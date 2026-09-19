@@ -150,7 +150,8 @@ def _game_from_api(item: dict[str, Any], username: str) -> Game:
         opening=opening.get("name"),
         eco=opening.get("eco"),
         moves=_parse_moves(item.get("moves")),
-        clocks=_parse_clocks(item.get("clocks")),
+        # API в JSON-режиме отдаёт часы в центисекундах; приводим к секундам.
+        clocks=[round(c / 100.0, 1) for c in _parse_clocks(item.get("clocks"))],
         user_color=user_color,
         opponent=opponent,
         user_rating=user_rating,
