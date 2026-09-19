@@ -1,8 +1,7 @@
 .venv/
 __pycache__/
 *.pyc
-data/*.db
-data/*.db-*
+data/
 .env
 .DS_Store
 .idea/

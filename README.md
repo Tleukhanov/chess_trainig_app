@@ -14,7 +14,7 @@
 - [x] M0.C SQLite-кеш
 - [x] M0.D CLI-отчёт (`coach`)
 - [x] M1 LLM-коуч (`review`: OpenRouter или любой OpenAI-compat, grounding по Stockfish)
-- [ ] M2 Слабости и дрели
+- [x] M2 Слабости и дрели (`coach` — узоры/фазы, `drills` — PGN/JSON)
 - [ ] M3 Maia (человеческий слой)
 - [ ] M4 Дебютный репертуар
 
@@ -27,6 +27,17 @@
   (датасет [lichess-org/chess-openings](https://github.com/lichess-org/chess-openings), CC0).
 - Кеш партий и анализа в SQLite: повторные отчёты мгновенны.
 - Русскоязычный текстовый отчёт + JSON.
+
+## Возможности M2
+
+- «Слабости по фазам»: распределение зевков/ошибок по дебюту, миттельшпилю и
+  эндшпилю со средними потерями win% — добавляется в отчёт `coach`.
+- «Узоры ошибок»: классификация каждой ошибки по мотиву
+  (вилка, связка, висячая фигура, пропущенный мат) со статистıкой по встречаемости.
+- Генерация дрелей из собственных ошибок: `python -m trainer drills --user NICK`
+  выбирает позиции, где ты зевнул/ошибся при ясном перевесе, и собирает их в
+  `data/drills.pgn` (можно импортировать в Lichess) или `.json` — каждая дрель
+  с FEN, лучшим ходом движка и линией.
 
 ## Возможности M1
 
@@ -60,8 +71,12 @@ Stockfish: скачать с <https://stockfishchess.org/download/windows/> и �
 ## Использование
 
 ```powershell
-# Анализ Stockfish + текстовый отчёт
+# Анализ Stockfish + текстовый отчёт (слабости по фазам, узоры ошибок)
 python -m trainer coach --user YOUR_LICHESS_NICK
+
+# Дрели из своих ошибок (PGN — импортируй на lichess.org/analysis)
+python -m trainer drills --user YOUR_LICHESS_NICK --out data/drills.pgn
+python -m trainer drills --user YOUR_LICHESS_NICK --out data/drills.json --min-drop 10
 
 # LLM-разбор ключевых моментов (из кеша; без ключа — только --dry-run)
 python -m trainer review --user YOUR_LICHESS_NICK
@@ -71,6 +86,10 @@ python -m trainer review --game GAME_ID                       # одна пар�
 # Тесты
 python -m unittest discover -s tests -v
 ```
+
+Для дрелей с полными линиями движка переанализируй кеш:
+`python -m trainer coach --user NICK --refresh` (линии `best_line` появляются
+только в анализах, сделанных после M1).
 
 LLM-ключ: положи `LLM_API_KEY` в `.env` (корень репо). Опционально
 `LLM_BASE_URL=https://openrouter.ai/api/v1` и `LLM_MODEL`.
