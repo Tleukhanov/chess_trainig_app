@@ -18,6 +18,7 @@ import chess
 import chess.pgn
 
 from .config import settings
+from .openings import classify_opening
 
 USER_AGENT = "chess-trainer/0.1 (+https://github.com/Tleukhanov/chess_trainig_app)"
 _CLOCK_RE = re.compile(r"\[%clk\s+([0-9:.]+)\]")
@@ -138,6 +139,11 @@ def _game_from_api(item: dict[str, Any], username: str) -> Game:
     winner = item.get("winner")
     created_at = int(item.get("createdAt") or item.get("timestamp") or 0)
 
+    opening_name = opening.get("name")
+    opening_eco = opening.get("eco")
+    if not opening_name:
+        opening_name, opening_eco = classify_opening(_parse_moves(item.get("moves")))
+
     return Game(
         id=item.get("id", ""),
         rated=bool(item.get("rated")),
@@ -147,8 +153,8 @@ def _game_from_api(item: dict[str, Any], username: str) -> Game:
         winner=winner,
         white=white,
         black=black,
-        opening=opening.get("name"),
-        eco=opening.get("eco"),
+        opening=opening_name,
+        eco=opening_eco,
         moves=_parse_moves(item.get("moves")),
         # API в JSON-режиме отдаёт часы в центисекундах; приводим к секундам.
         clocks=[round(c / 100.0, 1) for c in _parse_clocks(item.get("clocks"))],
@@ -203,6 +209,11 @@ def _game_from_pgn(game: chess.pgn.Game, username: str) -> Game:
         if clock is not None:
             clocks.append(clock)
 
+    opening_name = headers.get("Opening")
+    opening_eco = headers.get("ECO")
+    if not opening_name:
+        opening_name, opening_eco = classify_opening(moves)
+
     return Game(
         id=game_id,
         rated=False,
@@ -212,8 +223,8 @@ def _game_from_pgn(game: chess.pgn.Game, username: str) -> Game:
         winner=winner,
         white={"name": white_name},
         black={"name": black_name},
-        opening=headers.get("Opening"),
-        eco=headers.get("ECO"),
+        opening=opening_name,
+        eco=opening_eco,
         moves=moves,
         clocks=clocks,
         user_color=user_color,

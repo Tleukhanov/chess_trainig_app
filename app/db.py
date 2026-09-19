@@ -16,6 +16,7 @@ from typing import Any, Iterator
 
 from .config import settings
 from .games import Game
+from .openings import classify_opening
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS games(
@@ -70,7 +71,16 @@ def _uj(raw: str | None) -> Any:
 
 
 def _row_to_game(row: sqlite3.Row) -> Game:
-    """Восстанавливает объект Game из строки БД (в порядке полей dataclass)."""
+    """Восстанавливает объект Game из строки БД (в порядке полей dataclass).
+
+    Дебют — производные данные: если в кеше его нет (старые записи), определяем
+    локальным классификатором по ходам партии.
+    """
+    moves = _uj(row["moves_json"]) or []
+    opening = row["opening"]
+    eco = row["eco"]
+    if not opening:
+        opening, eco = classify_opening(moves)
     return Game(
         id=row["id"],
         rated=bool(row["rated"]),
@@ -80,9 +90,9 @@ def _row_to_game(row: sqlite3.Row) -> Game:
         winner=row["winner"],
         white=_uj(row["white"]) or {},
         black=_uj(row["black"]) or {},
-        opening=row["opening"],
-        eco=row["eco"],
-        moves=_uj(row["moves_json"]) or [],
+        opening=opening,
+        eco=eco,
+        moves=moves,
         clocks=_uj(row["clocks_json"]) or [],
         user_color=row["user_color"] or "white",
         opponent=row["opponent"],
