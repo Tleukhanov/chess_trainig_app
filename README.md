@@ -15,7 +15,7 @@
 - [x] M0.D CLI-отчёт (`coach`)
 - [x] M1 LLM-коуч (`review`: OpenRouter или любой OpenAI-compat, grounding по Stockfish)
 - [x] M2 Слабости и дрели (`coach` — узоры/фазы, `drills` — PGN/JSON)
-- [ ] M3 Maia (человеческий слой)
+- [x] M3 Человеческий слой (`humanize`: Maia/MaiaLite, фильтр дрелей по вердикту)
 - [ ] M4 Дебютный репертуар
 
 ## Возможности M0
@@ -38,6 +38,20 @@
   выбирает позиции, где ты зевнул/ошибся при ясном перевесе, и собирает их в
   `data/drills.pgn` (можно импортировать в Lichess) или `.json` — каждая дрель
   с FEN, лучшим ходом движка и линией.
+
+## Возможности M3
+
+- Оценка «человечности» каждой ошибки: насколько её сделал бы человек твоего уровня.
+  Вердикты: **неестественная** (явно исправимая тактика — тренировать в первую
+  очередь) / **пограничная** / **естественная** (сам движок-человек её допустил).
+- Два движка-политики:
+  - `MaiaLite` (по умолчанию) — мягкое «человекоподобное» распределение Stockfish
+    (температура `--temperature`, по умолчанию 15), работает прямо сейчас;
+- реальная **Maia** (`--engine maia`) — подключается если задать `MAIA_PATH`
+  на бинарь с maia-chess.net (иначе переключение на MaiaLite с предупреждением).
+- `python -m trainer humanize` считает человечность всех твоих зевков/ошибок из
+  кеша и пишет `data/humanity.json`, а `drills --verdict unnatural` собирает
+  дрели только из самых «неестественных» промахов.
 
 ## Возможности M1
 
@@ -77,6 +91,10 @@ python -m trainer coach --user YOUR_LICHESS_NICK
 # Дрели из своих ошибок (PGN — импортируй на lichess.org/analysis)
 python -m trainer drills --user YOUR_LICHESS_NICK --out data/drills.pgn
 python -m trainer drills --user YOUR_LICHESS_NICK --out data/drills.json --min-drop 10
+
+# Человеческий слой: человечность ошибок + дрели только «неестественных»
+python -m trainer humanize --user YOUR_LICHESS_NICK
+python -m trainer drills --user YOUR_LICHESS_NICK --verdict unnatural
 
 # LLM-разбор ключевых моментов (из кеша; без ключа — только --dry-run)
 python -m trainer review --user YOUR_LICHESS_NICK
