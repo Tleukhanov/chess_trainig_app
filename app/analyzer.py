@@ -210,6 +210,7 @@ class Engine:
         multipv: int | None = None,
         threads: int | None = None,
         hash_mb: int | None = None,
+        time_ms: int | None = None,
     ) -> None:
         self.path = Path(path or settings.stockfish_path)
         if not self.path.is_file():
@@ -221,7 +222,13 @@ class Engine:
         self.multipv = multipv if multipv is not None else settings.stockfish_multipv
         self.threads = threads if threads is not None else settings.stockfish_threads
         self.hash_mb = hash_mb if hash_mb is not None else settings.stockfish_hash_mb
+        self.time_ms = time_ms if time_ms is not None else settings.stockfish_time_ms
         self._engine: chess.engine.SimpleEngine | None = None
+
+    @property
+    def _time_limit_seconds(self) -> float | None:
+        """Лимит времени на одну позицию (None — без лимита; глубина всё равно ограничена)."""
+        return self.time_ms / 1000.0 if self.time_ms else None
 
     def _ensure_started(self) -> None:
         if self._engine is not None:
@@ -259,9 +266,8 @@ class Engine:
         """
         self._ensure_started()
         assert self._engine is not None
-        infos = self._engine.analyse(
-            board, chess.engine.Limit(depth=self.depth), multipv=self.multipv
-        )
+        limit = chess.engine.Limit(depth=self.depth, time=self._time_limit_seconds)
+        infos = self._engine.analyse(board, limit, multipv=self.multipv)
         lines: list[dict[str, Any]] = []
         for info in infos:
             score = info.get("score")
@@ -280,53 +286,60 @@ class Engine:
         lines.sort(key=lambda line: line["multipv"])
         return lines
 
+    def _analyze_sequence(self, moves: list[str]) -> list[tuple[Eval, str | None]]:
+        """Оценки всех позиций партии подряд (одно исследование на позицию).
+
+        Возвращает список (оценка в перспективе стороны, чей ход, лучший ход SAN)
+        длиной |moves| + 1 (включая позицию после последнего хода).
+        """
+        board = chess.Board()
+        entries: list[tuple[Eval, str | None]] = []
+        for ply in range(len(moves) + 1):
+            if board.is_game_over():
+                if board.is_checkmate():
+                    entries.append((Eval(cp=None, mate=-1), None))  # сторона, чей ход, получает мат
+                else:
+                    entries.append((Eval(cp=0.0, mate=None), None))  # пат/ничья
+                if ply < len(moves):
+                    board.push_san(moves[ply])
+                continue
+            lines = self.analyze_position(board)
+            if not lines:
+                break
+            top = lines[0]
+            eval_white = Eval(cp=top["eval"]["cp"], mate=top["eval"]["mate"])
+            entries.append(
+                (
+                    _eval_for_side(eval_white, board.turn == chess.WHITE),
+                    top["pv"][0] if top["pv"] else None,
+                )
+            )
+            if ply < len(moves):
+                board.push_san(moves[ply])
+        return entries
+
     def analyze_game(self, game: Game) -> GameAnalysis:
-        """Анализирует партию: перед ходом анализирует позицию и после него.
+        """Анализирует партию одним проходом: оценка позиции xN -> оценка ходов.
 
         win/drop/classification считаются для стороны, чей ход; агрегаты
         (acpl, blunders и т.п.) — только по ходам пользователя.
         """
-        board = chess.Board()
-        analyses: list[MoveAnalysis] = []
         user_is_white = game.user_color == "white"
+        entries = self._analyze_sequence(game.moves)
+        analyses: list[MoveAnalysis] = []
 
         for ply, san in enumerate(game.moves):
+            if ply + 1 >= len(entries):
+                break  # движок не смог проанализировать остаток партии
             mover_is_white = ply % 2 == 0
             mover = "white" if mover_is_white else "black"
 
-            before_lines = self.analyze_position(board)
-            if not before_lines:
-                break
-            top = before_lines[0]
-            top_eval = top["eval"]
-            best_eval_white = Eval(cp=top_eval["cp"], mate=top_eval["mate"])
-            best_move_san: str | None = top["pv"][0] if top["pv"] else None
-            before_side = _eval_for_side(best_eval_white, mover_is_white)
+            before_side, best_move_san = entries[ply]
+            after_next_side, _ = entries[ply + 1]
             win_before = _side_win(before_side)
-
-            try:
-                board.push_san(san)
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Не удалось применить ход SAN '{san}' (полуход {ply})"
-                ) from exc
-
-            if board.is_game_over():
-                if board.is_checkmate():
-                    after_side = Eval(cp=None, mate=1)
-                    win_after = 100.0
-                else:
-                    after_side = Eval(cp=0.0, mate=None)
-                    win_after = 50.0
-            else:
-                after_lines = self.analyze_position(board)
-                if not after_lines:
-                    break
-                after_eval = after_lines[0]["eval"]
-                after_eval_white = Eval(cp=after_eval["cp"], mate=after_eval["mate"])
-                after_opp = _eval_for_side(after_eval_white, not mover_is_white)
-                after_side = _flip(after_opp)
-                win_after = 100.0 - _side_win(after_opp)
+            # win_after для стороны, СДЕЛАВШЕЙ ход: обратная величина к win% стороны,
+            # которой теперь ходить.
+            win_after = 100.0 - _side_win(after_next_side)
 
             drop = win_before - win_after
             is_best = best_move_san is not None and _san_key(best_move_san) == _san_key(san)
@@ -347,7 +360,7 @@ class Engine:
                 MoveAnalysis(
                     san=san,
                     before=before_side,
-                    after=after_side,
+                    after=_flip(after_next_side),
                     win_before=round(win_before, 2),
                     win_after=round(win_after, 2),
                     drop=round(drop, 2),

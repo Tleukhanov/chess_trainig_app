@@ -39,6 +39,7 @@ class Settings:
     stockfish_multipv: int = int(_cfg("STOCKFISH_MULTIPV", "3"))
     stockfish_threads: int = int(_cfg("STOCKFISH_THREADS", "4"))
     stockfish_hash_mb: int = int(_cfg("STOCKFISH_HASH_MB", "512"))
+    stockfish_time_ms: int = int(_cfg("STOCKFISH_TIME_MS", "3000"))
 
     # --- lichess ---
     lichess_base_url: str = _cfg("LICHESS_BASE_URL", "https://lichess.org")
