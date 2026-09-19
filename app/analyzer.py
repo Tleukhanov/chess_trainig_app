@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -83,6 +83,8 @@ class MoveAnalysis:
     drop — потеря win.% (win_before - win_after).
     cp_loss — потеря относительно лучшей линии: так как оценка позиции движком
         и есть проекция лучшей линии, cp_loss совпадает с drop в win.п.
+    best_line — продолжение за лучшим ходом (полный top-pv без первого хода, до 6).
+    played_line — реально сыгранные далее ходы партии (до 5).
     """
 
     san: str
@@ -98,6 +100,8 @@ class MoveAnalysis:
     cp_loss: float | None = None
     clock_used: float | None = None
     time_pressure: bool | None = None
+    best_line: list[str] = field(default_factory=list)
+    played_line: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -114,6 +118,8 @@ class MoveAnalysis:
             "cp_loss": self.cp_loss,
             "clock_used": self.clock_used,
             "time_pressure": self.time_pressure,
+            "best_line": self.best_line,
+            "played_line": self.played_line,
         }
 
 
@@ -286,20 +292,21 @@ class Engine:
         lines.sort(key=lambda line: line["multipv"])
         return lines
 
-    def _analyze_sequence(self, moves: list[str]) -> list[tuple[Eval, str | None]]:
+    def _analyze_sequence(self, moves: list[str]) -> list[tuple[Eval, str | None, list[str]]]:
         """Оценки всех позиций партии подряд (одно исследование на позицию).
 
-        Возвращает список (оценка в перспективе стороны, чей ход, лучший ход SAN)
-        длиной |moves| + 1 (включая позицию после последнего хода).
+        Возвращает список (оценка в перспективе стороны, чей ход, лучший ход SAN,
+        полный top-pv SAN) длиной |moves| + 1 (включая позицию после последнего хода).
+        Для гейм-овер-позиций классификация и pv пустые.
         """
         board = chess.Board()
-        entries: list[tuple[Eval, str | None]] = []
+        entries: list[tuple[Eval, str | None, list[str]]] = []
         for ply in range(len(moves) + 1):
             if board.is_game_over():
                 if board.is_checkmate():
-                    entries.append((Eval(cp=None, mate=-1), None))  # сторона, чей ход, получает мат
+                    entries.append((Eval(cp=None, mate=-1), None, []))  # сторона, чей ход, получает мат
                 else:
-                    entries.append((Eval(cp=0.0, mate=None), None))  # пат/ничья
+                    entries.append((Eval(cp=0.0, mate=None), None, []))  # пат/ничья
                 if ply < len(moves):
                     board.push_san(moves[ply])
                 continue
@@ -312,6 +319,7 @@ class Engine:
                 (
                     _eval_for_side(eval_white, board.turn == chess.WHITE),
                     top["pv"][0] if top["pv"] else None,
+                    top["pv"],
                 )
             )
             if ply < len(moves):
@@ -334,8 +342,8 @@ class Engine:
             mover_is_white = ply % 2 == 0
             mover = "white" if mover_is_white else "black"
 
-            before_side, best_move_san = entries[ply]
-            after_next_side, _ = entries[ply + 1]
+            before_side, best_move_san, full_pv = entries[ply]
+            after_next_side, _, _ = entries[ply + 1]
             win_before = _side_win(before_side)
             # win_after для стороны, СДЕЛАВШЕЙ ход: обратная величина к win% стороны,
             # которой теперь ходить.
@@ -371,6 +379,8 @@ class Engine:
                     cp_loss=round(drop, 2),
                     clock_used=clock_used,
                     time_pressure=time_pressure,
+                    best_line=full_pv[1:7] if full_pv else [],
+                    played_line=game.moves[ply + 1 : ply + 1 + 5],
                 )
             )
 
