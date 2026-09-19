@@ -23,8 +23,9 @@ __all__ = ["Eval", "win_percent", "classify_move", "MoveAnalysis", "GameAnalysis
 
 @dataclass(frozen=True, slots=True)
 class Eval:
-    """Оценка позиции: либо cp (в пешках), либо mate (модуль ходов до мата).
+    """Оценка позиции: либо cp, либо mate (модуль ходов до мата).
 
+    cp задан в центипешках (как у движка): 100 == 1 пешка.
     Объект всегда выражен в перспективе той стороны, «за которую» он построен:
     положительный mate означает, что эта сторона ставит мат.
     """
@@ -156,10 +157,10 @@ class GameAnalysis:
 
 
 def _eval_from_white_score(score: Any) -> Eval:
-    """Из score.white() движка строит Eval в перспективе белых."""
+    """Из score.white() движка строит Eval в перспективе белых (cp в центипешках)."""
     if score.is_mate():
         return Eval(cp=None, mate=score.mate())
-    return Eval(cp=score.score() / 100.0, mate=None)
+    return Eval(cp=float(score.score()), mate=None)
 
 
 def _flip(eval_: Eval) -> Eval:
