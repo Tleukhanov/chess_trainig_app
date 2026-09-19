@@ -13,6 +13,8 @@ Stockfish и строит русскоязычный текстовый отчё
     python -m trainer review --user NICK --dry-run --max 2
     python -m trainer review --game 2SXfzXV2
     python -m trainer review --user NICK --json review.json
+    python -m trainer drills --user NICK --out data/drills.pgn
+    python -m trainer drills --user NICK --out data/drills.json --min-drop 10
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ from app.analyzer import Engine
 from app.coach import build_request, run_coach
 from app.config import settings
 from app.db import Database
+from app.drills import collect_drills, drills_to_json, drills_to_pgn, summarize
 from app.games import Game, fetch_user_games
 from app.llm import ChatMessage, LLMClient
 from app.report import build_report, format_report
@@ -63,6 +66,15 @@ def _make_parser() -> argparse.ArgumentParser:
     review.add_argument("--moments", type=int, default=6, help="максимум ключевых моментов на партию, %(default)s")
     review.add_argument("--dry-run", action="store_true", help="не звать LLM: вывести готовые промпты")
     review.add_argument("--json", metavar="PATH", default=None, help="сохранить разбор дополнительно в JSON")
+
+    drills = subparsers.add_parser("drills", help="дрели из своих ошибок (из кеша): PGN/JSON")
+    drills.add_argument("--user", default=None, help="ник на Lichess")
+    drills.add_argument("--game", default=None, help="id конкретной партии")
+    drills.add_argument("--out", default=None, help="файл вывода (по расширению .pgn/.json); по умолчанию data/drills.pgn")
+    drills.add_argument("--limit", type=int, default=0, help="максимум дрелей всего (0 = без лимита)")
+    drills.add_argument("--max-per-game", type=int, default=8, help="максимум на партию (по умолчанию %(default)s)")
+    drills.add_argument("--min-drop", type=float, default=15.0, help="мин. потеря win%% для дрели (по умолчанию %(default)s)")
+    drills.add_argument("--min-win", type=float, default=50.0, help="мин. win%% до хода (по умолчанию %(default)s)")
     return parser
 
 
@@ -346,6 +358,87 @@ def _cmd_coach(args: argparse.Namespace) -> int:
         return 1
 
 
+def _cmd_drills(args: argparse.Namespace) -> int:
+    """Исполняет подкоманду drills: дрели из своих ошибок по кешу анализа.
+
+    Работает только по кешу: движок не запускается, сеть не используется.
+    """
+    try:
+        with Database() as db:
+            db.init_db()
+            if args.game:
+                game = db.get_game(args.game)
+                if game is None:
+                    raise RuntimeError(
+                        f"Партия {args.game} не найдена в кеше "
+                        "(сначала: python -m trainer coach --user NICK)"
+                    )
+                analysis = db.get_analysis(args.game)
+                if analysis is None:
+                    raise RuntimeError(
+                        f"Партия {args.game} не проанализирована — сначала прогони "
+                        "coach, напр.: python -m trainer coach --user <NICK>"
+                    )
+                pairs = [(game, analysis)]
+            elif args.user:
+                pairs = db.get_analyzed_games(args.user, limit=200)
+                if not pairs:
+                    raise RuntimeError(
+                        f"Нет проанализированных партий для {args.user}. "
+                        "Запусти сначала: python -m trainer coach --user <NICK>"
+                    )
+            else:
+                raise RuntimeError("Укажи --user или --game")
+
+            drills = []
+            for game, analysis in pairs:
+                drills.extend(
+                    collect_drills(
+                        game,
+                        analysis,
+                        min_drop=args.min_drop,
+                        min_win=args.min_win,
+                        max_per_game=args.max_per_game,
+                    )
+                )
+            if args.limit and args.limit > 0:
+                drills = drills[: args.limit]
+
+            if not drills:
+                print(
+                    f"Дрелей не найдено: нет ошибок с потерями >= {args.min_drop}% "
+                    f"и win% >= {args.min_win}%. Рекомендации: уменьши "
+                    "--min-drop/--min-win, или проанализируй больше партий."
+                )
+                return 0
+
+            out = Path(args.out) if args.out else settings.data_dir / "drills.pgn"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            if out.suffix.lower() == ".json":
+                out.write_text(drills_to_json(drills), encoding="utf-8")
+            else:
+                out.write_text(drills_to_pgn(drills), encoding="utf-8")
+
+            summary = summarize(drills)
+            print(f"Дрелей: {summary['found']} из {summary['games']} партий → {out}")
+            avg = f"{summary['avg_drop']:.1f}" if summary["avg_drop"] is not None else "—"
+            print(f"Средняя потеря win%: {avg}")
+            for item in summary["top"]:
+                print(
+                    f"  [{item['game_id']}] сыграно {item['san']} → лучше {item['best']}"
+                )
+        return 0
+    except RuntimeError as exc:
+        print(f"Ошибка: {exc}")
+        return 1
+    except KeyboardInterrupt:
+        print("\nПрервано пользователем.")
+        return 130
+    except Exception as exc:
+        print(f"Непредвиденная ошибка: {exc!r}")
+        return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     """Точка входа CLI: разбор аргументов и диспетчеризация подкоманд."""
     parser = _make_parser()
@@ -357,6 +450,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_coach(args)
     if args.command == "review":
         return _cmd_review(args)
+    if args.command == "drills":
+        return _cmd_drills(args)
     parser.error(f"Неизвестная команда: {args.command}")
     return 2
 
