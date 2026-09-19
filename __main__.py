@@ -15,6 +15,8 @@ Stockfish и строит русскоязычный текстовый отчё
     python -m trainer review --user NICK --json review.json
     python -m trainer drills --user NICK --out data/drills.pgn
     python -m trainer drills --user NICK --out data/drills.json --min-drop 10
+    python -m trainer humanize --user NICK --out data/humanity.json
+    python -m trainer drills --user NICK --humanity data/humanity.json --verdict unnatural
 """
 
 from __future__ import annotations
@@ -75,6 +77,16 @@ def _make_parser() -> argparse.ArgumentParser:
     drills.add_argument("--max-per-game", type=int, default=8, help="максимум на партию (по умолчанию %(default)s)")
     drills.add_argument("--min-drop", type=float, default=15.0, help="мин. потеря win%% для дрели (по умолчанию %(default)s)")
     drills.add_argument("--min-win", type=float, default=50.0, help="мин. win%% до хода (по умолчанию %(default)s)")
+    drills.add_argument("--humanity", default=None, help="JSON-файл с человечностью (по умолчанию data/humanity.json)")
+    drills.add_argument("--verdict", nargs="+", default=None, choices=["natural", "borderline", "unnatural"], help="оставить только эти вердикты (нужно --humanity/данные)")
+
+    humanize = subparsers.add_parser("humanize", help="оценка «человечности» ошибок (Maia/MaiaLite)")
+    humanize.add_argument("--user", default=None, help="ник на Lichess")
+    humanize.add_argument("--game", default=None, help="id конкретной партии")
+    humanize.add_argument("--engine", default="maia-lite", choices=["maia-lite", "maia"], help="режим человечности (по умолчанию %(default)s)")
+    humanize.add_argument("--maia-path", default=None, help="путь к бинарю Maia (MAIA_PATH) для --engine maia")
+    humanize.add_argument("--temperature", type=float, default=15.0, help="температура MaiaLite (по умолчанию %(default)s)")
+    humanize.add_argument("--out", default=None, help="куда писать JSON с результатами (по умолчанию data/humanity.json)")
     return parser
 
 
@@ -390,6 +402,25 @@ def _cmd_drills(args: argparse.Namespace) -> int:
             else:
                 raise RuntimeError("Укажи --user или --game")
 
+            humanity_items: list[dict] | None = None
+            allowed_verdicts: set[str] | None = None
+            if args.verdict:
+                humanity_path = (
+                    Path(args.humanity)
+                    if args.humanity
+                    else settings.data_dir / "humanity.json"
+                )
+                if not humanity_path.exists():
+                    raise RuntimeError(
+                        f"Файл человечности не найден: {humanity_path}. "
+                        "Сначала: python -m trainer humanize --user NICK"
+                    )
+                data = json.loads(humanity_path.read_text(encoding="utf-8"))
+                humanity_items = (
+                    data.get("items") if isinstance(data, dict) else None
+                )
+                allowed_verdicts = set(args.verdict)
+
             drills = []
             for game, analysis in pairs:
                 drills.extend(
@@ -399,6 +430,8 @@ def _cmd_drills(args: argparse.Namespace) -> int:
                         min_drop=args.min_drop,
                         min_win=args.min_win,
                         max_per_game=args.max_per_game,
+                        humanity=humanity_items,
+                        allowed_verdicts=allowed_verdicts,
                     )
                 )
             if args.limit and args.limit > 0:
@@ -439,6 +472,116 @@ def _cmd_drills(args: argparse.Namespace) -> int:
         return 1
 
 
+def _cmd_humanize(args: argparse.Namespace) -> int:
+    """Исполняет подкоманду humanize: оценка «человечности» ошибок (Maia).
+
+    Прогоняет ошибки игрока через политику Maia/MaiaLite и пишет JSON-файл
+    с вердиктами по каждому ходу, который затем фильтрует команда drills.
+    """
+    try:
+        from app.humanize import VERDICT_LABELS, humanize_report
+        from app.maia import (
+            EngineNotConfiguredError,
+            MaiaBinaryPolicy,
+            MaiaLitePolicy,
+        )
+    except ImportError:
+        print("Ошибка: ядро M3 ещё не собрано (app.humanize) — повтори позже")
+        return 1
+
+    try:
+        with Database() as db:
+            db.init_db()
+            pairs: list[tuple[Game, dict]] = []
+            if args.game:
+                game = db.get_game(args.game)
+                if game is None:
+                    raise RuntimeError(f"Партия {args.game} не найдена в кеше")
+                analysis = db.get_analysis(args.game)
+                if analysis is None:
+                    raise RuntimeError(
+                        f"Партия {args.game} не проанализирована — сначала "
+                        "прогони coach, напр.: python -m trainer coach --user <NICK>"
+                    )
+                pairs = [(game, analysis)]
+            elif args.user:
+                pairs = db.get_analyzed_games(args.user, limit=500)
+                if not pairs:
+                    raise RuntimeError(
+                        f"Нет проанализированных партий для {args.user}. "
+                        "Запусти сначала: python -m trainer coach --user <NICK>"
+                    )
+            else:
+                raise RuntimeError("Укажи --user или --game")
+
+            if args.engine == "maia":
+                try:
+                    policy: MaiaLitePolicy | MaiaBinaryPolicy = MaiaBinaryPolicy(
+                        path=args.maia_path
+                    )
+                except EngineNotConfiguredError as exc:
+                    print(f"{exc} → используется MaiaLite.")
+                    policy = MaiaLitePolicy(temperature=args.temperature)
+            else:
+                policy = MaiaLitePolicy(temperature=args.temperature)
+
+            with policy as engine:
+                report = humanize_report(pairs, engine, k=8)
+
+        out = Path(args.out) if args.out else settings.data_dir / "humanity.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+        items = report.get("items") or []
+        print(f"Человечность рассчитана: {len(items)} ошибок → {out}")
+        for item in items:
+            verdict = item.get("verdict")
+            label = VERDICT_LABELS.get(verdict, verdict or "—")
+            ply = item.get("ply")
+            ply_txt = f"{ply + 1}" if isinstance(ply, int) else "—"
+            san = item.get("san") or "—"
+            classification = item.get("classification") or "—"
+            drop = item.get("drop")
+            drop_txt = f"{drop:>5}" if isinstance(drop, (int, float)) else "–"
+            prob_user = item.get("prob_user")
+            prob_user_txt = (
+                f"{prob_user:.2f}" if isinstance(prob_user, (int, float)) else "–"
+            )
+            prob_best = item.get("prob_best")
+            prob_best_txt = (
+                f"{prob_best:.2f}" if isinstance(prob_best, (int, float)) else "–"
+            )
+            beta = item.get("beta")
+            beta_txt = f"{beta:+.2f}" if isinstance(beta, (int, float)) else "–"
+            print(
+                f"  {item.get('game_id') or '—'}  п.{ply_txt} "
+                f"{san:<8} {classification:<10} drop {drop_txt}%  "
+                f"P(я)={prob_user_txt} P(лучш)={prob_best_txt} "
+                f"β={beta_txt} — {label}"
+            )
+        counts = {"natural": 0, "borderline": 0, "unnatural": 0, "no-data": 0}
+        for item in items:
+            verdict = item.get("verdict")
+            counts[verdict if verdict in counts else "no-data"] += 1
+        print(
+            "natural/borderline/unnatural/no-data = "
+            f"{counts['natural']}/{counts['borderline']}/"
+            f"{counts['unnatural']}/{counts['no-data']}"
+        )
+        return 0
+    except RuntimeError as exc:
+        print(f"Ошибка: {exc}")
+        return 1
+    except KeyboardInterrupt:
+        print("\nПрервано пользователем.")
+        return 130
+    except Exception as exc:
+        print(f"Непредвиденная ошибка: {exc!r}")
+        return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     """Точка входа CLI: разбор аргументов и диспетчеризация подкоманд."""
     parser = _make_parser()
@@ -452,6 +595,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_review(args)
     if args.command == "drills":
         return _cmd_drills(args)
+    if args.command == "humanize":
+        return _cmd_humanize(args)
     parser.error(f"Неизвестная команда: {args.command}")
     return 2
 

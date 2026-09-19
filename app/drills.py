@@ -61,6 +61,8 @@ def collect_drills(
     min_drop: float = 15.0,
     min_win: float = 50.0,
     max_per_game: int = 8,
+    humanity: list[dict] | None = None,
+    allowed_verdicts: set[str] | None = None,
 ) -> list[Drill]:
     """Собирает дрели из ходов пользователя с классификацией blunder/mistake.
 
@@ -69,11 +71,27 @@ def collect_drills(
     движок выдал лучший ход (best_move_san). FEN — позиция до хода игрока.
 
     ``max_per_game`` ограничивает число дрелей с одной партии (0 — без лимита).
+
+    ``humanity`` — список записей {"game_id", "ply", "verdict"} из отчёта
+    команды humanize. ``allowed_verdicts`` — множество вердиктов, которые
+    нужно оставить. Если фильтр запрошен, но данные человечности не переданы,
+    дрели не собираются с ошибкой ValueError.
     """
     moves = analysis.get("moves") or []
     user_is_white = game.user_color == "white"
     board = chess.Board()
     found: list[Drill] = []
+
+    lookup: dict[tuple[str, int], str] = {}
+    if allowed_verdicts:
+        if not humanity:
+            raise ValueError(
+                "человечность не передана: сначала собери её командой humanize "
+                "(--out data/humanity.json), затем передай её путь через --humanity"
+            )
+        for item in humanity:
+            key = (str(item.get("game_id")), int(item.get("ply")))
+            lookup[key] = str(item.get("verdict"))
 
     for ply, san in enumerate(game.moves):
         if ply < len(moves):
@@ -87,8 +105,12 @@ def collect_drills(
             drop = move.get("drop")
             win_before = move.get("win_before")
             best_move_san = move.get("best_move_san")
+            verdict_ok = True
+            if allowed_verdicts:
+                verdict_ok = (game.id, ply) in lookup and lookup[(game.id, ply)] in allowed_verdicts
             if (
-                classification in _DRAMATIC
+                verdict_ok
+                and classification in _DRAMATIC
                 and isinstance(drop, (int, float))
                 and drop >= min_drop
                 and isinstance(win_before, (int, float))
