@@ -13,6 +13,7 @@ from datetime import datetime
 from typing import Any
 
 from .games import Game
+from .patterns import PHASE_LABELS, weakness_stats
 
 __all__ = ["build_report", "format_report"]
 
@@ -148,6 +149,8 @@ def build_report(pairs: list[tuple[Game, dict]], user: str) -> dict[str, Any]:
         )
     opening_rows.sort(key=lambda item: (-item["games"], item["name"]))
 
+    weakness = weakness_stats(pairs)
+
     blunders_per_game = blunders_total / total_games if total_games else 0.0
     tp_blunder_rate = (tp_blunders_total / tp_moves_total * 100.0) if tp_moves_total else 0.0
 
@@ -181,6 +184,9 @@ def build_report(pairs: list[tuple[Game, dict]], user: str) -> dict[str, Any]:
             "tp_blunder_rate_pct": round(tp_blunder_rate, 1),
         },
         "openings": opening_rows,
+        "phases": weakness["phases"],
+        "motifs": weakness["motifs"],
+        "total_bad": weakness["total_bad"],
     }
 
 
@@ -269,6 +275,38 @@ def format_report(report: dict[str, Any]) -> str:
             )
     else:
         lines.append("Дебюты: нет данных.")
+
+    total_bad = report.get("total_bad", 0)
+    phases = report.get("phases") or {}
+    motifs = report.get("motifs") or {}
+    if total_bad:
+        if phases:
+            lines.append("  Слабости по фазам:")
+            lines.append(
+                "    {:<12} {:>6} {:>6} {:>6} {:>14}".format(
+                    "Фаза", "ходов", "зевки", "ошибки", "средн. потери%"
+                )
+            )
+            for ph_name, stats in phases.items():
+                lines.append(
+                    "    {:<12} {:>6} {:>6} {:>6} {:>13.1f}".format(
+                        PHASE_LABELS.get(ph_name, ph_name),
+                        stats["count"],
+                        stats["blunders"],
+                        stats["mistakes"],
+                        stats["avg_drop"],
+                    )
+                )
+        if motifs:
+            lines.append("  Узоры ошибок:")
+            for number, (motif, stats) in enumerate(motifs.items(), start=1):
+                lines.append(
+                    "    {}. {:<20} {:>4}  средн. потери {:.1f}%".format(
+                        number, motif.capitalize(), stats["count"], stats["avg_drop"]
+                    )
+                )
+    else:
+        lines.append("  Слабости: проблемных ходов нет.")
 
     lines.append(_SEPARATOR)
     return "\n".join(lines)
