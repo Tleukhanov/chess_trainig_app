@@ -17,6 +17,8 @@ Stockfish и строит русскоязычный текстовый отчё
     python -m trainer drills --user NICK --out data/drills.json --min-drop 10
     python -m trainer humanize --user NICK --out data/humanity.json
     python -m trainer drills --user NICK --humanity data/humanity.json --verdict unnatural
+    python -m trainer repertoire --user NICK
+    python -m trainer repertoire --user NICK --color black --no-write
 """
 
 from __future__ import annotations
@@ -35,6 +37,13 @@ from app.drills import collect_drills, drills_to_json, drills_to_pgn, summarize
 from app.games import Game, fetch_user_games
 from app.llm import ChatMessage, LLMClient
 from app.report import build_report, format_report
+from app.repertoire import (
+    Repertoire,
+    format_lines,
+    opening_stats,
+    repertoire_to_json,
+    repertoire_to_pgn,
+)
 
 __all__ = ["main"]
 
@@ -87,6 +96,17 @@ def _make_parser() -> argparse.ArgumentParser:
     humanize.add_argument("--maia-path", default=None, help="путь к бинарю Maia (MAIA_PATH) для --engine maia")
     humanize.add_argument("--temperature", type=float, default=15.0, help="температура MaiaLite (по умолчанию %(default)s)")
     humanize.add_argument("--out", default=None, help="куда писать JSON с результатами (по умолчанию data/humanity.json)")
+
+    repertoire = subparsers.add_parser("repertoire", help="личный дебютный репертуар по своим партиям (из кеша)")
+    repertoire.add_argument("--user", default=None, help="ник на Lichess")
+    repertoire.add_argument("--game", default=None, help="id конкретной партии")
+    repertoire.add_argument("--color", default="both", choices=["white", "black", "both"], help="цвет роли (по умолчанию %(default)s)")
+    repertoire.add_argument("--max-depth", type=int, default=8, help="глубина дерева репертуара (по умолчанию %(default)s)")
+    repertoire.add_argument("--min-count", type=int, default=1, help="мин. число партий для строки (по умолчанию %(default)s)")
+    repertoire.add_argument("--opening", nargs="+", default=None, help="фрагменты имён дебютов для фильтра (регистронезависимо)")
+    repertoire.add_argument("--pgn", default=None, help="куда писать PGN (для both — объединение цветов); по умолчанию data/repertoire_{цвет}.pgn")
+    repertoire.add_argument("--json", metavar="PATH", default=None, help="куда писать JSON (по умолчанию data/repertoire.json)")
+    repertoire.add_argument("--no-write", action="store_true", help="не писать файлы PGN/JSON, только печать")
     return parser
 
 
@@ -582,6 +602,131 @@ def _cmd_humanize(args: argparse.Namespace) -> int:
         return 1
 
 
+def _repertoire_pairs(db: Database, args: argparse.Namespace) -> list[tuple[Game, dict]]:
+    """Загружает пары (Game, analysis) для репертуара из кеша.
+
+    Работает только по кешу: движок не запускается, сеть не используется.
+    """
+    if args.game:
+        game = db.get_game(args.game)
+        if game is None:
+            raise RuntimeError(f"Партия {args.game} не найдена в кеше")
+        analysis = db.get_analysis(args.game)
+        if analysis is None:
+            raise RuntimeError(
+                f"Партия {args.game} не проанализирована — сначала прогони "
+                "coach, напр.: python -m trainer coach --user <NICK>"
+            )
+        return [(game, analysis)]
+    if not args.user:
+        raise RuntimeError("Укажи --user или --game")
+    pairs = db.get_analyzed_games(args.user, limit=200)
+    if not pairs:
+        raise RuntimeError(
+            f"Нет проанализированных партий для {args.user}. "
+            "Запусти сначала: python -m trainer coach --user <NICK>"
+        )
+    return pairs
+
+
+def _run_repertoire(
+    pairs: list[tuple[Game, dict]], args: argparse.Namespace
+) -> dict:
+    """Вся логика подкоманды repertoire: деревья линий, слабости, запись файлов."""
+    repertoire = Repertoire()
+    for game, analysis in pairs:
+        repertoire.add_game(game, analysis, max_depth=args.max_depth)
+
+    colors = ["white", "black"] if args.color == "both" else [args.color]
+    line_counts: dict[str, int] = {}
+    for color in colors:
+        lines = repertoire.lines(color, min_count=args.min_count)
+        line_counts[color] = len(lines)
+        print(format_lines(color, lines, limit=60))
+        weak = repertoire.weak_lines(color, min_count=args.min_count)
+        total = len(weak)
+        print(f"Слабых линий: {total} (прочность < 70%)" if total else "Слабых линий: нет")
+
+    stats = opening_stats(pairs, user=args.user)
+    if args.opening:
+        wanted = [token.strip().lower() for token in args.opening if token.strip()]
+        stats = [
+            row
+            for row in stats
+            if any(token in row["opening"].lower() for token in wanted)
+        ]
+
+    if stats:
+        print("Слабые места репертуара:")
+        print(
+            "  {:<38} {:>5} {:>7} {:>11} {:>11}".format(
+                "Название", "игр", "оч%", "зев·ош/игру", "ср.потери%"
+            )
+        )
+        for row in stats[:12]:
+            print(
+                "  {:<38} {:>5} {:>6.0f}% {:>12.2f} {:>10.1f}%".format(
+                    row["opening"],
+                    row["games"],
+                    row["points_pct"],
+                    row["errors_per_game"],
+                    row["avg_drop"],
+                )
+            )
+    else:
+        print("Слабые места репертуара: нет данных.")
+
+    if not args.no_write:
+        out_dir = settings.data_dir
+        out_dir.mkdir(parents=True, exist_ok=True)
+        written: list[Path] = []
+        if args.pgn:
+            path = Path(args.pgn)
+            chunks = [
+                repertoire_to_pgn(pairs, color, opening_filter=args.opening)
+                for color in colors
+            ]
+            path.write_text("".join(chunks), encoding="utf-8")
+            written.append(path)
+        else:
+            for color in colors:
+                path = out_dir / f"repertoire_{color}.pgn"
+                path.write_text(
+                    repertoire_to_pgn(pairs, color, opening_filter=args.opening),
+                    encoding="utf-8",
+                )
+                written.append(path)
+        json_path = Path(args.json) if args.json else out_dir / "repertoire.json"
+        json_path.write_text(repertoire_to_json(repertoire, pairs), encoding="utf-8")
+        print(f"Репертуар записан → {' + '.join(str(p) for p in written)}")
+        print(f"JSON → {json_path}")
+
+    return {
+        "white": line_counts.get("white", 0),
+        "black": line_counts.get("black", 0),
+        "openings": len(stats),
+    }
+
+
+def _cmd_repertoire(args: argparse.Namespace) -> int:
+    """Исполняет подкоманду repertoire: репертуар и слабые дебюты из кеша."""
+    try:
+        with Database() as db:
+            db.init_db()
+            pairs = _repertoire_pairs(db, args)
+            _run_repertoire(pairs, args)
+        return 0
+    except RuntimeError as exc:
+        print(f"Ошибка: {exc}")
+        return 1
+    except KeyboardInterrupt:
+        print("\nПрервано пользователем.")
+        return 130
+    except Exception as exc:
+        print(f"Непредвиденная ошибка: {exc!r}")
+        return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     """Точка входа CLI: разбор аргументов и диспетчеризация подкоманд."""
     parser = _make_parser()
@@ -597,6 +742,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_drills(args)
     if args.command == "humanize":
         return _cmd_humanize(args)
+    if args.command == "repertoire":
+        return _cmd_repertoire(args)
     parser.error(f"Неизвестная команда: {args.command}")
     return 2
 
