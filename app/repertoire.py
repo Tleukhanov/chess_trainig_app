@@ -394,8 +394,14 @@ def format_lines(
     ranked = sorted(lines, key=lambda line: line.count, reverse=True)[:limit]
     out = [f"Репертуар {color_ru}:"]
     for line in ranked:
-        tokens = [f"{idx + 1}.{san}"[:12] for idx, san in enumerate(line.moves[:12])]
+        show_n = 12
+        trimmed = len(line.moves) > show_n
+        tokens = [
+            f"{idx + 1}.{san}"[:12] for idx, san in enumerate(line.moves[:show_n])
+        ]
         prefix = " ".join(tokens).rstrip()
+        if trimmed:
+            prefix += " …"
         if line.ok_rate is None:
             tail = f"[{line.count} {_plural_games(line.count)}]"
         else:

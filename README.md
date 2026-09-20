@@ -16,7 +16,7 @@
 - [x] M1 LLM-коуч (`review`: OpenRouter или любой OpenAI-compat, grounding по Stockfish)
 - [x] M2 Слабости и дрели (`coach` — узоры/фазы, `drills` — PGN/JSON)
 - [x] M3 Человеческий слой (`humanize`: Maia/MaiaLite, фильтр дрелей по вердикту)
-- [ ] M4 Дебютный репертуар
+- [x] M4 Дебютный репертуар
 
 ## Возможности M0
 
@@ -52,6 +52,18 @@
 - `python -m trainer humanize` считает человечность всех твоих зевков/ошибок из
   кеша и пишет `data/humanity.json`, а `drills --verdict unnatural` собирает
   дрели только из самых «неестественных» промахов.
+
+## Возможности M4
+
+- Личный дебютный репертуар по ТВОИМ ходам из проанализированных партий:
+  `python -m trainer repertoire --user NICK` печатает деревья твоих линий
+  отдельно для белых и чёрных с числом партий и прочностью по фазам дерева,
+  помечая слабые линии («⚠ слабое место»).
+- Таблица «Слабые места репертуара»: дебюты с наибольшим числом зевков/ошибок
+  на партию и средними потерями win% — куда смотреть в первую очередь.
+- Экспорт: `data/repertoire_white.pgn` / `data/repertoire_black.pgn`
+  (импорт в Lichess) и `data/repertoire.json`; фильтр по фрагментам имён
+  дебютов `--opening` и глубина дерева `--max-depth` (ходов пользователя).
 
 ## Возможности M1
 
@@ -95,6 +107,11 @@ python -m trainer drills --user YOUR_LICHESS_NICK --out data/drills.json --min-d
 # Человеческий слой: человечность ошибок + дрели только «неестественных»
 python -m trainer humanize --user YOUR_LICHESS_NICK
 python -m trainer drills --user YOUR_LICHESS_NICK --verdict unnatural
+
+# Дебютный репертуар (деревья линий, слабые дебюты, PGN/JSON)
+python -m trainer repertoire --user YOUR_LICHESS_NICK
+python -m trainer repertoire --user YOUR_LICHESS_NICK --color black --max-depth 10
+python -m trainer repertoire --user YOUR_LICHESS_NICK --opening "Sicilian" --no-write
 
 # LLM-разбор ключевых моментов (из кеша; без ключа — только --dry-run)
 python -m trainer review --user YOUR_LICHESS_NICK

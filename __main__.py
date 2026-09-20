@@ -101,7 +101,7 @@ def _make_parser() -> argparse.ArgumentParser:
     repertoire.add_argument("--user", default=None, help="ник на Lichess")
     repertoire.add_argument("--game", default=None, help="id конкретной партии")
     repertoire.add_argument("--color", default="both", choices=["white", "black", "both"], help="цвет роли (по умолчанию %(default)s)")
-    repertoire.add_argument("--max-depth", type=int, default=8, help="глубина дерева репертуара (по умолчанию %(default)s)")
+    repertoire.add_argument("--max-depth", type=int, default=16, help="глубина дерева репертуара, ходов пользователя (по умолчанию %(default)s)")
     repertoire.add_argument("--min-count", type=int, default=1, help="мин. число партий для строки (по умолчанию %(default)s)")
     repertoire.add_argument("--opening", nargs="+", default=None, help="фрагменты имён дебютов для фильтра (регистронезависимо)")
     repertoire.add_argument("--pgn", default=None, help="куда писать PGN (для both — объединение цветов); по умолчанию data/repertoire_{цвет}.pgn")

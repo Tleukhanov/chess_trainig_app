@@ -143,7 +143,7 @@ class CliParserTests(unittest.TestCase):
         self.assertEqual(args.user, "X")
         self.assertIsNone(args.game)
         self.assertEqual(args.color, "both")
-        self.assertEqual(args.max_depth, 8)
+        self.assertEqual(args.max_depth, 16)
         self.assertEqual(args.min_count, 1)
         self.assertIsNone(args.opening)
         self.assertIsNone(args.pgn)
