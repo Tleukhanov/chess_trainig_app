@@ -57,13 +57,18 @@
 
 - Личный дебютный репертуар по ТВОИМ ходам из проанализированных партий:
   `python -m trainer repertoire --user NICK` печатает деревья твоих линий
-  отдельно для белых и чёрных с числом партий и прочностью по фазам дерева,
-  помечая слабые линии («⚠ слабое место»).
+  отдельно для белых и чёрных с числом партий и прочностью линии
+  (накопительная доля хороших ходов по всему пути), помечая слабые линии
+  («⚠ слабое место»).
 - Таблица «Слабые места репертуара»: дебюты с наибольшим числом зевков/ошибок
   на партию и средними потерями win% — куда смотреть в первую очередь.
 - Экспорт: `data/repertoire_white.pgn` / `data/repertoire_black.pgn`
   (импорт в Lichess) и `data/repertoire.json`; фильтр по фрагментам имён
   дебютов `--opening` и глубина дерева `--max-depth` (ходов пользователя).
+- `plan` — план тренировки из кеша без движка: частые ветви репертуара,
+  слабые дебюты, узоры ошибок и фазы, человечность и дрели одним блоком.
+- `overview` — быстрая сводка тренера (ветви, слабые дебюты, человечность,
+  число дрелей) по кешу.
 
 ## Возможности M1
 
@@ -117,6 +122,10 @@ python -m trainer repertoire --user YOUR_LICHESS_NICK --opening "Sicilian" --no-
 python -m trainer review --user YOUR_LICHESS_NICK
 python -m trainer review --user YOUR_LICHESS_NICK --dry-run   # промпты без вызова API
 python -m trainer review --game GAME_ID                       # одна партия по id
+
+# План тренировки и сводка (из кеша, без движка и сети)
+python -m trainer plan --user YOUR_LICHESS_NICK
+python -m trainer overview --user YOUR_LICHESS_NICK
 
 # Тесты
 python -m unittest discover -s tests -v

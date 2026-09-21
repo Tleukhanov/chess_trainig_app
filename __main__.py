@@ -36,6 +36,7 @@ from app.db import Database
 from app.drills import collect_drills, drills_to_json, drills_to_pgn, summarize
 from app.games import Game, fetch_user_games
 from app.llm import ChatMessage, LLMClient
+from app.plan import build_plan, format_plan
 from app.report import build_report, format_report
 from app.repertoire import (
     Repertoire,
@@ -115,6 +116,16 @@ def _make_parser() -> argparse.ArgumentParser:
     overview.add_argument("--game", default=None, help="id конкретной партии")
     overview.add_argument("--humanity", default=None, help="JSON человечности (по умолчанию data/humanity.json)")
     overview.add_argument("--drills-dir", default=None, help="каталог с дрелями (по умолчанию settings.data_dir)")
+
+    plan = subparsers.add_parser(
+        "plan",
+        help="план тренировки из кеша: ветви репертуара, слабые дебюты, узоры, человечность, дрели (без движка)",
+    )
+    plan.add_argument("--user", default=None, help="ник на Lichess")
+    plan.add_argument("--game", default=None, help="id конкретной партии")
+    plan.add_argument("--humanity", default=None, help="JSON человечности (по умолчанию data/humanity.json)")
+    plan.add_argument("--drills-dir", default=None, help="каталог с дрелями (по умолчанию settings.data_dir)")
+    plan.add_argument("--max-depth", type=int, default=16, help="глубина дерева репертуара, ходов пользователя (по умолчанию %(default)s)")
     return parser
 
 
@@ -864,6 +875,37 @@ def _cmd_overview(args: argparse.Namespace) -> int:
         return 1
 
 
+def _cmd_plan(args: argparse.Namespace) -> int:
+    """Исполняет подкоманду plan: план тренировки из кеша."""
+    try:
+        with Database() as db:
+            db.init_db()
+            pairs = _repertoire_pairs(db, args)
+            humanity = _load_humanity(
+                Path(args.humanity) if args.humanity else settings.data_dir / "humanity.json"
+            )
+            drills_dir = Path(args.drills_dir) if args.drills_dir else settings.data_dir
+            plan_report = build_plan(
+                pairs,
+                user=args.user,
+                humanity=humanity,
+                drills_total=_count_pgn_games(drills_dir / "drills.pgn"),
+                drills_unnatural=_count_pgn_games(drills_dir / "drills_unnatural.pgn"),
+                max_depth=args.max_depth,
+            )
+            print(format_plan(plan_report))
+        return 0
+    except RuntimeError as exc:
+        print(f"Ошибка: {exc}")
+        return 1
+    except KeyboardInterrupt:
+        print("\nПрервано пользователем.")
+        return 130
+    except Exception as exc:
+        print(f"Непредвиденная ошибка: {exc!r}")
+        return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     """Точка входа CLI: разбор аргументов и диспетчеризация подкоманд."""
     parser = _make_parser()
@@ -883,6 +925,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_repertoire(args)
     if args.command == "overview":
         return _cmd_overview(args)
+    if args.command == "plan":
+        return _cmd_plan(args)
     parser.error(f"Неизвестная команда: {args.command}")
     return 2
 
