@@ -279,5 +279,90 @@ class RunRepertoireTests(unittest.TestCase):
         self.assertEqual(len(data["openings"]), 2)
 
 
+class OverviewTests(unittest.TestCase):
+    """Тесты сводки overview: пары, человечность, счёт дрелей, вывод."""
+
+    def setUp(self) -> None:
+        self.cli = _load_cli()
+
+    def _tmp(self) -> Path:
+        tmpdir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmpdir, True)
+        return tmpdir
+
+    def _write_humanity(self, path: Path) -> None:
+        path.write_text(
+            json.dumps(
+                {
+                    "total_bad": 4,
+                    "verdicts": {"natural": 1, "borderline": 1, "unnatural": 2},
+                    "avg_beta": -5.0,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def test_returns_counts_and_prints_sections(self) -> None:
+        tmpdir = self._tmp()
+        humanity = tmpdir / "humanity.json"
+        self._write_humanity(humanity)
+        (tmpdir / "drills.pgn").write_text(
+            '[Event "d1"]\n\n1. e4 e5 1-0\n\n[Event "d2"]\n\n1. d4 d5 1-0\n',
+            encoding="utf-8",
+        )
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result = self.cli["_run_overview"](
+                fixture_pairs(),
+                user="u",
+                humanity_path=humanity,
+                drills_dir=tmpdir,
+            )
+        text = output.getvalue()
+        self.assertEqual(result["games"], 2)
+        self.assertGreaterEqual(result["white_lines"], 1)
+        self.assertEqual(result["black_lines"], 0)
+        self.assertEqual(result["openings"], 2)
+        self.assertEqual(result["humanity"]["total"], 4)
+        self.assertEqual(result["humanity"]["unnatural"], 2)
+        self.assertEqual(result["drills_total"], 2)
+        self.assertEqual(result["drills_unnatural"], 0)
+        self.assertIn("Сводка по кешу", text)
+        self.assertIn("Репертуар (частые ветви)", text)
+        self.assertIn("Слабые места репертуара", text)
+        self.assertIn("Человечность ошибок", text)
+        self.assertIn("неестественных: 2", text)
+
+    def test_missing_humanity_and_drills(self) -> None:
+        tmpdir = self._tmp()
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result = self.cli["_run_overview"](
+                fixture_pairs(),
+                humanity_path=tmpdir / "nope.json",
+                drills_dir=tmpdir,
+            )
+        self.assertIsNone(result["humanity"])
+        self.assertEqual(result["drills_total"], 0)
+        self.assertIn("запусти: python -m trainer humanize", output.getvalue())
+
+    def test_parser_defaults(self) -> None:
+        parser = self.cli["_make_parser"]()
+        args = parser.parse_args(["overview", "--user", "X"])
+        self.assertEqual(args.command, "overview")
+        self.assertEqual(args.user, "X")
+        self.assertIsNone(args.humanity)
+        self.assertIsNone(args.drills_dir)
+
+    def test_dispatch_overview(self) -> None:
+        parser = self.cli["_make_parser"]()
+        args = parser.parse_args(["overview", "--user", "u"])
+        self.assertEqual(args.command, "overview")
+        # неизвестный юзер в реальном кеше → аккуратный код 1, а не падение
+        with redirect_stdout(io.StringIO()):
+            code = self.cli["main"](["overview", "--user", "__no_such_user__"])
+        self.assertEqual(code, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

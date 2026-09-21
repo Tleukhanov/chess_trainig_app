@@ -78,7 +78,13 @@ class RepertoireNode:
 
 @dataclass(frozen=True, slots=True)
 class LineSummary:
-    """Сводка одной дебютной линии: последовательность ходов пользователя."""
+    """Сводка одной дебютной линии: последовательность ходов пользователя.
+
+    ``count``/``ok``/``bad``/``ok_rate`` — статистика ПОСЛЕДНЕГО узла линии
+    (сколько раз ты сыграл этот ход и как). ``path_ok``/``path_bad``/
+    ``path_ok_rate`` — накопительная статистика ВСЕЙ линии (всех ходов
+    пользователя на пути): это честная «прочность линии».
+    """
 
     moves: tuple[str, ...]
     count: int
@@ -86,6 +92,16 @@ class LineSummary:
     bad: int
     ok_rate: float | None
     games: list[str]
+    path_ok: int = 0
+    path_bad: int = 0
+
+    @property
+    def path_ok_rate(self) -> float | None:
+        """Доля «хороших» ходов пользователя по всей линии (None, если пусто)."""
+        total = self.path_ok + self.path_bad
+        if total == 0:
+            return None
+        return self.path_ok / total
 
 
 class Repertoire:
@@ -135,14 +151,14 @@ class Repertoire:
         """Все линии дерева цвета (DFS), включая префиксы-предки.
 
         Для каждого пройденного узла (кроме корня) формируется LineSummary
-        со статистикой этого узла, если count >= min_count. max_depth None —
-        весь путь.
+        с накопительной (path) статистикой всей линии, если count >= min_count.
+        max_depth None — весь путь.
         """
         root = self.white if color == "white" else self.black
         result: list[LineSummary] = []
         path: list[str] = []
 
-        def walk(node: RepertoireNode, depth: int) -> None:
+        def walk(node: RepertoireNode, depth: int, acc_ok: int, acc_bad: int) -> None:
             if node.move is not None:
                 if node.count >= min_count and (max_depth is None or depth <= max_depth):
                     result.append(
@@ -153,16 +169,18 @@ class Repertoire:
                             bad=node.bad,
                             ok_rate=node.ok_rate,
                             games=list(node.games),
+                            path_ok=acc_ok + node.ok,
+                            path_bad=acc_bad + node.bad,
                         )
                     )
                 if max_depth is not None and depth >= max_depth:
                     return
             for san, child in node.children.items():
                 path.append(san)
-                walk(child, depth + 1)
+                walk(child, depth + 1, acc_ok + node.ok, acc_bad + node.bad)
                 path.pop()
 
-        walk(root, 0)
+        walk(root, 0, 0, 0)
         return result
 
     def weak_lines(
@@ -172,11 +190,11 @@ class Repertoire:
         min_count: int = 1,
         max_ok_rate: float = 0.7,
     ) -> list[LineSummary]:
-        """Слабые линии: прочность ниже порога max_ok_rate (строго)."""
+        """Слабые линии: прочность ВСЕЙ линии ниже порога max_ok_rate (строго)."""
         return [
             line
             for line in self.lines(color, min_count=min_count)
-            if line.ok_rate is not None and line.ok_rate < max_ok_rate
+            if line.path_ok_rate is not None and line.path_ok_rate < max_ok_rate
         ]
 
 
@@ -351,6 +369,9 @@ def repertoire_to_json(repertoire: Repertoire, pairs: list[tuple[Game, dict]]) -
                 "ok": line.ok,
                 "bad": line.bad,
                 "ok_rate": line.ok_rate,
+                "path_ok": line.path_ok,
+                "path_bad": line.path_bad,
+                "path_ok_rate": line.path_ok_rate,
             }
             for line in repertoire.lines(color)
         ]
@@ -383,12 +404,14 @@ def format_lines(
     limit: int = 40,
     max_ok_rate_warn: float = 0.7,
 ) -> str:
-    """Человеческий вывод линий для CLI: прочность и пометка слабых мест.
+    """Человеческий вывод линий для CLI: прочность линии и пометка слабых мест.
 
     Строки урезаются до ``limit`` лучших по числу партий; ход выводится как
-    «N.SAN» (номер полного хода = index+1), до 12 значащих символов на ход
-    и до 12 ходов. Линии с прочностью ниже ``max_ok_rate_warn`` помечаются
-    «⚠ слабое место» в конце строки (порог отключается значением None).
+    «N.SAN» (N — номер хода пользователя в линии), до 12 значащих символов
+    на ход и до 12 ходов (длинные продолжения обрезаются « …»). «Прочность
+    линии» — накопительная доля хороших ходов пользователя по всему пути
+    (``path_ok_rate``). Линии с прочностью ниже ``max_ok_rate_warn`` помечаются
+    «⚠ слабое место» (порог отключается значением None).
     """
     color_ru = "белых" if color == "white" else "чёрных"
     ranked = sorted(lines, key=lambda line: line.count, reverse=True)[:limit]
@@ -402,14 +425,15 @@ def format_lines(
         prefix = " ".join(tokens).rstrip()
         if trimmed:
             prefix += " …"
-        if line.ok_rate is None:
+        rate = line.path_ok_rate
+        if rate is None:
             tail = f"[{line.count} {_plural_games(line.count)}]"
         else:
-            tail = f"[{line.count} {_plural_games(line.count)}, прочность {line.ok_rate * 100:.0f}%]"
+            tail = f"[{line.count} {_plural_games(line.count)}, прочность {rate * 100:.0f}%]"
         warn = (
             max_ok_rate_warn is not None
-            and line.ok_rate is not None
-            and line.ok_rate < max_ok_rate_warn
+            and rate is not None
+            and rate < max_ok_rate_warn
         )
         suffix = "  ⚠ слабое место" if warn else ""
         out.append(f"  {prefix}   {tail}{suffix}")

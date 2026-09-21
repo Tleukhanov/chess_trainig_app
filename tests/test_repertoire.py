@@ -211,6 +211,70 @@ class RepertoireAddGameTests(unittest.TestCase):
         )
         self.assertEqual(summary.games, ["a", "b", "c"])
         self.assertEqual(summary.count, 3)
+        self.assertEqual(summary.path_ok, 0)
+        self.assertEqual(summary.path_bad, 0)
+        self.assertIsNone(summary.path_ok_rate)
+
+    def test_path_stats_cumulative_along_line(self) -> None:
+        game = mkgame(
+            "g6",
+            ["e4", "e5", "Nf3", "Nc6", "Bc4", "Nf6"],
+            "white",
+            "win",
+        )
+        analysis = mkanalysis(
+            "white",
+            6,
+            [
+                ("e4", "good"), ("e5", "best"), ("Nf3", "mistake"), ("Nc6", "best"),
+                ("Bc4", "good"), ("Nf6", "best"),
+            ],
+        )
+        repertoire = Repertoire()
+        repertoire.add_game(game, analysis)
+        by_moves = {line.moves: line for line in repertoire.lines("white")}
+
+        e4 = by_moves[("e4",)]
+        self.assertEqual((e4.path_ok, e4.path_bad), (1, 0))
+        self.assertEqual(e4.path_ok_rate, 1.0)
+
+        nf3 = by_moves[("e4", "Nf3")]
+        self.assertEqual((nf3.path_ok, nf3.path_bad), (1, 1))
+        self.assertEqual(nf3.path_ok_rate, 0.5)
+
+        bc4 = by_moves[("e4", "Nf3", "Bc4")]
+        self.assertEqual((bc4.path_ok, bc4.path_bad), (2, 1))
+        self.assertAlmostEqual(bc4.path_ok_rate, 2 / 3)
+        # узел Bc4 «хороший», но вся линия с ошибкой посередине — слабая
+        weak = repertoire.weak_lines("white", max_ok_rate=0.7)
+        self.assertEqual(
+            [line.moves for line in weak],
+            [("e4", "Nf3"), ("e4", "Nf3", "Bc4")],
+        )
+
+    def test_deep_isolated_blunder_not_weak_line(self) -> None:
+        game = mkgame(
+            "g7",
+            ["e4", "e5", "Nf3", "Nc6", "Bc4", "Nf6", "d3", "d6", "Bg5", "Be7", "Bd3", "O-O"],
+            "white",
+            "win",
+        )
+        spec = [("e4", "good"), ("e5", "best"), ("Nf3", "good"), ("Nc6", "best"),
+                ("Bc4", "good"), ("Nf6", "best"), ("d3", "good"), ("d6", "best"),
+                ("Bg5", "good"), ("Be7", "best"), ("Bd3", "mistake"), ("O-O", "best")]
+        analysis = mkanalysis("white", 12, spec)
+        repertoire = Repertoire()
+        repertoire.add_game(game, analysis)
+
+        deep = {line.moves: line for line in repertoire.lines("white")}[
+            ("e4", "Nf3", "Bc4", "d3", "Bg5", "Bd3")
+        ]
+        self.assertEqual(deep.ok_rate, 0.0)  # последний ход узла — ошибка
+        self.assertAlmostEqual(deep.path_ok_rate, 5 / 6)  # но линия в целом крепкая
+        self.assertNotIn(
+            deep.moves,
+            [line.moves for line in repertoire.weak_lines("white", max_ok_rate=0.7)],
+        )
 
 
 class OpeningStatsTests(unittest.TestCase):

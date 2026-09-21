@@ -107,6 +107,14 @@ def _make_parser() -> argparse.ArgumentParser:
     repertoire.add_argument("--pgn", default=None, help="куда писать PGN (для both — объединение цветов); по умолчанию data/repertoire_{цвет}.pgn")
     repertoire.add_argument("--json", metavar="PATH", default=None, help="куда писать JSON (по умолчанию data/repertoire.json)")
     repertoire.add_argument("--no-write", action="store_true", help="не писать файлы PGN/JSON, только печать")
+
+    overview = subparsers.add_parser(
+        "overview", help="сводка тренера из кеша: ветви репертуара, слабые дебюты, человечность, дрели (без движка и сети)"
+    )
+    overview.add_argument("--user", default=None, help="ник на Lichess")
+    overview.add_argument("--game", default=None, help="id конкретной партии")
+    overview.add_argument("--humanity", default=None, help="JSON человечности (по умолчанию data/humanity.json)")
+    overview.add_argument("--drills-dir", default=None, help="каталог с дрелями (по умолчанию settings.data_dir)")
     return parser
 
 
@@ -629,6 +637,29 @@ def _repertoire_pairs(db: Database, args: argparse.Namespace) -> list[tuple[Game
     return pairs
 
 
+def _print_opening_stats_table(stats: list[dict], *, limit: int = 12) -> None:
+    """Печатает таблицу «Слабые места репертуара» (топ-`limit` по ошибкам)."""
+    if not stats:
+        print("Слабые места репертуара: нет данных.")
+        return
+    print("Слабые места репертуара:")
+    print(
+        "  {:<38} {:>5} {:>7} {:>11} {:>11}".format(
+            "Название", "игр", "оч%", "зев·ош/игру", "ср.потери%"
+        )
+    )
+    for row in stats[:limit]:
+        print(
+            "  {:<38} {:>5} {:>6.0f}% {:>12.2f} {:>10.1f}%".format(
+                row["opening"],
+                row["games"],
+                row["points_pct"],
+                row["errors_per_game"],
+                row["avg_drop"],
+            )
+        )
+
+
 def _run_repertoire(
     pairs: list[tuple[Game, dict]], args: argparse.Namespace
 ) -> dict:
@@ -657,22 +688,7 @@ def _run_repertoire(
         ]
 
     if stats:
-        print("Слабые места репертуара:")
-        print(
-            "  {:<38} {:>5} {:>7} {:>11} {:>11}".format(
-                "Название", "игр", "оч%", "зев·ош/игру", "ср.потери%"
-            )
-        )
-        for row in stats[:12]:
-            print(
-                "  {:<38} {:>5} {:>6.0f}% {:>12.2f} {:>10.1f}%".format(
-                    row["opening"],
-                    row["games"],
-                    row["points_pct"],
-                    row["errors_per_game"],
-                    row["avg_drop"],
-                )
-            )
+        _print_opening_stats_table(stats)
     else:
         print("Слабые места репертуара: нет данных.")
 
@@ -727,6 +743,127 @@ def _cmd_repertoire(args: argparse.Namespace) -> int:
         return 1
 
 
+def _load_humanity(path: Path) -> dict | None:
+    """Читает data/humanity.json: возвращает {total, natural, borderline, unnatural} или None."""
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    verdicts = data.get("verdicts") if isinstance(data, dict) else None
+    if not isinstance(verdicts, dict):
+        return None
+    total = data.get("total_bad")
+    if not isinstance(total, int):
+        total = sum(
+            int(v) for v in verdicts.values() if isinstance(v, (int, float))
+        )
+    counts = {
+        label: int(verdicts.get(label, 0) or 0)
+        for label in ("natural", "borderline", "unnatural")
+    }
+    return {"total": total, **counts}
+
+
+def _count_pgn_games(path: Path) -> int:
+    """Число партий в PGN-файле (по заголовкам [Event …])."""
+    if not path.exists():
+        return 0
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return 0
+    return sum(1 for line in text.splitlines() if line.startswith("[Event ")) if text.strip() else 0
+
+
+def _run_overview(
+    pairs: list[tuple[Game, dict]],
+    *,
+    user: str | None = None,
+    humanity_path: Path | None = None,
+    drills_dir: Path | None = None,
+) -> dict:
+    """Сводка из кеша без движка и сети: ветви, слабости, человечность, дрели."""
+    repertoire = Repertoire()
+    for game, analysis in pairs:
+        repertoire.add_game(game, analysis)
+
+    print(f"Сводка по кешу · партий: {len(pairs)}")
+    print("\n--- Репертуар (частые ветви) ---")
+    branch_counts: dict[str, int] = {}
+    for color in ("white", "black"):
+        candidates = [
+            line
+            for line in repertoire.lines(color, min_count=1)
+            if len(line.moves) <= 4
+        ]
+        if not candidates:
+            continue
+        strong = [line for line in candidates if line.count >= 2]
+        chosen = sorted(strong or candidates, key=lambda line: line.count, reverse=True)[:8]
+        branch_counts[color] = len(chosen)
+        print(format_lines(color, chosen, limit=8))
+
+    stats = opening_stats(pairs, user=user)
+    print("\n--- Слабые места репертуара ---")
+    _print_opening_stats_table(stats, limit=8)
+
+    humanity = _load_humanity(humanity_path) if humanity_path is not None else None
+    print("\n--- Человечность ошибок ---")
+    if humanity:
+        print(
+            "Всего плохих ходов: {total} · естественных: {natural} · "
+            "пограничных: {borderline} · неестественных: {unnatural}".format(**humanity)
+        )
+    else:
+        print(f"Нет файла {humanity_path} — запусти: python -m trainer humanize --user NICK")
+
+    out_dir = drills_dir if drills_dir is not None else settings.data_dir
+    drills_total = _count_pgn_games(out_dir / "drills.pgn")
+    drills_unnatural = _count_pgn_games(out_dir / "drills_unnatural.pgn")
+    print("\n--- Дрели ---")
+    print(f"data/drills.pgn: {drills_total} партий · data/drills_unnatural.pgn: {drills_unnatural}")
+
+    return {
+        "games": len(pairs),
+        "white_lines": branch_counts.get("white", 0),
+        "black_lines": branch_counts.get("black", 0),
+        "openings": len(stats),
+        "humanity": humanity,
+        "drills_total": drills_total,
+        "drills_unnatural": drills_unnatural,
+    }
+
+
+def _cmd_overview(args: argparse.Namespace) -> int:
+    """Исполняет подкоманду overview: сводка тренера из кеша."""
+    try:
+        with Database() as db:
+            db.init_db()
+            pairs = _repertoire_pairs(db, args)
+            drills_dir = Path(args.drills_dir) if args.drills_dir else None
+            humanity_path = (
+                Path(args.humanity) if args.humanity else settings.data_dir / "humanity.json"
+            )
+            _run_overview(
+                pairs,
+                user=args.user,
+                humanity_path=humanity_path,
+                drills_dir=drills_dir,
+            )
+        return 0
+    except RuntimeError as exc:
+        print(f"Ошибка: {exc}")
+        return 1
+    except KeyboardInterrupt:
+        print("\nПрервано пользователем.")
+        return 130
+    except Exception as exc:
+        print(f"Непредвиденная ошибка: {exc!r}")
+        return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     """Точка входа CLI: разбор аргументов и диспетчеризация подкоманд."""
     parser = _make_parser()
@@ -744,6 +881,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_humanize(args)
     if args.command == "repertoire":
         return _cmd_repertoire(args)
+    if args.command == "overview":
+        return _cmd_overview(args)
     parser.error(f"Неизвестная команда: {args.command}")
     return 2
 
