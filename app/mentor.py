@@ -15,6 +15,7 @@ import time
 from typing import Any
 
 from .llm import ChatMessage, LLMClient
+from .progress import progress_brief
 
 __all__ = [
     "build_mentor_request",
@@ -98,8 +99,13 @@ def build_mentor_request(
     plan: dict[str, Any],
     *,
     extra: str = "",
+    progress: dict[str, Any] | None = None,
 ) -> list[ChatMessage]:
-    """Собирает (системный, пользовательский) запрос для тренера из плана."""
+    """Собирает (системный, пользовательский) запрос для тренера из плана.
+
+    ``progress`` — необязательная динамика (dict из ``build_progress``):
+    если передана, в запрос добавляется секция ДИНАМИКА с трендом.
+    """
     rep = plan.get("repertoire", {})
     repertoire_txt = "\n\n".join(
         f"{color_ru}: \n{_branch_lines(rep.get(color, []))}"
@@ -139,6 +145,21 @@ def build_mentor_request(
         sections.append("")
         sections.append("ОСОБЫЕ ПОЖЕЛАНИЯ ИГРОКА (учти их в плане):")
         sections.append(textwrap.indent(extra.strip(), "  "))
+
+    if progress:
+        sections.append("")
+        sections.append("ДИНАМИКА (сравни окна: ранние vs последние партии):")
+        brief = progress_brief(progress)
+        if brief:
+            sections.append(textwrap.indent(brief, "  "))
+        rows = progress.get("windows_rows") or []
+        latest = rows[-1] if rows else None
+        if latest:
+            sections.append(
+                f"  последнее окно ({latest.get('dates', '—')}): {latest.get('games')} партий, "
+                f"очки {latest.get('score_pct')}%, ACPL {latest.get('acpl')}, "
+                f"неестественных промахов {latest.get('unnatural_share_pct')}%"
+            )
 
     user_text = "\n".join(sections)
 

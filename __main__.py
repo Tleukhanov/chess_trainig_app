@@ -38,6 +38,7 @@ from app.games import Game, fetch_user_games
 from app.llm import ChatMessage, LLMClient
 from app.mentor import build_mentor_request, format_mentor_reply, run_mentor
 from app.plan import build_plan, format_plan
+from app.progress import build_progress, format_progress
 from app.report import build_report, format_report
 from app.repertoire import (
     Repertoire,
@@ -143,8 +144,18 @@ def _make_parser() -> argparse.ArgumentParser:
     mentor.add_argument("--key", default=None, help="API-ключ (переопределяет LLM_API_KEY)")
     mentor.add_argument("--base-url", default=None, help="базовый URL API (переопределяет LLM_BASE_URL)")
     mentor.add_argument("--timeout", type=float, default=180.0, help="таймаут запроса к LLM, сек (по умолчанию %(default)s)")
+    mentor.add_argument("--no-progress", action="store_true", help="не включать тренд динамики в запрос тренера")
     mentor.add_argument("--dry-run", action="store_true", help="не звать LLM: вывести готовый промпт")
     mentor.add_argument("--json", metavar="PATH", default=None, help="сохранить ответ тренера дополнительно в JSON")
+
+    progress = subparsers.add_parser(
+        "progress", help="динамика прогресса по временным окнам (из кеша, без движка и сети)"
+    )
+    progress.add_argument("--user", default=None, help="ник на Lichess")
+    progress.add_argument("--game", default=None, help="id конкретной партии")
+    progress.add_argument("--humanity", default=None, help="JSON человечности (по умолчанию data/humanity.json)")
+    progress.add_argument("--windows", type=int, default=5, help="число временных окон (по умолчанию %(default)s)")
+    progress.add_argument("--json", metavar="PATH", default=None, help="сохранить динамику дополнительно в JSON")
     return parser
 
 
@@ -955,19 +966,25 @@ def _cmd_mentor(args: argparse.Namespace) -> int:
         with Database() as db:
             db.init_db()
             pairs = _repertoire_pairs(db, args)
-            humanity = _load_humanity(
-                Path(args.humanity) if args.humanity else settings.data_dir / "humanity.json"
-            )
             drills_dir = Path(args.drills_dir) if args.drills_dir else settings.data_dir
+            humanity_path = Path(args.humanity) if args.humanity else settings.data_dir / "humanity.json"
             plan_report = build_plan(
                 pairs,
                 user=args.user,
-                humanity=humanity,
+                humanity=_load_humanity(humanity_path),
                 drills_total=_count_pgn_games(drills_dir / "drills.pgn"),
                 drills_unnatural=_count_pgn_games(drills_dir / "drills_unnatural.pgn"),
                 max_depth=args.max_depth,
             )
-            request = build_mentor_request(plan_report, extra=args.notes or "")
+            progress_report = None
+            if not args.no_progress:
+                progress_report = build_progress(
+                    pairs,
+                    user=args.user,
+                    humanity=_load_humanity_raw(humanity_path),
+                    windows=5,
+                )
+            request = build_mentor_request(plan_report, extra=args.notes or "", progress=progress_report)
 
             if args.dry_run:
                 print("=== mentor: готовые промпты ===")
@@ -1011,6 +1028,47 @@ def _cmd_mentor(args: argparse.Namespace) -> int:
         return 1
 
 
+def _load_humanity_raw(path: Path) -> dict | None:
+    """Читает data/humanity.json целиком ({items: [...]}) или None, если нет."""
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _cmd_progress(args: argparse.Namespace) -> int:
+    """Исполняет подкоманду progress: динамика прогресса по окнам из кеша."""
+    try:
+        with Database() as db:
+            db.init_db()
+            pairs = _repertoire_pairs(db, args)
+            humanity = _load_humanity_raw(
+                Path(args.humanity) if args.humanity else settings.data_dir / "humanity.json"
+            )
+            progress_report = build_progress(
+                pairs,
+                user=args.user,
+                humanity=humanity,
+                windows=args.windows,
+            )
+            print(format_progress(progress_report))
+            if args.json:
+                _dump_json(progress_report, args.json)
+        return 0
+    except RuntimeError as exc:
+        print(f"Ошибка: {exc}")
+        return 1
+    except KeyboardInterrupt:
+        print("\nПрервано пользователем.")
+        return 130
+    except Exception as exc:
+        print(f"Непредвиденная ошибка: {exc!r}")
+        return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     """Точка входа CLI: разбор аргументов и диспетчеризация подкоманд."""
     parser = _make_parser()
@@ -1034,6 +1092,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_plan(args)
     if args.command == "mentor":
         return _cmd_mentor(args)
+    if args.command == "progress":
+        return _cmd_progress(args)
     parser.error(f"Неизвестная команда: {args.command}")
     return 2
 
