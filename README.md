@@ -67,6 +67,11 @@
   дебютов `--opening` и глубина дерева `--max-depth` (ходов пользователя).
 - `plan` — план тренировки из кеша без движка: частые ветви репертуара,
   слабые дебюты, узоры ошибок и фазы, человечность и дрели одним блоком.
+- `mentor` — LLM-тренер: собирает ту же сводку из кеша и через OpenRouter
+  (или любой OpenAI-совместимый API) даёт разговорный разбор твоего стиля
+  игры и персональный план тренировки, учитывая доп. заметки игрока
+  (`--notes`). Модель, ключ и URL — из env (`LLM_MODEL`, `LLM_API_KEY`,
+  `LLM_BASE_URL`) или флагов `--model/--key/--base-url`.
 - `overview` — быстрая сводка тренера (ветви, слабые дебюты, человечность,
   число дрелей) по кешу.
 
@@ -126,6 +131,14 @@ python -m trainer review --game GAME_ID                       # одна пар�
 # План тренировки и сводка (из кеша, без движка и сети)
 python -m trainer plan --user YOUR_LICHESS_NICK
 python -m trainer overview --user YOUR_LICHESS_NICK
+
+# LLM-тренер: расскажет стиль игры и составит персональный план,
+# учитывая твои доп. заметки (цели, время, слабые места — передай через --notes)
+python -m trainer mentor --user YOUR_LICHESS_NICK
+python -m trainer mentor --user YOUR_LICHESS_NICK --notes "Хочу усилить эндшпиль, 30 мин/день"
+python -m trainer mentor --user YOUR_LICHESS_NICK --dry-run   # промпт без вызова API
+python -m trainer mentor --user YOUR_LICHESS_NICK --json data/mentor.json
+# модель/ключ/URL — из env LLM_MODEL, LLM_API_KEY, LLM_BASE_URL (или флаги --model/--key/--base-url)
 
 # Тесты
 python -m unittest discover -s tests -v

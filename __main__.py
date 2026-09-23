@@ -36,6 +36,7 @@ from app.db import Database
 from app.drills import collect_drills, drills_to_json, drills_to_pgn, summarize
 from app.games import Game, fetch_user_games
 from app.llm import ChatMessage, LLMClient
+from app.mentor import build_mentor_request, format_mentor_reply, run_mentor
 from app.plan import build_plan, format_plan
 from app.report import build_report, format_report
 from app.repertoire import (
@@ -58,7 +59,8 @@ def _make_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", metavar="КОМАНДА")
 
     coach = subparsers.add_parser("coach", help="анализ партий и построение отчёта")
-    coach.add_argument("--user", required=True, help="ник на Lichess")
+    coach.add_argument("--user", default=None, help="ник на Lichess (не нужен при --game)")
+    coach.add_argument("--game", nargs="*", default=None, help="id партий (один или несколько): переанализировать их из кеша точечно, вместе с --depth")
     coach.add_argument("--max", type=int, default=settings.games_max, help="сколько партий взять (по умолчанию %(default)s)")
     coach.add_argument("--perf", default="rapid", help="пул партий: rapid/classical/blitz/...")
     coach.add_argument("--depth", type=int, default=settings.stockfish_depth, help="глубина анализа Stockfish")
@@ -126,6 +128,22 @@ def _make_parser() -> argparse.ArgumentParser:
     plan.add_argument("--humanity", default=None, help="JSON человечности (по умолчанию data/humanity.json)")
     plan.add_argument("--drills-dir", default=None, help="каталог с дрелями (по умолчанию settings.data_dir)")
     plan.add_argument("--max-depth", type=int, default=16, help="глубина дерева репертуара, ходов пользователя (по умолчанию %(default)s)")
+
+    mentor = subparsers.add_parser(
+        "mentor",
+        help="LLM-тренер: опиши стиль игры и составь план с учётом доп. заметок игрока (OpenRouter/LLM)",
+    )
+    mentor.add_argument("--user", default=None, help="ник на Lichess")
+    mentor.add_argument("--game", default=None, help="id конкретной партии")
+    mentor.add_argument("--humanity", default=None, help="JSON человечности (по умолчанию data/humanity.json)")
+    mentor.add_argument("--drills-dir", default=None, help="каталог с дрелями (по умолчанию settings.data_dir)")
+    mentor.add_argument("--max-depth", type=int, default=16, help="глубина дерева репертуара, ходов пользователя (по умолчанию %(default)s)")
+    mentor.add_argument("--notes", default=None, help="твои доп. заметки/дополнительные вещи, которые должна учесть модель (цели, слабые места, время на тренировки и т.п.)")
+    mentor.add_argument("--model", default=None, help="модель LLM (переопределяет LLM_MODEL)")
+    mentor.add_argument("--key", default=None, help="API-ключ (переопределяет LLM_API_KEY)")
+    mentor.add_argument("--base-url", default=None, help="базовый URL API (переопределяет LLM_BASE_URL)")
+    mentor.add_argument("--dry-run", action="store_true", help="не звать LLM: вывести готовый промпт")
+    mentor.add_argument("--json", metavar="PATH", default=None, help="сохранить ответ тренера дополнительно в JSON")
     return parser
 
 
@@ -364,16 +382,40 @@ def _cmd_coach(args: argparse.Namespace) -> int:
     try:
         with Database() as db:
             db.init_db()
-            games = _load_games(db, args)
+            if args.game:
+                if not args.user:
+                    args.user = "?"
+                ids = list(args.game)
+                games = []
+                missing = [gid for gid in ids if db.get_game(gid) is None]
+                if missing:
+                    raise RuntimeError(
+                        f"Партии не найдены в кеше: {', '.join(missing)}. "
+                        "Сначала загрузи их: python -m trainer coach --user <NICK>"
+                    )
+                for gid in ids:
+                    game = db.get_game(gid)
+                    if game is not None:
+                        games.append(game)
+                print(
+                    f"Точечный переанализ {len(games)} партий (пользователь {args.user}, "
+                    f"глубина {args.depth}, multipv {args.multipv}) — движок работает, "
+                    "перезапись кеша для этих партий."
+                )
+            else:
+                if not args.user:
+                    raise RuntimeError("Укажи --user или --game")
+                games = _load_games(db, args)
 
             qualified = [game for game in games if game.is_finished() and game.moves]
             skipped = len(games) - len(qualified)
             if skipped:
                 print(f"Пропущено незавершённых или пустых партий: {skipped}.")
 
-            if args.refresh:
+            if args.refresh or args.game:
                 target = list(qualified)
-                print(f"Режим --refresh: переанализирую {len(target)} партий с перезаписью кеша.")
+                if not args.game:
+                    print(f"Режим --refresh: переанализирую {len(target)} партий с перезаписью кеша.")
             else:
                 game_ids = [game.id for game in qualified]
                 unanalyzed = set(db.get_unanalyzed(game_ids))
@@ -906,6 +948,68 @@ def _cmd_plan(args: argparse.Namespace) -> int:
         return 1
 
 
+def _cmd_mentor(args: argparse.Namespace) -> int:
+    """Исполняет подкоманду mentor: LLM-тренер, стиль игры и план с доп. заметками."""
+    try:
+        with Database() as db:
+            db.init_db()
+            pairs = _repertoire_pairs(db, args)
+            humanity = _load_humanity(
+                Path(args.humanity) if args.humanity else settings.data_dir / "humanity.json"
+            )
+            drills_dir = Path(args.drills_dir) if args.drills_dir else settings.data_dir
+            plan_report = build_plan(
+                pairs,
+                user=args.user,
+                humanity=humanity,
+                drills_total=_count_pgn_games(drills_dir / "drills.pgn"),
+                drills_unnatural=_count_pgn_games(drills_dir / "drills_unnatural.pgn"),
+                max_depth=args.max_depth,
+            )
+            request = build_mentor_request(plan_report, extra=args.notes or "")
+
+            if args.dry_run:
+                print("=== mentor: готовые промпты ===")
+                for message in request:
+                    print(f"-- {message.role}:")
+                    _print_wrapped(message.content)
+                return 0
+
+            kwargs: dict = {}
+            if args.model:
+                kwargs["model"] = args.model
+            if args.key:
+                kwargs["api_key"] = args.key
+            if args.base_url:
+                kwargs["base_url"] = args.base_url
+            llm = LLMClient(**kwargs)
+            print(f"Модель: {llm.model} · базовый URL: {llm.base_url}")
+            reply = run_mentor(llm, request)
+            text = format_mentor_reply(reply)
+            print("=== ответ тренера ===")
+            _print_wrapped(text, width=90, indent="")
+            if args.json:
+                _dump_json(
+                    {
+                        "user": plan_report.get("user"),
+                        "model": llm.model,
+                        "notes": args.notes or "",
+                        "reply": text,
+                    },
+                    args.json,
+                )
+        return 0
+    except RuntimeError as exc:
+        print(f"Ошибка: {exc}")
+        return 1
+    except KeyboardInterrupt:
+        print("\nПрервано пользователем.")
+        return 130
+    except Exception as exc:
+        print(f"Непредвиденная ошибка: {exc!r}")
+        return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     """Точка входа CLI: разбор аргументов и диспетчеризация подкоманд."""
     parser = _make_parser()
@@ -927,6 +1031,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_overview(args)
     if args.command == "plan":
         return _cmd_plan(args)
+    if args.command == "mentor":
+        return _cmd_mentor(args)
     parser.error(f"Неизвестная команда: {args.command}")
     return 2
 
