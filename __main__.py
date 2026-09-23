@@ -142,6 +142,7 @@ def _make_parser() -> argparse.ArgumentParser:
     mentor.add_argument("--model", default=None, help="модель LLM (переопределяет LLM_MODEL)")
     mentor.add_argument("--key", default=None, help="API-ключ (переопределяет LLM_API_KEY)")
     mentor.add_argument("--base-url", default=None, help="базовый URL API (переопределяет LLM_BASE_URL)")
+    mentor.add_argument("--timeout", type=float, default=180.0, help="таймаут запроса к LLM, сек (по умолчанию %(default)s)")
     mentor.add_argument("--dry-run", action="store_true", help="не звать LLM: вывести готовый промпт")
     mentor.add_argument("--json", metavar="PATH", default=None, help="сохранить ответ тренера дополнительно в JSON")
     return parser
@@ -982,7 +983,7 @@ def _cmd_mentor(args: argparse.Namespace) -> int:
                 kwargs["api_key"] = args.key
             if args.base_url:
                 kwargs["base_url"] = args.base_url
-            llm = LLMClient(**kwargs)
+            llm = LLMClient(timeout=args.timeout, **kwargs)
             print(f"Модель: {llm.model} · базовый URL: {llm.base_url}")
             reply = run_mentor(llm, request)
             text = format_mentor_reply(reply)

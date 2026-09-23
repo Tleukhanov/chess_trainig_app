@@ -103,7 +103,7 @@ class LLMClientTests(unittest.TestCase):
         self.assertNotIn("Authorization", self.last_request()["headers"])
 
     def test_no_key_nonlocal_base_url_raises(self) -> None:
-        client = LLMClient(api_key=None, base_url="https://openrouter.ai/api/v1")
+        client = LLMClient(api_key="", base_url="https://openrouter.ai/api/v1")
         with self.assertRaisesRegex(RuntimeError, "LLM_API_KEY"):
             client.chat([ChatMessage("user", "hi")])
 

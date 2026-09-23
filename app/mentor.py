@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import textwrap
+import time
 from typing import Any
 
 from .llm import ChatMessage, LLMClient
@@ -22,6 +23,9 @@ __all__ = [
 ]
 
 _DASH = "—"
+
+_MAX_TRIES = 3
+_BACKOFF = (1.0, 5.0, 15.0)
 
 _SYSTEM_PROMPT = """Ты — персональный шахматный тренер взрослого игрока с рейтингом ~2100 (КМС).
 Пиши по-русски, конкретно и по делу: без общих слов вроде «больше решай тактику».
@@ -172,5 +176,18 @@ def format_mentor_reply(text: str) -> str:
 
 
 def run_mentor(llm: LLMClient, messages: list[ChatMessage]) -> str:
-    """Зовёт LLM и возвращает текст тренерской рекомендации (без коуча-фаз)."""
-    return llm.chat(messages, temperature=0.5, max_tokens=1200, json_mode=False)
+    """Зовёт LLM и возвращает текст тренерской рекомендации.
+
+    Free-провайдеры OpenRouter периодически отвечают 429/503/пусто —
+    делаем несколько попыток с нарастающей паузой.
+    """
+    last: RuntimeError | None = None
+    for attempt in range(_MAX_TRIES):
+        if attempt:
+            time.sleep(_BACKOFF[min(attempt - 1, len(_BACKOFF) - 1)])
+        try:
+            return llm.chat(messages, temperature=0.5, max_tokens=1600)
+        except RuntimeError as exc:
+            last = exc
+    assert last is not None
+    raise last
