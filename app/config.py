@@ -46,6 +46,11 @@ class Settings:
     lichess_token: str = _cfg("LICHESS_TOKEN", "")
     games_max: int = int(_cfg("GAMES_MAX", "50"))
 
+    # --- FIDE (через публичный Lichess-прокси, без токена) ---
+    fide_base_url: str = _cfg("FIDE_BASE_URL", "https://lichess.org/api/fide")
+    fide_id: str = _cfg("FIDE_ID", "")
+    fide_timeout: int = int(_cfg("FIDE_TIMEOUT", "30"))
+
     # --- данные ---
     data_dir: Path = PROJECT_ROOT / "data"
     db_path: Path = PROJECT_ROOT / "data" / "trainer.db"

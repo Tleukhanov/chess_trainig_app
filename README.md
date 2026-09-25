@@ -17,6 +17,21 @@
 - [x] M2 Слабости и дрели (`coach` — узоры/фазы, `drills` — PGN/JSON)
 - [x] M3 Человеческий слой (`humanize`: Maia/MaiaLite, фильтр дрелей по вердикту)
 - [x] M4 Дебютный репертуар
+- [x] M5 Динамика прогресса (`progress`: метрики по окнам, тренд, вердикт)
+- [x] M6 FIDE-профиль и разбор турнира (`fide`, `tournament`)
+
+## Версии
+
+Проект версионируется по SemVer: текущая версия — **v0.1.0**
+(`python -m trainer --version`). Пока проект в разработке (0.x), минорная
+версия растёт на каждом крупном милестоуне, патч — на фиксах. Дальше
+продолжаем расти: v0.2.0, v0.3.0 и так далее.
+
+- **v0.1.0** — милестоуны M0–M6: окружение и Stockfish, клиент Lichess,
+  SQLite-кеш, CLI (`coach`), LLM-коуч (`review`), слабости и дрели,
+  человеческий слой (`humanize`), дебютный репертуар, динамика прогресса
+  (`progress`), FIDE-профиль с трендом рейтинга (`fide`) и разбор
+  турнира (`tournament`).
 
 ## Возможности M0
 
@@ -80,6 +95,21 @@
   и средний рейтинг; в конце — тренд первого и последнего окна и общий
   вердикт (улучшение / спад / стабильно). Тренд также добавляется в запрос
   `mentor` (отключить: `--no-progress`).
+
+## Возможности M6
+
+- `fide` — профиль и тренд рейтинга FIDE **без токена** (через публичный
+  Lichess-прокси): `python -m trainer fide --id 1503014`. Печатает страну,
+  год рождения, текущий рейтинг (классика/рапид/блиц) и тренд по временным
+  окнам (`--windows`, по умолчанию 4). Ответы кешируются в `data/fide.json`,
+  так что повторный запуск не ходит в сеть; без кеша и без сети команда
+  завершается понятной ошибкой, а не трассировкой.
+- `tournament` — разбор очного турнира (OTB) **полностью офлайн**: ручной ввод
+  результатов вида `--games "Иванов:white:win:2100" --games "Петров:black:draw:2050"`
+  (`opponent:color:result[:рейтинг]`, `color` — `white`/`black`, `result` —
+  `win`/`draw`/`loss`), опционально начальный рейтинг `--initial 2000`.
+  Считает очки, средний рейтинг соперников, перформанс и прирост по K=20.
+- Обе команды умеют `--json ПУТЬ` — выгрузка отчёта в JSON (`ensure_ascii=False`).
 
 ## Возможности M1
 
@@ -151,6 +181,14 @@ python -m trainer mentor --user YOUR_LICHESS_NICK --notes "Хочу усилит
 python -m trainer mentor --user YOUR_LICHESS_NICK --dry-run   # промпт без вызова API
 python -m trainer mentor --user YOUR_LICHESS_NICK --json data/mentor.json
 # модель/ключ/URL — из env LLM_MODEL, LLM_API_KEY, LLM_BASE_URL (или флаги --model/--key/--base-url)
+
+# FIDE-профиль и тренд рейтинга (без токена, через Lichess-прокси; кеш в data/fide.json)
+python -m trainer fide --id YOUR_FIDE_ID
+python -m trainer fide --id YOUR_FIDE_ID --windows 6 --json data/fide.json
+
+# Турнир OTB: ручной ввод результатов, перформанс и прирост рейтинга (без сети)
+python -m trainer tournament --games "Иванов:white:win:2100" --games "Петров:black:draw:2050" --initial 2000
+python -m trainer tournament --games "Иванов:white:win:2100" --json data/tournament.json
 
 # Тесты
 python -m unittest discover -s tests -v

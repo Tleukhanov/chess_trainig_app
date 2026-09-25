@@ -156,6 +156,43 @@ def _make_parser() -> argparse.ArgumentParser:
     progress.add_argument("--humanity", default=None, help="JSON человечности (по умолчанию data/humanity.json)")
     progress.add_argument("--windows", type=int, default=5, help="число временных окон (по умолчанию %(default)s)")
     progress.add_argument("--json", metavar="PATH", default=None, help="сохранить динамику дополнительно в JSON")
+
+    fide = subparsers.add_parser(
+        "fide", help="профиль и тренд рейтинга FIDE (кеш data/fide.json или сеть)"
+    )
+    fide.add_argument(
+        "--id", default=None, help="FIDE ID (по умолчанию — значения из настроек)"
+    )
+    fide.add_argument(
+        "--windows", type=int, default=4, help="число временных окон (по умолчанию %(default)s)"
+    )
+    fide.add_argument(
+        "--json", metavar="PATH", default=None,
+        help="сохранить справку о FIDE дополнительно в JSON",
+    )
+
+    tournament = subparsers.add_parser(
+        "tournament", help="итоги OTB-турнира: очки, перформанс, прирост рейтинга"
+    )
+    tournament.add_argument(
+        "--games",
+        metavar="ОППОНЕНТ:ЦВЕТ:РЕЗУЛЬТАТ[:РЕЙТИНГ_СОПЕРНИКА]",
+        action="append",
+        default=None,
+        help=(
+            "партия турнира: ОППОНЕНТ — имя, ЦВЕТ — white/black, "
+            "РЕЗУЛЬТАТ — win/draw/loss, РЕЙТИНГ_СОПЕРНИКА — число (опционально); "
+            "флаг можно повторять"
+        ),
+    )
+    tournament.add_argument(
+        "--initial", type=int, default=None,
+        help="ваш рейтинг до турнира для прироста (K=20); без него прирост не считается",
+    )
+    tournament.add_argument(
+        "--json", metavar="PATH", default=None,
+        help="сохранить итоги турнира дополнительно в JSON",
+    )
     return parser
 
 
@@ -1069,6 +1106,99 @@ def _cmd_progress(args: argparse.Namespace) -> int:
         return 1
 
 
+def _cmd_fide(args: argparse.Namespace) -> int:
+    """Исполняет подкоманду fide: профиль и тренд рейтинга FIDE."""
+    try:
+        from dataclasses import asdict
+
+        from app.fide import (
+            build_fide_trend,
+            fetch_fide_player,
+            fetch_fide_ratings,
+            format_fide_brief,
+            format_fide_trend,
+        )
+
+        fide_id = str(args.id or settings.fide_id or "").strip()
+        if not fide_id:
+            print("Ошибка: не указан FIDE ID. Передайте --id или задайте FIDE_ID в .env.")
+            return 1
+        player = fetch_fide_player(fide_id)
+        ratings = fetch_fide_ratings(fide_id)
+        trend = build_fide_trend(ratings, windows=args.windows)
+        if player.name:
+            year = f", {player.birth_year}" if player.birth_year else ""
+            print(f"Игрок: {player.name} ({player.federation}{year}) — FIDE {fide_id}")
+        brief = format_fide_brief(trend, user_fide=fide_id)
+        if brief:
+            print(brief)
+        print(format_fide_trend(trend, user_fide=fide_id))
+        if args.json:
+            _dump_json({"id": fide_id, "player": asdict(player), "trend": trend}, args.json)
+        return 0
+    except RuntimeError as exc:
+        print(f"Ошибка: {exc}")
+        return 1
+    except KeyboardInterrupt:
+        print("\nПрервано пользователем.")
+        return 130
+    except Exception as exc:
+        print(f"Непредвиденная ошибка: {exc!r}")
+        return 1
+
+
+def _cmd_tournament(args: argparse.Namespace) -> int:
+    """Исполняет подкоманду tournament: итоги OTB-турнира."""
+    try:
+        from app.fide import TournamentGame, build_tournament_report, format_tournament
+
+        games: list[TournamentGame] = []
+        for spec in args.games or []:
+            parts = [part.strip() for part in spec.split(":")]
+            if len(parts) < 3 or not parts[0]:
+                print(
+                    f"Ошибка: неверный формат партии: {spec!r} "
+                    "(ожидается ОППОНЕНТ:ЦВЕТ:РЕЗУЛЬТАТ[:РЕЙТИНГ_СОПЕРНИКА])"
+                )
+                return 1
+            opponent, color, result = parts[0], parts[1], parts[2]
+            opponent_rating = None
+            if len(parts) > 3 and parts[3]:
+                try:
+                    opponent_rating = int(parts[3])
+                except ValueError:
+                    print(f"Ошибка: рейтинг соперника не число: {parts[3]!r}")
+                    return 1
+            if color not in ("white", "black"):
+                print(f"Ошибка: цвет должен быть white или black, получено: {color!r}")
+                return 1
+            if result not in ("win", "draw", "loss"):
+                print(f"Ошибка: результат должен быть win/draw/loss, получено: {result!r}")
+                return 1
+            games.append(
+                TournamentGame(
+                    opponent=opponent,
+                    color=color,
+                    result=result,
+                    opponent_rating=opponent_rating,
+                )
+            )
+        report = build_tournament_report(games, initial_rating=args.initial)
+        print(format_tournament(report))
+        if args.json:
+            _dump_json(report, args.json)
+        return 0
+    except RuntimeError as exc:
+        print(f"Ошибка: {exc}")
+        return 1
+    except KeyboardInterrupt:
+        print("\nПрервано пользователем.")
+        return 130
+    except Exception as exc:
+        print(f"Непредвиденная ошибка: {exc!r}")
+        return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     """Точка входа CLI: разбор аргументов и диспетчеризация подкоманд."""
     parser = _make_parser()
@@ -1094,6 +1224,10 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_mentor(args)
     if args.command == "progress":
         return _cmd_progress(args)
+    if args.command == "fide":
+        return _cmd_fide(args)
+    if args.command == "tournament":
+        return _cmd_tournament(args)
     parser.error(f"Неизвестная команда: {args.command}")
     return 2
 
