@@ -13,8 +13,9 @@
 
 Два сценария:
   * профиль + тренд рейтинга по временным окнам (как ``progress``);
-  * турнирный режим (``fide --tournament``) — ручной ввод результатов OTB
-    по турам с расчётом очков, перформанса и прироста рейтинга (FIDE K).
+  * турнирный режим (отдельная команда ``tournament``) — ручной ввод
+    результатов OTB по турам с расчётом очков, перформанса и прироста
+    рейтинга (FIDE K).
 """
 
 from __future__ import annotations
@@ -34,17 +35,16 @@ __all__ = [
     "FidePlayer",
     "FideRatings",
     "TournamentGame",
-    "format_fide_brief",
-    "format_fide_report",
-    "format_tournament",
-    "fide_brief",
     "fetch_fide_player",
     "fetch_fide_ratings",
-    "build_fide_report",
+    "parse_fide_history",
     "build_fide_trend",
+    "build_tournament_report",
+    "format_fide_brief",
+    "format_fide_trend",
+    "format_tournament",
     "fide_cache_load",
     "fide_cache_save",
-    "build_tournament_report",
 ]
 
 USER_AGENT = "chess-trainer/0.1 (+https://lichess.org)"
@@ -162,6 +162,12 @@ def _ratings_url(fide_id: str) -> str:
     return f"{base}/player/{urllib.parse.quote(str(fide_id))}/ratings"
 
 
+def _same_fide_id(cached_id: Any, requested_id: str) -> bool:
+    if not requested_id or cached_id is None:
+        return False
+    return str(cached_id).strip() == requested_id
+
+
 def fetch_fide_player(
     fide_id: str,
     *,
@@ -169,12 +175,15 @@ def fetch_fide_player(
     use_cache: bool = True,
 ) -> FidePlayer:
     """Профиль FIDE-игрока; при ``use_cache`` читает и пишет data/fide.json."""
+    requested_id = str(fide_id).strip()
     cached = None
     if use_cache:
         cached = fide_cache_load().get("profile")
-    player = FidePlayer.from_api(cached) if isinstance(cached, dict) else None
+    player = None
+    if isinstance(cached, dict) and _same_fide_id(cached.get("id"), requested_id):
+        player = FidePlayer.from_api(cached)
     if player is None or not player.name:
-        url = _profile_url(fide_id)
+        url = _profile_url(requested_id)
         player = FidePlayer.from_api(_http_json(url, timeout=timeout))
         if use_cache:
             fide_cache_save(profile=player)
@@ -188,17 +197,17 @@ def fetch_fide_ratings(
     use_cache: bool = True,
 ) -> FideRatings:
     """История рейтингов FIDE-игрока (через прокси Lichess)."""
+    requested_id = str(fide_id).strip()
     cached = None
     if use_cache:
         cached = fide_cache_load().get("ratings")
-    if isinstance(cached, dict) and cached:
+    if isinstance(cached, dict) and _same_fide_id(cached.get("id"), requested_id):
         ratings = parse_fide_history(cached)
-        if not ratings.history:
-            pass
-        return ratings
-    ratings = parse_fide_history(_http_json(_ratings_url(fide_id), timeout=timeout))
+        if any(ratings.history.values()):
+            return ratings
+    ratings = parse_fide_history(_http_json(_ratings_url(requested_id), timeout=timeout))
     if use_cache:
-        fide_cache_save(ratings=ratings)
+        fide_cache_save(ratings=ratings, ratings_id=requested_id)
     return ratings
 
 
@@ -225,12 +234,13 @@ def fide_cache_save(
     *,
     profile: FidePlayer | None = None,
     ratings: FideRatings | None = None,
+    ratings_id: str | None = None,
 ) -> Path:
     """Дописывает профиль/историю в data/fide.json; возвращает путь."""
     data = fide_cache_load()
     if profile is not None:
         data["profile"] = {
-            "id": profile.id,
+            "id": str(profile.id).strip(),
             "name": profile.name,
             "federation": profile.federation,
             "year": profile.birth_year,
@@ -246,6 +256,11 @@ def fide_cache_save(
             ]
             for key, points in ratings.history.items()
         }
+        normalized_ratings_id = (
+            str(ratings_id).strip() if ratings_id is not None else ""
+        )
+        if normalized_ratings_id:
+            data["ratings"]["id"] = normalized_ratings_id
     path = _cache_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
