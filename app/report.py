@@ -13,6 +13,7 @@ from datetime import datetime
 from typing import Any
 
 from .games import Game
+from .metrics import METRIC_LABELS, metric
 from .patterns import PHASE_LABELS, weakness_stats
 
 __all__ = ["build_report", "format_report"]
@@ -57,8 +58,8 @@ def build_report(pairs: list[tuple[Game, dict]], user: str) -> dict[str, Any]:
         key = game.result_for_user if game.result_for_user in distribution else "draw"
         distribution[key] += 1
 
-    acpl_values: list[float] = []
-    accuracy_values: list[float] = []
+    avg_win_loss_values: list[float] = []
+    avg_win_before_values: list[float] = []
     blunders_total = 0
     mistakes_total = 0
     inaccuracies_total = 0
@@ -70,10 +71,10 @@ def build_report(pairs: list[tuple[Game, dict]], user: str) -> dict[str, Any]:
     missed_wins: list[dict[str, Any]] = []
 
     for game, analysis in pairs:
-        acpl = float(analysis.get("acpl") or 0.0)
-        accuracy = float(analysis.get("accuracy") or 0.0)
-        acpl_values.append(acpl)
-        accuracy_values.append(accuracy)
+        avg_win_loss = metric(analysis, "avg_win_loss")
+        avg_win_before = metric(analysis, "avg_win_before")
+        avg_win_loss_values.append(avg_win_loss)
+        avg_win_before_values.append(avg_win_before)
 
         blunders = analysis.get("blunders") or []
         mistakes = analysis.get("mistakes") or []
@@ -101,8 +102,8 @@ def build_report(pairs: list[tuple[Game, dict]], user: str) -> dict[str, Any]:
                 "game_id": game.id,
                 "opponent": game.opponent,
                 "result": game.result_for_user,
-                "acpl": acpl,
-                "accuracy": accuracy,
+                "avg_win_loss": avg_win_loss,
+                "avg_win_before": avg_win_before,
                 "blunders": len(blunders),
             }
         )
@@ -127,7 +128,7 @@ def build_report(pairs: list[tuple[Game, dict]], user: str) -> dict[str, Any]:
             return 0.0
         return float(before) - float(after)
 
-    worst_games.sort(key=lambda item: item["acpl"], reverse=True)
+    worst_games.sort(key=lambda item: item["avg_win_loss"], reverse=True)
     worst_games = worst_games[:_WORST_GAMES_LIMIT]
     missed_wins.sort(key=_win_loss, reverse=True)
     missed_wins = missed_wins[:_MISSED_WIN_LIMIT]
@@ -135,7 +136,9 @@ def build_report(pairs: list[tuple[Game, dict]], user: str) -> dict[str, Any]:
     openings: dict[str, list[tuple[float, float]]] = defaultdict(list)
     for game, analysis in pairs:
         name = game.opening or game.eco or _DEFAULT_OPENING
-        openings[name].append((game.user_result_points(), float(analysis.get("acpl") or 0.0)))
+        openings[name].append(
+            (game.user_result_points(), metric(analysis, "avg_win_loss"))
+        )
 
     opening_rows: list[dict[str, Any]] = []
     for name, entries in openings.items():
@@ -144,7 +147,7 @@ def build_report(pairs: list[tuple[Game, dict]], user: str) -> dict[str, Any]:
                 "name": name,
                 "games": len(entries),
                 "score_pct": sum(points_ for points_, _ in entries) / len(entries) * 100.0,
-                "avg_acpl": sum(acpl_ for _, acpl_ in entries) / len(entries),
+                "avg_win_loss": sum(loss_ for _, loss_ in entries) / len(entries),
             }
         )
     opening_rows.sort(key=lambda item: (-item["games"], item["name"]))
@@ -165,8 +168,16 @@ def build_report(pairs: list[tuple[Game, dict]], user: str) -> dict[str, Any]:
         },
         "result_distribution": distribution,
         "avg": {
-            "acpl": round(sum(acpl_values) / len(acpl_values), 2) if acpl_values else 0.0,
-            "accuracy": round(sum(accuracy_values) / len(accuracy_values), 2) if accuracy_values else 0.0,
+            "avg_win_loss": (
+                round(sum(avg_win_loss_values) / len(avg_win_loss_values), 2)
+                if avg_win_loss_values
+                else 0.0
+            ),
+            "avg_win_before": (
+                round(sum(avg_win_before_values) / len(avg_win_before_values), 2)
+                if avg_win_before_values
+                else 0.0
+            ),
             "blunders_per_game": round(blunders_per_game, 2),
         },
         "total": {
@@ -214,8 +225,8 @@ def format_report(report: dict[str, Any]) -> str:
 
     avg = report["avg"]
     lines.append(
-        f"Качество: средний ACPL = {avg['acpl']:.1f}, "
-        f"точность = {avg['accuracy']:.1f}%, "
+        f"Качество: {METRIC_LABELS['avg_win_loss']} = {avg['avg_win_loss']:.1f}, "
+        f"{METRIC_LABELS['avg_win_before']} = {avg['avg_win_before']:.1f}%, "
         f"зевков в среднем на партию = {avg['blunders_per_game']:.2f}"
     )
 
@@ -230,12 +241,13 @@ def format_report(report: dict[str, Any]) -> str:
 
     worst = report["worst_games"]
     if worst:
-        lines.append("Плохие партии (топ 5 по ACPL):")
+        lines.append(f"Плохие партии (топ 5 по потере win%):")
         for item in worst:
             opponent = item["opponent"] or "—"
             lines.append(
                 f"  {item['game_id']}  vs {opponent}  {_RESULT_RU.get(item['result'], item['result'])}  "
-                f"ACPL={item['acpl']:.1f}  точность={item['accuracy']:.1f}%"
+                f"потеря win%={item['avg_win_loss']:.1f}  "
+                f"win% перед ходом={item['avg_win_before']:.1f}%"
             )
     else:
         lines.append("Плохие партии: нет данных.")
@@ -266,11 +278,15 @@ def format_report(report: dict[str, Any]) -> str:
     openings = report["openings"]
     if openings:
         lines.append("Дебюты:")
-        lines.append("  {:<36} {:>5} {:>8} {:>9}".format("Название", "игр", "очки%", "ACPL"))
+        lines.append(
+            "  {:<36} {:>5} {:>8} {:>11}".format(
+                "Название", "игр", "очки%", "потеря win%"
+            )
+        )
         for item in openings:
             lines.append(
-                "  {:<36} {:>5} {:>7.0f}% {:>9.1f}".format(
-                    item["name"], item["games"], item["score_pct"], item["avg_acpl"]
+                "  {:<36} {:>5} {:>7.0f}% {:>11.1f}".format(
+                    item["name"], item["games"], item["score_pct"], item["avg_win_loss"]
                 )
             )
     else:

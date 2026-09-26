@@ -19,6 +19,9 @@ Stockfish и строит русскоязычный текстовый отчё
     python -m trainer drills --user NICK --humanity data/humanity.json --verdict unnatural
     python -m trainer repertoire --user NICK
     python -m trainer repertoire --user NICK --color black --no-write
+    python -m trainer prepare --user ТЫ --opponent СОПЕРНИК
+    python -m trainer prepare --user ТЫ --opponent СОПЕРНИК --max 30 --perf rapid
+    python -m trainer prepare --user ТЫ --opponent СОПЕРНИК --cached-only --no-save
 """
 
 from __future__ import annotations
@@ -37,6 +40,12 @@ from app.drills import collect_drills, drills_to_json, drills_to_pgn, summarize
 from app.games import Game, fetch_user_games
 from app.llm import ChatMessage, LLMClient
 from app.mentor import build_mentor_request, format_mentor_reply, run_mentor
+from app.metrics import metric
+from app.opponent import (
+    build_confrontations,
+    build_opponent_profile,
+    format_prep,
+)
 from app.plan import build_plan, format_plan
 from app.progress import build_progress, format_progress
 from app.report import build_report, format_report
@@ -56,7 +65,7 @@ def _make_parser() -> argparse.ArgumentParser:
         prog="trainer",
         description="Chess Trainer — персональный шахматный тренер",
     )
-    parser.add_argument("--version", action="version", version="chess-trainer 0.1.0")
+    parser.add_argument("--version", action="version", version="chess-trainer 0.2.0")
     subparsers = parser.add_subparsers(dest="command", metavar="КОМАНДА")
 
     coach = subparsers.add_parser("coach", help="анализ партий и построение отчёта")
@@ -193,6 +202,33 @@ def _make_parser() -> argparse.ArgumentParser:
         "--json", metavar="PATH", default=None,
         help="сохранить итоги турнира дополнительно в JSON",
     )
+
+    prepare = subparsers.add_parser(
+        "prepare",
+        help="подготовка к сопернику по его партиям: его репертуар, слабости и твои ответы",
+    )
+    prepare.add_argument("--user", default=None, help="твой ник на Lichess (из его партий строится твой ответ)")
+    prepare.add_argument("--opponent", default=None, help="ник соперника на Lichess")
+    prepare.add_argument(
+        "--max", type=int, default=settings.games_opponent_max,
+        help="сколько партий соперника взять (по умолчанию %(default)s)",
+    )
+    prepare.add_argument("--perf", default="rapid", help="пул партий: rapid/classical/blitz/...")
+    prepare.add_argument(
+        "--color", default="both", choices=["white", "black", "both"],
+        help="как он играет: белыми/чёрными/оба (по умолчанию %(default)s)",
+    )
+    prepare.add_argument(
+        "--top", type=int, default=8,
+        help="сколько дебютов и точек встречи показать (по умолчанию %(default)s)",
+    )
+    prepare.add_argument("--depth", type=int, default=settings.stockfish_depth, help="глубина анализа Stockfish")
+    prepare.add_argument("--multipv", type=int, default=settings.stockfish_multipv, help="число анализируемых линий")
+    prepare.add_argument("--since", type=int, default=None, help="брать партии с этого времени (unix, миллисекунды)")
+    prepare.add_argument("--cached-only", action="store_true", help="не ходить в сеть, брать только кеш")
+    prepare.add_argument("--refresh", action="store_true", help="переанализировать партии соперника заново")
+    prepare.add_argument("--json", metavar="PATH", default=None, help="сохранить лист подготовки в JSON")
+    prepare.add_argument("--no-save", action="store_true", help="не записывать партии и анализ в кеш")
     return parser
 
 
@@ -284,11 +320,11 @@ def _review_header(game: Game, analysis: dict) -> str:
     result = _RESULT_RU.get(
         analysis.get("result_for_user") or game.result_for_user or "draw"
     )
-    acpl = analysis.get("acpl")
-    acpl_txt = f"{acpl:.1f}" if isinstance(acpl, (int, float)) else "—"
+    avg_win_loss = metric(analysis, "avg_win_loss", default=None)
+    loss_txt = "—" if avg_win_loss is None else f"{avg_win_loss:.1f}"
     return (
         f"{game.id} ({_player_name(game.white)}—{_player_name(game.black)}, "
-        f"{result}, {game.opening or '—'}, ACPL {acpl_txt})"
+        f"{result}, {game.opening or '—'}, потеря win% {loss_txt})"
     )
 
 
@@ -316,7 +352,7 @@ def _select_review_games(db: Database, args: argparse.Namespace) -> list[tuple[G
     pairs.sort(
         key=lambda p: (
             -(len(p[1].get("blunders", [])) + len(p[1].get("mistakes", []))),
-            -p[1].get("acpl", 0.0),
+            -metric(p[1], "avg_win_loss"),
         )
     )
     return pairs[: args.max]
@@ -346,7 +382,7 @@ def _review_json_entry(
         "black": _player_name(game.black),
         "result": analysis.get("result_for_user") or game.result_for_user or "draw",
         "opening": game.opening,
-        "acpl": analysis.get("acpl"),
+        "avg_win_loss": metric(analysis, "avg_win_loss", default=None),
         "moments": entry_moments,
         "summary": summary,
     }
@@ -498,6 +534,118 @@ def _cmd_coach(args: argparse.Namespace) -> int:
     except Exception as exc:
         print(f"Непредвиденная ошибка: {exc!r}")
         return 1
+
+
+def _cmd_prepare(args: argparse.Namespace) -> int:
+    """Исполняет подкоманду prepare: твой кеш + его партии -> лист подготовки.
+
+    Партии соперника сохраняются в ту же базу, но с его ником в колонке
+    user, поэтому твои команды (coach, overview, progress) их не видят.
+    """
+    if not args.opponent:
+        print("Ошибка: укажи --opponent (ник соперника).")
+        return 1
+
+    try:
+        with Database() as db:
+            db.init_db()
+
+            your_pairs: list[tuple[Game, dict]] = []
+            if args.user:
+                your_pairs = db.get_analyzed_games(args.user, limit=500)
+            if not your_pairs:
+                print(
+                    "Нет твоих проанализированных партий"
+                    + (f" для {args.user}" if args.user else "")
+                    + " — твой ответ по его дебютам строить не из чего."
+                )
+                print(
+                    "Сначала прогони: "
+                    f"python -m trainer coach --user {args.user or 'ТВОЙ_НИК'}"
+                )
+                return 1
+
+            his_games = _load_opponent_games(db, args)
+            qualified = [game for game in his_games if game.is_finished() and game.moves]
+            skipped = len(his_games) - len(qualified)
+            if skipped:
+                print(f"Пропущено незавершённых или пустых партий: {skipped}.")
+
+            if args.refresh:
+                target = list(qualified)
+                print(
+                    f"Режим --refresh: переанализирую {len(target)} партий соперника "
+                    "с перезаписью кеша."
+                )
+            else:
+                game_ids = [game.id for game in qualified]
+                unanalyzed = set(db.get_unanalyzed(game_ids))
+                target = [game for game in qualified if game.id in unanalyzed]
+
+            if target:
+                positions = sum(len(game.moves) for game in target)
+                minutes = positions * settings.stockfish_time_ms / 1000.0 / 60.0
+                print(
+                    f"К анализу {len(target)} партий (движок, глубина {args.depth}, "
+                    f"multipv {args.multipv}). Оценка времени: ~{minutes:.1f} мин; "
+                    "повторный запуск будет мгновенным — кеш сохраняется."
+                )
+                with Engine(depth=args.depth, multipv=args.multipv) as engine:
+                    _analyze(db, engine, target, args)
+            else:
+                print("Все партии соперника уже проанализированы, анализ не требуется.")
+
+            his_pairs = _collect_pairs(db, qualified, {})
+            if not his_pairs:
+                print("Нет партий соперника с анализом в кеше — готовиться не к чему.")
+                return 1
+
+            profile = build_opponent_profile(
+                his_pairs, args.opponent, top=args.top, color=args.color
+            )
+            confrontations = build_confrontations(profile, your_pairs, top=args.top)
+            if args.json:
+                _dump_json(
+                    {
+                        "profile": {
+                            key: value
+                            for key, value in profile.items()
+                            if key != "progress"
+                        },
+                        "confrontations": confrontations,
+                    },
+                    args.json,
+                )
+            print(format_prep(profile, confrontations, user=args.user))
+        return 0
+    except RuntimeError as exc:
+        print(f"Ошибка: {exc}")
+        return 1
+    except KeyboardInterrupt:
+        print("\nПрервано пользователем.")
+        return 130
+    except Exception as exc:
+        print(f"Непредвиденная ошибка: {exc!r}")
+        return 1
+
+
+def _load_opponent_games(db: Database, args: argparse.Namespace) -> list[Game]:
+    """Партии соперника: из кеша или с Lichess (сохраняются под его ником)."""
+    if args.cached_only:
+        games = db.get_games(args.opponent, args.max)
+        print(f"Режим --cached-only: загружено {len(games)} партий соперника из кеша.")
+        return games
+    games = fetch_user_games(
+        args.opponent, since_ts=args.since, max_games=args.max, perf=args.perf
+    )
+    if args.no_save:
+        print(f"С Lichess получено {len(games)} партий (кеш не обновляю: --no-save).")
+    else:
+        new_games = db.save_games(games, args.opponent)
+        print(
+            f"С Lichess получено {len(games)} партий соперника, новых в кеше: {new_games}."
+        )
+    return games
 
 
 def _cmd_drills(args: argparse.Namespace) -> int:
@@ -1228,6 +1376,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_fide(args)
     if args.command == "tournament":
         return _cmd_tournament(args)
+    if args.command == "prepare":
+        return _cmd_prepare(args)
     parser.error(f"Неизвестная команда: {args.command}")
     return 2
 

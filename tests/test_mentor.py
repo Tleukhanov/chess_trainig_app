@@ -33,15 +33,15 @@ def _mk_game(
     )
 
 
-def _mkanalysis(color: str, acpl: float, move_records: list[tuple]) -> dict:
+def _mkanalysis(color: str, avg_win_loss: float, move_records: list[tuple]) -> dict:
     moves, blunders, mistakes, missed = [], [], [], []
     for i, (san, cls, *rest) in enumerate(move_records):
         drop = rest[0] if rest else 0.0
         moves.append({"san": san, "classification": cls, "drop": drop})
     return {
         "user_color": color,
-        "acpl": acpl,
-        "accuracy": 80.0,
+        "avg_win_loss": avg_win_loss,
+        "avg_win_before": 80.0,
         "blunders": blunders,
         "mistakes": mistakes,
         "missed_wins": missed,

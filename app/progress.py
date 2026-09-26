@@ -3,10 +3,10 @@
 Работает только по кешу: движок не запускаем и в сеть не ходим. Партии
 сортируются по дате и разбиваются на последовательные окна (равные доли
 по числу партий) — устойчиво к разреженным календарным периодам. Для
-каждого окна считаются: очки, ACPL, точность, зевки/ошибки на партию,
-средняя потеря win.%, «неестественные» промахи (из humanize) и средний
-рейтинг. В конце — тренд «первое окно → последнее» для каждой метрики
-и общий вердикт (улучшение / снижение / стабильно).
+каждого окна считаются: очки, средняя потеря win%, средний win% перед
+ходом, зевки/ошибки на партию, «неестественные» промахи (из humanize) и
+средний рейтинг. В конце — тренд «первое окно → последнее» для каждой
+метрики и общий вердикт (улучшение / снижение / стабильно).
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import datetime
 from typing import Any
 
 from .games import Game
+from .metrics import metric as read_metric
 
 __all__ = [
     "BUILTIN_METRICS",
@@ -25,8 +26,8 @@ __all__ = [
 
 # Метрики с направлением «лучше»: False — лучше меньше, True — лучше больше.
 _BUILTIN_METRICS = {
-    "acpl": False,
-    "accuracy": True,
+    "avg_win_loss": False,
+    "avg_win_before": True,
     "blunders_per_game": False,
     "errors_per_game": False,
     "avg_drop": False,
@@ -83,20 +84,20 @@ def _window_metrics(
     games = len(window)
     points = sum(game.user_result_points() for game, _ in window)
 
-    acpl_all: list[float] = []
-    accuracy_all: list[float] = []
+    avg_win_loss_all: list[float] = []
+    avg_win_before_all: list[float] = []
     blunders = 0
     mistakes = 0
     drops: list[float] = []
     ratings: list[int] = []
 
     for game, analysis in window:
-        acpl = analysis.get("acpl")
-        if isinstance(acpl, (int, float)):
-            acpl_all.append(float(acpl))
-        accuracy = analysis.get("accuracy")
-        if isinstance(accuracy, (int, float)):
-            accuracy_all.append(float(accuracy))
+        avg_win_loss = read_metric(analysis, "avg_win_loss", default=None)
+        if isinstance(avg_win_loss, (int, float)):
+            avg_win_loss_all.append(float(avg_win_loss))
+        avg_win_before = read_metric(analysis, "avg_win_before", default=None)
+        if isinstance(avg_win_before, (int, float)):
+            avg_win_before_all.append(float(avg_win_before))
         blunders += len(analysis.get("blunders") or [])
         mistakes += len(analysis.get("mistakes") or [])
         if isinstance(game.user_rating, int):
@@ -122,8 +123,8 @@ def _window_metrics(
     return {
         "games": games,
         "score_pct": round(points / games * 100.0, 1) if games else None,
-        "acpl": _mean(acpl_all),
-        "accuracy": _mean(accuracy_all),
+        "avg_win_loss": _mean(avg_win_loss_all),
+        "avg_win_before": _mean(avg_win_before_all),
         "blunders_per_game": round(blunders / games, 2) if games else None,
         "errors_per_game": round((blunders + mistakes) / games, 2) if games else None,
         "avg_drop": _mean(drops),
@@ -254,19 +255,19 @@ def format_progress(progress: dict[str, Any]) -> str:
         return "\n".join(out)
 
     out.append(
-        "  {:<4} {:>4} {:>11} {:>6} {:>6} {:>6} {:>9} {:>7} {:>7}".format(
-            "окно", "парт", "даты", "очки%", "ACPL", "точн%", "зев·ош/игру", "не-ест%", "рейтинг"
+        "  {:<4} {:>4} {:>11} {:>6} {:>7} {:>7} {:>9} {:>7} {:>7}".format(
+            "окно", "парт", "даты", "очки%", "потерь%", "win% до", "зев·ош/игру", "не-ест%", "рейтинг"
         )
     )
     for row in rows:
         out.append(
-            "  {:<4} {:>4} {:>11} {:>6} {:>6} {:>6} {:>9} {:>7} {:>7}".format(
+            "  {:<4} {:>4} {:>11} {:>6} {:>7} {:>7} {:>9} {:>7} {:>7}".format(
                 row["index"],
                 row["games"],
                 row["dates"],
                 _any1(row["score_pct"]),
-                _any(row["acpl"]),
-                _any(row["accuracy"]),
+                _any(row["avg_win_loss"]),
+                _any(row["avg_win_before"]),
                 _any(row["errors_per_game"]),
                 _any1(row["unnatural_share_pct"]),
                 _any(row["avg_rating"]),
@@ -279,8 +280,8 @@ def format_progress(progress: dict[str, Any]) -> str:
     if rows_len >= 2 and trend:
         out.append("Динамика (первое → последнее окно):")
         labels = {
-            "acpl": "ACPL",
-            "accuracy": "Точность",
+            "avg_win_loss": "Ср. потеря win%",
+            "avg_win_before": "Ср. win% перед ходом",
             "blunders_per_game": "Зевки/игру",
             "errors_per_game": "Зевки+ошибки/игру",
             "avg_drop": "Ср. потеря win%",
@@ -314,7 +315,12 @@ def format_progress(progress: dict[str, Any]) -> str:
 def progress_brief(
     progress: dict[str, Any],
     *,
-    metrics: tuple[str, ...] = ("acpl", "blunders_per_game", "unnatural_share_pct", "score_pct"),
+    metrics: tuple[str, ...] = (
+        "avg_win_loss",
+        "blunders_per_game",
+        "unnatural_share_pct",
+        "score_pct",
+    ),
 ) -> str:
     """Компактный тренд для запросов LLM (mentor): строка изменений.
 

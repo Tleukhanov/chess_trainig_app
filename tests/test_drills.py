@@ -44,7 +44,6 @@ def _move(
         "best_move_san": best,
         "best_eval": None,
         "best_win": wb,
-        "cp_loss": drop,
         "clock_used": None,
         "time_pressure": None,
     }
@@ -104,8 +103,8 @@ def _basic_analysis() -> dict:
         "user_color": "white",
         "result_for_user": "win",
         "opponent": "B",
-        "acpl": 20.0,
-        "accuracy": 80.0,
+        "avg_win_loss": 20.0,
+        "avg_win_before": 80.0,
         "blunders": [4],
         "mistakes": [],
         "inaccuracies": [],

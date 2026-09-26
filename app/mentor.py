@@ -114,8 +114,8 @@ def build_mentor_request(
 
     users_ru = plan.get("user") or "игрок"
     score = plan.get("score_pct")
-    acpl = plan.get("acpl")
-    summary_anchor = f"""Стиль партий: {score}% очков, ACPL {acpl}."""
+    avg_win_loss = plan.get("avg_win_loss")
+    summary_anchor = f"""Стиль партий: {score}% очков, средняя потеря win% {avg_win_loss}."""
 
     sections = [
         f"Игрок: {users_ru}. Партий в кеше: {plan.get('games', 0)}.",
@@ -157,7 +157,8 @@ def build_mentor_request(
         if latest:
             sections.append(
                 f"  последнее окно ({latest.get('dates', '—')}): {latest.get('games')} партий, "
-                f"очки {latest.get('score_pct')}%, ACPL {latest.get('acpl')}, "
+                f"очки {latest.get('score_pct')}%, средняя потеря win% "
+                f"{latest.get('avg_win_loss')}, "
                 f"неестественных промахов {latest.get('unnatural_share_pct')}%"
             )
 

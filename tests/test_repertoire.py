@@ -68,7 +68,6 @@ def _move_record(san: str, cls: str, drop: float) -> dict:
         "best_move_san": None,
         "best_eval": None,
         "best_win": None,
-        "cp_loss": drop,
         "clock_used": None,
         "time_pressure": None,
     }
@@ -97,8 +96,8 @@ def mkanalysis(
         "user_color": user_color,
         "result_for_user": "win",
         "opponent": "B",
-        "acpl": 0.0,
-        "accuracy": 100.0,
+        "avg_win_loss": 0.0,
+        "avg_win_before": 100.0,
         "blunders": [],
         "mistakes": [],
         "inaccuracies": [],

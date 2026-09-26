@@ -15,6 +15,7 @@ from typing import Any
 
 from .games import Game
 from .llm import ChatMessage, LLMClient
+from .metrics import metric
 
 __all__ = [
     "SYSTEM_PROMPT",
@@ -137,7 +138,8 @@ def build_request(game: Game, analysis: dict[str, Any], max_moments: int = 6) ->
         f"Партия {_player_name(game.white)}—{_player_name(game.black)}, "
         f"ты — {_COLOR_RU['white' if user_is_white else 'black']}. "
         f"Результат: {_RESULT_RU.get(result, 'ничья')}. Дебют: {opening}. "
-        f"Твой ACPL: {_fmt(analysis.get('acpl'))}, точность: {_fmt(analysis.get('accuracy'))}%."
+        f"Средняя потеря win%: {_fmt(metric(analysis, 'avg_win_loss'))}, "
+        f"win% перед ходом: {_fmt(metric(analysis, 'avg_win_before'))}%."
     ]
 
     for number, ply in enumerate(idx, start=1):

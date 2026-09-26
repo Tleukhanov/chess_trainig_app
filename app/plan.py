@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from .games import Game
+from .metrics import metric
 from .patterns import PHASE_LABELS, weakness_stats
 from .repertoire import Repertoire, _plural_games, opening_stats
 
@@ -95,12 +96,14 @@ def build_plan(
         repertoire.add_game(game, analysis, max_depth=max_depth)
 
     score_pct = None
-    acpl = None
+    avg_win_loss = None
     if pairs:
         points = sum(game.user_result_points() for game, _ in pairs)
         score_pct = round(points / len(pairs) * 100.0, 1)
-        acpl_values = [float(a.get("acpl") or 0.0) for _, a in pairs]
-        acpl = round(sum(acpl_values) / len(acpl_values), 2) if acpl_values else 0.0
+        loss_values = [metric(a, "avg_win_loss") for _, a in pairs]
+        avg_win_loss = (
+            round(sum(loss_values) / len(loss_values), 2) if loss_values else 0.0
+        )
 
     weak_openings = opening_stats(pairs, user=user)
 
@@ -108,7 +111,7 @@ def build_plan(
         "user": user,
         "games": len(pairs),
         "score_pct": score_pct,
-        "acpl": acpl,
+        "avg_win_loss": avg_win_loss,
         "repertoire": {
             "white": _top_branches(repertoire, "white"),
             "black": _top_branches(repertoire, "black"),
@@ -164,8 +167,8 @@ def format_plan(plan: dict[str, Any]) -> str:
     header += f" · партий: {plan.get('games', 0)}"
     if plan.get("score_pct") is not None:
         header += f" · очки: {plan['score_pct']}%"
-    if plan.get("acpl") is not None:
-        header += f" · ACPL: {plan['acpl']}"
+    if plan.get("avg_win_loss") is not None:
+        header += f" · средняя потеря win%: {plan['avg_win_loss']}"
     out.append(header)
     out.append("")
 

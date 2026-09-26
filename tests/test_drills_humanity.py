@@ -30,7 +30,6 @@ def _move(
         "best_move_san": best,
         "best_eval": None,
         "best_win": win_before,
-        "cp_loss": drop,
         "clock_used": None,
         "time_pressure": None,
     }

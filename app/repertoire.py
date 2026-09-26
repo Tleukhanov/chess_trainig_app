@@ -20,6 +20,7 @@ import chess.pgn
 from .games import Game
 
 __all__ = [
+    "UNKNOWN_OPENING",
     "RepertoireNode",
     "LineSummary",
     "Repertoire",
@@ -30,7 +31,11 @@ __all__ = [
 ]
 
 _ERROR_CLASSES = frozenset({"blunder", "mistake"})
-_BAD_NAME = "Без названия"
+
+#: Название дебюта, когда сервер его не прислал: в сводках по дебютам
+#: такие партии собираются вместе, но как «дебют» они бесполезны —
+#: в частности, их нельзя использовать для сопоставления репертуаров.
+UNKNOWN_OPENING = "Без названия"
 _PGN_DATE = "2026.09.19"
 
 
@@ -211,7 +216,7 @@ def opening_stats(
     groups: dict[tuple[str, str | None], dict[str, Any]] = {}
 
     for game, analysis in pairs:
-        opening = game.opening or _BAD_NAME
+        opening = game.opening or UNKNOWN_OPENING
         eco = game.eco
         key = (opening, eco)
         group = groups.setdefault(
@@ -297,7 +302,7 @@ def _build_repertoire_game(
     """Полная PGN-партия: главная линия с аннотациями ходов пользователя."""
     result = chess.pgn.Game()
     color_ru = "белых" if color == "white" else "чёрных"
-    opening = game.opening or _BAD_NAME
+    opening = game.opening or UNKNOWN_OPENING
     result.headers["Event"] = f"Репертуар {color_ru}: {opening}"
     result.headers["Site"] = "chess-trainer"
     result.headers["Date"] = _PGN_DATE
@@ -341,7 +346,7 @@ def repertoire_to_pgn(
     for game, analysis in pairs:
         if game.user_color != color:
             continue
-        opening = game.opening or _BAD_NAME
+        opening = game.opening or UNKNOWN_OPENING
         groups.setdefault(opening, []).append((game, analysis))
 
     if opening_filter:

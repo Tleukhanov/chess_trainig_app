@@ -45,6 +45,9 @@ class Settings:
     lichess_base_url: str = _cfg("LICHESS_BASE_URL", "https://lichess.org")
     lichess_token: str = _cfg("LICHESS_TOKEN", "")
     games_max: int = int(_cfg("GAMES_MAX", "50"))
+    # Для чужих партий берём меньше: анализ каждой новой партии Stockfish
+    # занимает минуты, а 30 партий уже хватает, чтобы понять репертуар.
+    games_opponent_max: int = int(_cfg("GAMES_OPPONENT_MAX", "30"))
 
     # --- FIDE (через публичный Lichess-прокси, без токена) ---
     fide_base_url: str = _cfg("FIDE_BASE_URL", "https://lichess.org/api/fide")

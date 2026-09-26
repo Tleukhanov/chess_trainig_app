@@ -80,9 +80,10 @@ class MoveAnalysis:
 
     before/after — оценки позиции до/после хода в перспективе стороны, чей ход.
     win_before/win_after — вероятность победы для той же стороны.
-    drop — потеря win.% (win_before - win_after).
-    cp_loss — потеря относительно лучшей линии: так как оценка позиции движком
-        и есть проекция лучшей линии, cp_loss совпадает с drop в win.п.
+    drop — потеря win.% (win_before - win_after); это и есть мера качества хода,
+        отдельного поля «потеря в центпойнах» здесь нет и не нужно: оценка
+        позиции движком и есть проекция лучшей линии, то есть drop уже измеряет
+        потерю относительно неё, только в win.%, а не в центипешках.
     best_line — продолжение за лучшим ходом (полный top-pv без первого хода, до 6).
     played_line — реально сыгранные далее ходы партии (до 5).
     """
@@ -97,7 +98,6 @@ class MoveAnalysis:
     best_move_san: str | None = None
     best_eval: Eval | None = None
     best_win: float | None = None
-    cp_loss: float | None = None
     clock_used: float | None = None
     time_pressure: bool | None = None
     best_line: list[str] = field(default_factory=list)
@@ -115,7 +115,6 @@ class MoveAnalysis:
             "best_move_san": self.best_move_san,
             "best_eval": self.best_eval.to_dict() if self.best_eval else None,
             "best_win": self.best_win,
-            "cp_loss": self.cp_loss,
             "clock_used": self.clock_used,
             "time_pressure": self.time_pressure,
             "best_line": self.best_line,
@@ -134,8 +133,8 @@ class GameAnalysis:
     game_id: str
     user_color: str
     moves: list[MoveAnalysis]
-    acpl: float
-    accuracy: float
+    avg_win_loss: float
+    avg_win_before: float
     blunders: list[int]
     mistakes: list[int]
     inaccuracies: list[int]
@@ -151,8 +150,8 @@ class GameAnalysis:
             "user_color": self.user_color,
             "result_for_user": self.result_for_user,
             "opponent": self.opponent,
-            "acpl": self.acpl,
-            "accuracy": self.accuracy,
+            "avg_win_loss": self.avg_win_loss,
+            "avg_win_before": self.avg_win_before,
             "blunders": self.blunders,
             "mistakes": self.mistakes,
             "inaccuracies": self.inaccuracies,
@@ -330,7 +329,7 @@ class Engine:
         """Анализирует партию одним проходом: оценка позиции xN -> оценка ходов.
 
         win/drop/classification считаются для стороны, чей ход; агрегаты
-        (acpl, blunders и т.п.) — только по ходам пользователя.
+        (avg_win_loss, blunders и т.п.) — только по ходам пользователя.
         """
         user_is_white = game.user_color == "white"
         entries = self._analyze_sequence(game.moves)
@@ -376,7 +375,6 @@ class Engine:
                     best_move_san=best_move_san,
                     best_eval=before_side,
                     best_win=round(win_before, 2),
-                    cp_loss=round(drop, 2),
                     clock_used=clock_used,
                     time_pressure=time_pressure,
                     best_line=full_pv[1:7] if full_pv else [],
@@ -386,11 +384,15 @@ class Engine:
 
         user_indices = [i for i in range(len(analyses)) if (i % 2 == 0) == user_is_white]
 
-        cpl_values = [analyses[i].cp_loss for i in user_indices if analyses[i].cp_loss is not None]
-        acpl = round(sum(cpl_values) / len(cpl_values), 2) if cpl_values else 0.0
+        loss_values = [analyses[i].drop for i in user_indices if analyses[i].drop is not None]
+        avg_win_loss = round(sum(loss_values) / len(loss_values), 2) if loss_values else 0.0
 
-        acc_values = [analyses[i].win_before for i in user_indices if analyses[i].win_before is not None]
-        accuracy = round(sum(acc_values) / len(acc_values), 2) if acc_values else 0.0
+        before_values = [
+            analyses[i].win_before for i in user_indices if analyses[i].win_before is not None
+        ]
+        avg_win_before = (
+            round(sum(before_values) / len(before_values), 2) if before_values else 0.0
+        )
 
         blunders = [i for i in user_indices if analyses[i].classification == "blunder"]
         mistakes = [i for i in user_indices if analyses[i].classification == "mistake"]
@@ -409,8 +411,8 @@ class Engine:
             game_id=game.id,
             user_color=game.user_color,
             moves=analyses,
-            acpl=acpl,
-            accuracy=accuracy,
+            avg_win_loss=avg_win_loss,
+            avg_win_before=avg_win_before,
             blunders=blunders,
             mistakes=mistakes,
             inaccuracies=inaccuracies,

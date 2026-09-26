@@ -60,13 +60,15 @@ def _move_record(san: str, cls: str, drop: float) -> dict:
         "best_move_san": None,
         "best_eval": None,
         "best_win": None,
-        "cp_loss": drop,
+        "cp_loss": drop,  # legacy: поле больше не пишется analyzer, но старые записи есть
         "clock_used": None,
         "time_pressure": None,
     }
 
 
-def mkanalysis(acpl: float, accuracy: float, blunders: int = 1, mistakes: int = 1) -> dict:
+def mkanalysis(
+    avg_win_loss: float, avg_win_before: float, blunders: int = 1, mistakes: int = 1
+) -> dict:
     moves: list[dict] = []
     for ply in range(6):
         san = ["e4", "e5", "Nf3", "Nc6", "Bc4", "Bc5"][ply]
@@ -83,8 +85,8 @@ def mkanalysis(acpl: float, accuracy: float, blunders: int = 1, mistakes: int = 
         "user_color": "white",
         "result_for_user": "win",
         "opponent": "B",
-        "acpl": acpl,
-        "accuracy": accuracy,
+        "avg_win_loss": avg_win_loss,
+        "avg_win_before": avg_win_before,
         "blunders": [2] if blunders else [],
         "mistakes": [4] if mistakes else [],
         "inaccuracies": [],
@@ -136,9 +138,9 @@ class BuildProgressTests(unittest.TestCase):
         self.assertEqual(progress["windows"], 2)
         rows = progress["windows_rows"]
         self.assertEqual([r["games"] for r in rows], [3, 3])
-        # ранние партии слабее: ACPL выше, точность ниже
-        self.assertGreater(rows[0]["acpl"], rows[1]["acpl"])
-        self.assertLess(rows[0]["accuracy"], rows[1]["accuracy"])
+        # ранние партии слабее: потеря win% выше, win% перед ходом ниже
+        self.assertGreater(rows[0]["avg_win_loss"], rows[1]["avg_win_loss"])
+        self.assertLess(rows[0]["avg_win_before"], rows[1]["avg_win_before"])
         self.assertGreater(rows[0]["blunders_per_game"], rows[1]["blunders_per_game"])
         self.assertGreater(rows[0]["unnatural_share_pct"], rows[1]["unnatural_share_pct"])
         self.assertLess(rows[0]["avg_rating"], rows[1]["avg_rating"])
@@ -150,14 +152,25 @@ class BuildProgressTests(unittest.TestCase):
         rows = [row for row in progress["windows_rows"]]
         self.assertEqual([r["games"] for r in rows], [3, 3])
         # прогресс всегда сортирует по дате: первые окна — старые (слабые) партии
-        self.assertGreater(rows[0]["acpl"], rows[1]["acpl"])
+        self.assertGreater(rows[0]["avg_win_loss"], rows[1]["avg_win_loss"])
+
+    def test_legacy_metric_keys_are_readable(self) -> None:
+        """Анализы из кеша, сделанные до переименования, не теряют метрики."""
+        game, analysis = _pairs_improving()[0]
+        legacy = dict(analysis)
+        legacy["acpl"] = legacy.pop("avg_win_loss")
+        legacy["accuracy"] = legacy.pop("avg_win_before")
+        progress = build_progress([(game, legacy)], windows=1)
+        row = progress["windows_rows"][0]
+        self.assertEqual(row["avg_win_loss"], legacy["acpl"])
+        self.assertEqual(row["avg_win_before"], legacy["accuracy"])
 
     def test_trend_improving(self) -> None:
         progress = build_progress(_pairs_improving(), user="u", windows=2)
         trend = progress["trend"]
         self.assertEqual(trend["overall"], "improving")
-        self.assertIn("acpl", trend["improving"])
-        self.assertIn("accuracy", trend["improving"])
+        self.assertIn("avg_win_loss", trend["improving"])
+        self.assertIn("avg_win_before", trend["improving"])
         self.assertIn("avg_rating", trend["improving"])
         self.assertEqual(trend["worsening"], [])
 
@@ -175,7 +188,7 @@ class BuildProgressTests(unittest.TestCase):
         self.assertEqual(progress["windows_rows"][0]["games"], 1)
 
     def test_builtin_metrics_are_finite(self) -> None:
-        self.assertIn("acpl", BUILTIN_METRICS)
+        self.assertIn("avg_win_loss", BUILTIN_METRICS)
         self.assertIn("unnatural_share_pct", BUILTIN_METRICS)
 
 
@@ -186,7 +199,7 @@ class FormatProgressTests(unittest.TestCase):
         self.assertIn("партий: 6", text)
         self.assertIn("Динамика (первое → последнее окно)", text)
         self.assertIn("Итог", text)
-        self.assertIn("ACPL", text)
+        self.assertIn("Ср. потеря win%", text)
 
     def test_empty_text(self) -> None:
         text = format_progress(build_progress([]))
@@ -197,7 +210,7 @@ class ProgressBriefTests(unittest.TestCase):
     def test_brief_summary(self) -> None:
         progress = build_progress(_pairs_improving(), user="u", windows=2)
         brief = progress_brief(progress)
-        self.assertIn("acpl", brief)
+        self.assertIn("avg_win_loss", brief)
         self.assertIn("общий тренд", brief)
         self.assertIn("improving", brief)
 

@@ -57,7 +57,6 @@ def _move_record(san: str, cls: str, drop: float) -> dict:
         "best_move_san": None,
         "best_eval": None,
         "best_win": None,
-        "cp_loss": drop,
         "clock_used": None,
         "time_pressure": None,
     }
@@ -78,8 +77,8 @@ def mkanalysis(user_color: str, moves_count: int, spec: list[str | tuple]) -> di
         "user_color": user_color,
         "result_for_user": "win",
         "opponent": "B",
-        "acpl": 45.0,
-        "accuracy": 92.0,
+        "avg_win_loss": 45.0,
+        "avg_win_before": 92.0,
         "blunders": [],
         "mistakes": [],
         "inaccuracies": [],
@@ -128,7 +127,7 @@ class BuildPlanTests(unittest.TestCase):
         self.assertEqual(plan["user"], "u")
         self.assertEqual(plan["games"], 2)
         self.assertEqual(plan["score_pct"], 50.0)
-        self.assertEqual(plan["acpl"], 45.0)
+        self.assertEqual(plan["avg_win_loss"], 45.0)
         white = plan["repertoire"]["white"]
         self.assertGreaterEqual(len(white), 1)
         self.assertEqual(white[0]["moves"], ["e4"])
