@@ -12,6 +12,10 @@
 * :func:`build_confrontations` — точки встречи: его дебют с твоим ответом;
 * :func:`format_prep` — текстовый лист подготовки.
 
+Плюс тренировочная часть — :func:`build_opponent_drills`: дрели под матч
+с этим соперником (его ошибки как твои наказания + твои провалы против
+него) и :func:`format_opponent_drills` — лист задач.
+
 Дебюты сопоставляются по семействам, а не по полному названию и не по
 линиям репертуара. Три причины:
 
@@ -34,17 +38,22 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any
 
+from .drills import Drill, collect_drills
 from .games import Game
 from .patterns import PHASE_LABELS, weakness_stats
 from .progress import build_progress
-from .repertoire import UNKNOWN_OPENING, Repertoire
+from .repertoire import UNKNOWN_OPENING, Repertoire, _plural_games
 
 __all__ = [
+    "DRILL_FOCUSES",
     "PREP_MIN_GAMES",
     "opening_family",
+    "games_against",
     "build_opponent_profile",
     "build_confrontations",
     "format_prep",
+    "build_opponent_drills",
+    "format_opponent_drills",
 ]
 
 #: Ниже этого числа партий выводы о репертуаре соперника шумные,
@@ -446,5 +455,255 @@ def format_prep(
             out.append(f"  {item['label']}: {item['bad_moves']} плохих ходов{detail}")
         for item in weaknesses["motifs"]:
             out.append(f"  {item['motif']}: {item['bad_moves']}")
+
+    return "\n".join(out)
+
+
+#: Что тренируем: свои провалы против него, его ошибки или оба набора.
+DRILL_FOCUSES = ("mine", "his", "both")
+
+
+def games_against(
+    pairs: list[tuple[Game, dict]], nickname: str | None
+) -> list[tuple[Game, dict]]:
+    """Твои партии против конкретного соперника.
+
+    Сравнение регистронезависимое: на Lichess ник нечувствителен к регистру,
+    а в кеше остаётся ровно то, что прислал сервер. Пустой ник даёт пустой
+    список, а не «все партии».
+    """
+    nick = (nickname or "").strip().lower()
+    if not nick:
+        return []
+    return [
+        (game, analysis)
+        for game, analysis in pairs
+        if (game.opponent or "").strip().lower() == nick
+    ]
+
+
+def _drills_from(
+    pairs: list[tuple[Game, dict]],
+    *,
+    min_drop: float,
+    min_win: float,
+    max_per_game: int,
+    humanity: list[dict] | None,
+    allowed_verdicts: set[str] | None,
+) -> list[Drill]:
+    """Дрели из набора партий, отсортированные по размеру потери win%."""
+    found: list[Drill] = []
+    for game, analysis in pairs:
+        found.extend(
+            collect_drills(
+                game,
+                analysis,
+                min_drop=min_drop,
+                min_win=min_win,
+                max_per_game=max_per_game,
+                humanity=humanity,
+                allowed_verdicts=allowed_verdicts,
+            )
+        )
+    found.sort(key=lambda drill: -(drill.drop or 0.0))
+    return found
+
+
+def _families_of(drills: list[Drill], limit: int = 5) -> list[tuple[str, int]]:
+    """Дебютные семейства дрелей по убыванию числа задач."""
+    counts: dict[str, int] = defaultdict(int)
+    for drill in drills:
+        counts[opening_family(drill.opening or "")] += 1
+    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:limit]
+
+
+def _verdicts_for(
+    pairs: list[tuple[Game, dict]],
+    humanity: list[dict] | None,
+    allowed_verdicts: set[str] | None,
+    label: str,
+) -> tuple[set[str] | None, str]:
+    """Вердикты человечности для набора партий и предупреждение, если их нет.
+
+    Фильтр человечности привязан к конкретным партиям, поэтому один и тот же
+    файл ``humanity.json`` не покрывает и твои партии, и чужие. Если в нём
+    нет ни одной партии из набора, фильтр не применяется — иначе набор молча
+    опустел бы, и это выглядело бы как «ошибок нет».
+    """
+    if not allowed_verdicts:
+        return None, ""
+    covered = {str(item.get("game_id")) for item in humanity or []}
+    if not covered & {game.id for game, _ in pairs}:
+        return None, (
+            f"вердикты человечности не покрывают {label} — дрели отобраны без них"
+        )
+    return allowed_verdicts, ""
+
+
+def build_opponent_drills(
+    my_pairs: list[tuple[Game, dict]],
+    his_pairs: list[tuple[Game, dict]],
+    *,
+    opponent: str,
+    focus: str = "both",
+    min_drop: float = 15.0,
+    min_win: float = 50.0,
+    max_per_game: int = 8,
+    humanity: list[dict] | None = None,
+    allowed_verdicts: set[str] | None = None,
+    profile: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Дрели под матч с соперником: два набора задач.
+
+    * ``mine`` — твои провалы **против него**: те же позиции, где ты
+      зевнул в партии с этим человеком. Их мало (в кеше на человека
+      приходится 1–2 партии), зато это ровно то, что повторится.
+    * ``his`` — **его** ошибки, взятые из его собственных партий: позиции,
+      где он стоял и проиграл. Это основной объём материала, потому что его
+      партии уже разобраны командой ``prepare``. Смысл такой тренировки —
+      заранее научиться находить ход в тех структурах, где он спотыкается.
+
+    ``focus`` выбирает, что попадёт в результат. ``profile`` (его профиль
+    из :func:`build_opponent_profile`) не обязателен: он добавляет в лист
+    подсказку, какие мотивы в его ошибках самые частые.
+    """
+    if focus not in DRILL_FOCUSES:
+        raise ValueError(f"неизвестный фокус: {focus!r}")
+
+    against = games_against(my_pairs, opponent)
+    mine_verdicts, mine_note = _verdicts_for(
+        against, humanity, allowed_verdicts, "твои партии с ним"
+    )
+    his_verdicts, his_note = _verdicts_for(
+        his_pairs, humanity, allowed_verdicts, "его партии"
+    )
+
+    mine = (
+        _drills_from(
+            against,
+            min_drop=min_drop,
+            min_win=min_win,
+            max_per_game=max_per_game,
+            humanity=humanity,
+            allowed_verdicts=mine_verdicts,
+        )
+        if focus in ("mine", "both")
+        else []
+    )
+    his = (
+        _drills_from(
+            his_pairs,
+            min_drop=min_drop,
+            min_win=min_win,
+            max_per_game=max_per_game,
+            humanity=humanity,
+            allowed_verdicts=his_verdicts,
+        )
+        if focus in ("his", "both")
+        else []
+    )
+
+    # Мотивы приходят двумя формами: weakness_stats отдаёт словарь
+    # «мотив → счётчик», а профиль соперника — уже готовый список словарей.
+    raw_motifs = (profile or {}).get("weaknesses", {}).get("motifs") or {}
+    motif_items = list(raw_motifs.values()) if isinstance(raw_motifs, dict) else raw_motifs
+    motifs = [
+        {"motif": item["motif"], "bad_moves": item["bad_moves"]}
+        for item in motif_items[:3]
+        if item.get("bad_moves")
+    ]
+
+    return {
+        "opponent": opponent,
+        "focus": focus,
+        "mine": {
+            # партии против него считаем только если их набор вообще в фокусе,
+            # иначе в листе появится «2 игры, 0 дрелей» и это будет путать
+            "games": len(against) if focus in ("mine", "both") else 0,
+            "drills": mine,
+            "families": _families_of(mine),
+        },
+        "his": {
+            "games": len(his_pairs) if focus in ("his", "both") else 0,
+            "drills": his,
+            "families": _families_of(his),
+        },
+        "motifs": motifs,
+        "notes": [note for note in (mine_note, his_note) if note],
+        "drills": mine + his,
+    }
+
+
+def _drill_count_line(count: int) -> str:
+    """«3 дрели» с правильным окончанием."""
+    return f"{count} {_plural_word(count, 'дреля', 'дрели', 'дрелей')}"
+
+
+def _task_count_line(count: int) -> str:
+    """«3 задачи» с правильным окончанием."""
+    return f"{count} {_plural_word(count, 'задача', 'задачи', 'задач')}"
+
+
+def _plural_word(count: int, one: str, few: str, many: str) -> str:
+    n = abs(count) % 100
+    if 10 < n < 20:
+        return many
+    last = n % 10
+    if last == 1:
+        return one
+    if 2 <= last <= 4:
+        return few
+    return many
+
+
+def format_opponent_drills(plan: dict[str, Any]) -> str:
+    """Лист тренировки под соперника: что качаем и в каких дебютах."""
+    out = ["=" * 60, f"Дрели против: {plan['opponent']}"]
+
+    mine, his = plan["mine"], plan["his"]
+    out.append("")
+    out.append(
+        f"Твоих провалов против него: {mine['games']} "
+        f"{_plural_games(mine['games'])}, {_drill_count_line(len(mine['drills']))}"
+    )
+    out.append(
+        f"Его ошибок — твои наказания: {his['games']} "
+        f"{_plural_games(his['games'])}, {_drill_count_line(len(his['drills']))}"
+    )
+
+    if not plan["drills"]:
+        out.append("")
+        out.append("Дрелей не нашлось: снизь --min-drop/--min-win или разбери больше партий.")
+        focus = plan["focus"]
+        if focus in ("his", "both") and not his["games"]:
+            out.append(
+                f"Его партий в кеше нет — сначала: python -m trainer prepare "
+                f"--user ТЫ --opponent {plan['opponent']}"
+            )
+        elif focus in ("mine", "both") and not mine["games"]:
+            out.append(
+                f"Партий с ним у тебя в кеше нет — разбери свои: "
+                f"python -m trainer coach --user ТЫ"
+            )
+        return "\n".join(out)
+
+    if his["families"]:
+        out.append("")
+        out.append("Дебюты, где он ошибается (сначала эти):")
+        for family, count in his["families"]:
+            out.append(f"  {family} — {_task_count_line(count)}")
+    if mine["families"]:
+        out.append("")
+        out.append("Твои провалы в его дебютах:")
+        for family, count in mine["families"]:
+            out.append(f"  {family} — {_task_count_line(count)}")
+    if plan["motifs"]:
+        out.append("")
+        out.append("Что он забывает чаще всего:")
+        for item in plan["motifs"]:
+            out.append(f"  {item['motif']}: {item['bad_moves']}")
+    for note in plan["notes"]:
+        out.append("")
+        out.append(f"Замечание: {note}.")
 
     return "\n".join(out)

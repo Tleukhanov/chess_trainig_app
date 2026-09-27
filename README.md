@@ -20,14 +20,18 @@
 - [x] M5 Динамика прогресса (`progress`: метрики по окнам, тренд, вердикт)
 - [x] M6 FIDE-профиль и разбор турнира (`fide`, `tournament`)
 - [x] M7 Подготовка к сопернику (`prepare`)
+- [x] M8 Дрели под соперника (`drills --opponent/--focus`)
 
 ## Версии
 
-Проект версионируется по SemVer: текущая версия — **v0.2.0**
+Проект версионируется по SemVer: текущая версия — **v0.3.0**
 (`python -m trainer --version`). Пока проект в разработке (0.x), минорная
 версия растёт на каждом крупном милестоуне, патч — на фиксах. Дальше
-продолжаем расти: v0.3.0, v0.4.0 и так далее.
+продолжаем расти: v0.4.0 и так далее.
 
+- **v0.3.0** — милестоун M8: дрели под конкретного соперника
+  (`drills --opponent RIVAL --focus mine|his|both`) из уже кешированных партий,
+  без Stockfish и сети.
 - **v0.2.0** — милестоун M7: подготовка к конкретному сопернику (`prepare`) и
   честные названия метрик (`avg_win_loss` вместо ACPL, `avg_win_before` вместо
   «точности»).
@@ -157,6 +161,28 @@ JSON и подсказках для LLM:
 - Метрики переименованы честно: `avg_win_loss` и `avg_win_before` вместо ACPL
   и «точности», см. раздел выше; старые записи кеша читаются без пересчёта.
 
+## Возможности M8
+
+- `drills --opponent` — дрели под конкретный матч, **полностью офлайн**:
+  ни Stockfish, ни сети. Требует только кеш: сначала прогони
+  `prepare --user ТЫ --opponent СОПЕРНИК`, чтобы его партии лежали под его ником.
+  `python -m trainer drills --user ТЫ --opponent СОПЕРНИК`.
+- `--focus mine|his|both` (по умолчанию `both`):
+  - `mine` — твои провалы **в матчах с ним** (берутся только партии, где он твой
+    соперник, а не все твои игры);
+  - `his` — его собственные ошибки, отсортированные по потере win%: это
+    наказания за его слабость, сначала играй их;
+  - `both` — оба набора, сначала его (так быстрее растёт твой win%).
+- Обычные флаги `drills` работают как раньше (`--limit`, `--min-drop`,
+  `--min-win`, `--max-per-game`, `--verdict`, `--out`). Фильтр вердиктов
+  применяется только к тому набору, который покрыт `humanity.json`; если
+  человечность не покрывает партии — дрели отбираются без неё, а лист
+  предупредит об этом. `--out` по умолчанию `data/drills_vs_<СОПЕРНИК>.pgn`.
+  `--game` с `--opponent` несовместимы (набор и так узкий), а `--focus` без
+  `--opponent` — ошибка, а не молчаливый игнор.
+- В листе: счётчики обоих наборов, дебютные семейства «сначала эти» (его — как
+  наказания, твои — как провалы), и мотивы его ошибок.
+
 ## Возможности M1
 
 - LLM-коуч на любом OpenAI-совместимом API (по умолчанию OpenRouter; можно указать
@@ -195,6 +221,11 @@ python -m trainer coach --user YOUR_LICHESS_NICK
 # Дрели из своих ошибок (PGN — импортируй на lichess.org/analysis)
 python -m trainer drills --user YOUR_LICHESS_NICK --out data/drills.pgn
 python -m trainer drills --user YOUR_LICHESS_NICK --out data/drills.json --min-drop 10
+
+# Дрели под матч (из кеша, без сети): его ошибки + твои провалы против него
+python -m trainer prepare --user YOUR_LICHESS_NICK --opponent RIVAL_NICK
+python -m trainer drills --user YOUR_LICHESS_NICK --opponent RIVAL_NICK
+python -m trainer drills --user YOUR_LICHESS_NICK --opponent RIVAL_NICK --focus his
 
 # Человеческий слой: человечность ошибок + дрели только «неестественных»
 python -m trainer humanize --user YOUR_LICHESS_NICK

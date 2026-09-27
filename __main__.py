@@ -43,9 +43,12 @@ from app.mentor import build_mentor_request, format_mentor_reply, run_mentor
 from app.metrics import metric
 from app.opponent import (
     build_confrontations,
+    build_opponent_drills,
     build_opponent_profile,
+    format_opponent_drills,
     format_prep,
 )
+from app.patterns import weakness_stats
 from app.plan import build_plan, format_plan
 from app.progress import build_progress, format_progress
 from app.report import build_report, format_report
@@ -65,7 +68,7 @@ def _make_parser() -> argparse.ArgumentParser:
         prog="trainer",
         description="Chess Trainer — персональный шахматный тренер",
     )
-    parser.add_argument("--version", action="version", version="chess-trainer 0.2.0")
+    parser.add_argument("--version", action="version", version="chess-trainer 0.3.0")
     subparsers = parser.add_subparsers(dest="command", metavar="КОМАНДА")
 
     coach = subparsers.add_parser("coach", help="анализ партий и построение отчёта")
@@ -101,6 +104,8 @@ def _make_parser() -> argparse.ArgumentParser:
     drills.add_argument("--min-win", type=float, default=50.0, help="мин. win%% до хода (по умолчанию %(default)s)")
     drills.add_argument("--humanity", default=None, help="JSON-файл с человечностью (по умолчанию data/humanity.json)")
     drills.add_argument("--verdict", nargs="+", default=None, choices=["natural", "borderline", "unnatural"], help="оставить только эти вердикты (нужно --humanity/данные)")
+    drills.add_argument("--opponent", default=None, help="ник соперника: дрели под матч с ним (его ошибки + твои провалы против него); нужен и --user")
+    drills.add_argument("--focus", default="both", choices=["mine", "his", "both"], help="чьи ошибки тренируем при --opponent (по умолчанию %(default)s)")
 
     humanize = subparsers.add_parser("humanize", help="оценка «человечности» ошибок (Maia/MaiaLite)")
     humanize.add_argument("--user", default=None, help="ник на Lichess")
@@ -648,11 +653,126 @@ def _load_opponent_games(db: Database, args: argparse.Namespace) -> list[Game]:
     return games
 
 
+def _drills_verdicts(args: argparse.Namespace) -> tuple[list[dict] | None, set[str] | None]:
+    """Человечность и набор вердиктов для drills; None — фильтр не запрошен."""
+    if not args.verdict:
+        return None, None
+    humanity_path = (
+        Path(args.humanity) if args.humanity else settings.data_dir / "humanity.json"
+    )
+    if not humanity_path.exists():
+        raise RuntimeError(
+            f"Файл человечности не найден: {humanity_path}. "
+            "Сначала: python -m trainer humanize --user NICK"
+        )
+    data = json.loads(humanity_path.read_text(encoding="utf-8"))
+    items = data.get("items") if isinstance(data, dict) else None
+    return items, set(args.verdict)
+
+
+def _write_drills(drills, out: Path) -> None:
+    """Пишет дрели в PGN или JSON — по расширению файла."""
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if out.suffix.lower() == ".json":
+        out.write_text(drills_to_json(drills), encoding="utf-8")
+    else:
+        out.write_text(drills_to_pgn(drills), encoding="utf-8")
+
+
+def _cmd_drills_vs_opponent(args: argparse.Namespace) -> int:
+    """Дрели под матч: его ошибки как наказания + твои провалы против него.
+
+    Работает по кешу обеих сторон: твои партии лежат под твоим ником, его —
+    под его (их туда кладёт команда ``prepare``). Движок и сеть не нужны.
+    """
+    if not args.user:
+        print(
+            "Ошибка: с --opponent нужен и --user (твой ник): по нему берутся твои "
+            "партии, в которых ты играл с этим соперником."
+        )
+        return 1
+    try:
+        with Database() as db:
+            db.init_db()
+            my_pairs = db.get_analyzed_games(args.user, limit=200)
+            if not my_pairs:
+                raise RuntimeError(
+                    f"Нет твоих проанализированных партий для {args.user}. "
+                    "Запусти сначала: python -m trainer coach --user <NICK>"
+                )
+            his_pairs: list[tuple[Game, dict]] = []
+            if args.focus in ("his", "both"):
+                his_pairs = db.get_analyzed_games(args.opponent, limit=200)
+                if not his_pairs:
+                    print(
+                        f"Партий соперника {args.opponent} в кеше нет — тренировать "
+                        "его ошибки не из чего."
+                    )
+                    print(
+                        f"Сначала разбери его партии: python -m trainer prepare "
+                        f"--user {args.user} --opponent {args.opponent}"
+                    )
+                    return 1
+
+            humanity_items, allowed_verdicts = _drills_verdicts(args)
+
+            plan = build_opponent_drills(
+                my_pairs,
+                his_pairs,
+                opponent=args.opponent,
+                focus=args.focus,
+                min_drop=args.min_drop,
+                min_win=args.min_win,
+                max_per_game=args.max_per_game,
+                humanity=humanity_items,
+                allowed_verdicts=allowed_verdicts,
+                profile={"weaknesses": weakness_stats(his_pairs)} if his_pairs else None,
+            )
+
+            drills = plan["drills"]
+            if args.limit and args.limit > 0:
+                drills = drills[: args.limit]
+            print(format_opponent_drills(plan))
+            if not drills:
+                return 0
+
+            out = (
+                Path(args.out)
+                if args.out
+                else settings.data_dir / f"drills_vs_{args.opponent}.pgn"
+            )
+            _write_drills(drills, out)
+            print("")
+            print(f"Дрелей записано: {len(drills)} → {out}")
+        return 0
+    except RuntimeError as exc:
+        print(f"Ошибка: {exc}")
+        return 1
+    except KeyboardInterrupt:
+        print("\nПрервано пользователем.")
+        return 130
+    except Exception as exc:
+        print(f"Непредвиденная ошибка: {exc!r}")
+        return 1
+
+
 def _cmd_drills(args: argparse.Namespace) -> int:
     """Исполняет подкоманду drills: дрели из своих ошибок по кешу анализа.
 
     Работает только по кешу: движок не запускается, сеть не используется.
+    С ``--opponent`` набор собирается под матч с конкретным человеком.
     """
+    if args.opponent:
+        if args.game:
+            print(
+                "Ошибка: --game нельзя совмещать с --opponent: дрели под матч "
+                "собираются по всем твоим партиям с этим соперником."
+            )
+            return 1
+        return _cmd_drills_vs_opponent(args)
+    if args.focus != "both":
+        print("Ошибка: --focus работает только вместе с --opponent.")
+        return 1
     try:
         with Database() as db:
             db.init_db()
@@ -680,24 +800,7 @@ def _cmd_drills(args: argparse.Namespace) -> int:
             else:
                 raise RuntimeError("Укажи --user или --game")
 
-            humanity_items: list[dict] | None = None
-            allowed_verdicts: set[str] | None = None
-            if args.verdict:
-                humanity_path = (
-                    Path(args.humanity)
-                    if args.humanity
-                    else settings.data_dir / "humanity.json"
-                )
-                if not humanity_path.exists():
-                    raise RuntimeError(
-                        f"Файл человечности не найден: {humanity_path}. "
-                        "Сначала: python -m trainer humanize --user NICK"
-                    )
-                data = json.loads(humanity_path.read_text(encoding="utf-8"))
-                humanity_items = (
-                    data.get("items") if isinstance(data, dict) else None
-                )
-                allowed_verdicts = set(args.verdict)
+            humanity_items, allowed_verdicts = _drills_verdicts(args)
 
             drills = []
             for game, analysis in pairs:
@@ -724,11 +827,7 @@ def _cmd_drills(args: argparse.Namespace) -> int:
                 return 0
 
             out = Path(args.out) if args.out else settings.data_dir / "drills.pgn"
-            out.parent.mkdir(parents=True, exist_ok=True)
-            if out.suffix.lower() == ".json":
-                out.write_text(drills_to_json(drills), encoding="utf-8")
-            else:
-                out.write_text(drills_to_pgn(drills), encoding="utf-8")
+            _write_drills(drills, out)
 
             summary = summarize(drills)
             print(f"Дрелей: {summary['found']} из {summary['games']} партий → {out}")
