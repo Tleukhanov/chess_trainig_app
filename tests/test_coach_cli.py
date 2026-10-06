@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import io
+import shutil
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 _ROOT = Path(__file__).resolve().parent.parent
 
@@ -19,6 +22,21 @@ def _load_cli() -> dict:
 class CoachCliParserTests(unittest.TestCase):
     def setUp(self) -> None:
         self.cli = _load_cli()
+        # coach ходит в Database() → реальную базу; init_db v0.4 пишет в неё
+        # (миграция, users/meta), поэтому диспетчеризация изолирована.
+        self.tmpdir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmpdir, True)
+        real_db_cls = self.cli["Database"]
+
+        def temp_db(path=None):
+            return real_db_cls(self.tmpdir / "trainer.db")
+
+        # runpy возвращает копию глобалов — патчить надо истинные глобалы
+        # модуля, иначе main() продолжит видеть продакшен-БД.
+        globals_ = self.cli["main"].__globals__
+        patcher = patch.dict(globals_, {"Database": temp_db})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_game_without_user_parses(self) -> None:
         parser = self.cli["_make_parser"]()
@@ -31,7 +49,7 @@ class CoachCliParserTests(unittest.TestCase):
     def test_no_user_no_game_errors_at_runtime(self) -> None:
         # argparse больше не требует --user; отсутствие обоих ловится в _cmd_coach.
         with redirect_stdout(io.StringIO()):
-            code = self.cli["main"](["coach"])
+            code = self.cli["main"](["--yes", "coach"])
         self.assertEqual(code, 1)
 
     def test_unknown_game_returns_hint(self) -> None:

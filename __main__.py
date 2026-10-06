@@ -28,7 +28,9 @@ from __future__ import annotations
 
 import argparse
 import json
-import textwrap
+import math
+import os
+import sys
 import time
 from pathlib import Path
 
@@ -37,7 +39,14 @@ from app.coach import build_request, run_coach
 from app.config import settings
 from app.db import Database
 from app.drills import collect_drills, drills_to_json, drills_to_pgn, summarize
+from app.fide import (
+    fetch_fide_player,
+    fetch_fide_ratings,
+    fide_cache_load,
+    fide_cache_save,
+)
 from app.games import Game, fetch_user_games
+from app.identity import apply_identity, resolve_identity, run, validate_nick
 from app.llm import ChatMessage, LLMClient
 from app.mentor import build_mentor_request, format_mentor_reply, run_mentor
 from app.metrics import metric
@@ -48,6 +57,7 @@ from app.opponent import (
     format_opponent_drills,
     format_prep,
 )
+from app.paths import artifact, artifact_read, drills_dir
 from app.patterns import weakness_stats
 from app.plan import build_plan, format_plan
 from app.progress import build_progress, format_progress
@@ -68,7 +78,11 @@ def _make_parser() -> argparse.ArgumentParser:
         prog="trainer",
         description="Chess Trainer — персональный шахматный тренер",
     )
-    parser.add_argument("--version", action="version", version="chess-trainer 0.3.0")
+    parser.add_argument("--version", action="version", version="chess-trainer 0.4.0")
+    parser.add_argument(
+        "--yes", action="store_true",
+        help="не задавать вопросов: соглашаться на переключение профиля",
+    )
     subparsers = parser.add_subparsers(dest="command", metavar="КОМАНДА")
 
     coach = subparsers.add_parser("coach", help="анализ партий и построение отчёта")
@@ -175,7 +189,10 @@ def _make_parser() -> argparse.ArgumentParser:
         "fide", help="профиль и тренд рейтинга FIDE (кеш data/fide.json или сеть)"
     )
     fide.add_argument(
-        "--id", default=None, help="FIDE ID (по умолчанию — значения из настроек)"
+        "--id", default=None, help="FIDE ID (по умолчанию — из профиля/настроек)"
+    )
+    fide.add_argument(
+        "--user", default=None, help="ник на Lichess: чей профиль; при --id сохраняет ID туда"
     )
     fide.add_argument(
         "--windows", type=int, default=4, help="число временных окон (по умолчанию %(default)s)"
@@ -234,6 +251,19 @@ def _make_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--refresh", action="store_true", help="переанализировать партии соперника заново")
     prepare.add_argument("--json", metavar="PATH", default=None, help="сохранить лист подготовки в JSON")
     prepare.add_argument("--no-save", action="store_true", help="не записывать партии и анализ в кеш")
+
+    user = subparsers.add_parser("user", help="профили игроков: кто закреплён, кого добавить/переключить")
+    user.add_argument("--yes", action="store_true", help="не задавать вопросов (для switch)")
+    user_actions = user.add_subparsers(dest="action", metavar="ДЕЙСТВИЕ")
+    user_actions.add_parser("list", help="все профили: ник, FIDE, партий, анализов, привязка")
+    user_actions.add_parser("whoami", help="закреплённый сейчас игрок")
+    add_p = user_actions.add_parser("add", help="зарегистрировать игрока и закрепить")
+    add_p.add_argument("nick", help="ник на Lichess")
+    add_p.add_argument("--fide", default=None, help="FIDE ID (не обязательно)")
+    add_p.add_argument("--yes", action="store_true", help="не задавать вопросов (для switch)")
+    switch_p = user_actions.add_parser("switch", help="закрепить другого игрока (без ника — выбор из списка)")
+    switch_p.add_argument("nick", nargs="?", default=None, help="ник на Lichess")
+    switch_p.add_argument("--yes", action="store_true", help="не задавать вопросов (для switch)")
     return parser
 
 
@@ -657,12 +687,12 @@ def _drills_verdicts(args: argparse.Namespace) -> tuple[list[dict] | None, set[s
     """Человечность и набор вердиктов для drills; None — фильтр не запрошен."""
     if not args.verdict:
         return None, None
-    humanity_path = (
-        Path(args.humanity) if args.humanity else settings.data_dir / "humanity.json"
+    humanity_path = Path(args.humanity) if args.humanity else artifact_read(
+        "humanity.json", getattr(args, "user", None)
     )
-    if not humanity_path.exists():
+    if not humanity_path or not humanity_path.exists():
         raise RuntimeError(
-            f"Файл человечности не найден: {humanity_path}. "
+            f"Файл человечности не найден: {humanity_path or 'data/humanity.json'}. "
             "Сначала: python -m trainer humanize --user NICK"
         )
     data = json.loads(humanity_path.read_text(encoding="utf-8"))
@@ -739,7 +769,7 @@ def _cmd_drills_vs_opponent(args: argparse.Namespace) -> int:
             out = (
                 Path(args.out)
                 if args.out
-                else settings.data_dir / f"drills_vs_{args.opponent}.pgn"
+                else artifact(f"drills_vs_{args.opponent}.pgn", args.user)
             )
             _write_drills(drills, out)
             print("")
@@ -777,7 +807,7 @@ def _cmd_drills(args: argparse.Namespace) -> int:
         with Database() as db:
             db.init_db()
             if args.game:
-                game = db.get_game(args.game)
+                game = db.get_game(args.game, user=args.user)
                 if game is None:
                     raise RuntimeError(
                         f"Партия {args.game} не найдена в кеше "
@@ -826,7 +856,7 @@ def _cmd_drills(args: argparse.Namespace) -> int:
                 )
                 return 0
 
-            out = Path(args.out) if args.out else settings.data_dir / "drills.pgn"
+            out = Path(args.out) if args.out else artifact("drills.pgn", args.user)
             _write_drills(drills, out)
 
             summary = summarize(drills)
@@ -871,7 +901,7 @@ def _cmd_humanize(args: argparse.Namespace) -> int:
             db.init_db()
             pairs: list[tuple[Game, dict]] = []
             if args.game:
-                game = db.get_game(args.game)
+                game = db.get_game(args.game, user=args.user)
                 if game is None:
                     raise RuntimeError(f"Партия {args.game} не найдена в кеше")
                 analysis = db.get_analysis(args.game)
@@ -905,7 +935,7 @@ def _cmd_humanize(args: argparse.Namespace) -> int:
             with policy as engine:
                 report = humanize_report(pairs, engine, k=8)
 
-        out = Path(args.out) if args.out else settings.data_dir / "humanity.json"
+        out = Path(args.out) if args.out else artifact("humanity.json", args.user)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(
             json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -965,7 +995,7 @@ def _repertoire_pairs(db: Database, args: argparse.Namespace) -> list[tuple[Game
     Работает только по кешу: движок не запускается, сеть не используется.
     """
     if args.game:
-        game = db.get_game(args.game)
+        game = db.get_game(args.game, user=args.user)
         if game is None:
             raise RuntimeError(f"Партия {args.game} не найдена в кеше")
         analysis = db.get_analysis(args.game)
@@ -1042,8 +1072,7 @@ def _run_repertoire(
         print("Слабые места репертуара: нет данных.")
 
     if not args.no_write:
-        out_dir = settings.data_dir
-        out_dir.mkdir(parents=True, exist_ok=True)
+        out_dir = drills_dir(args.user)
         written: list[Path] = []
         if args.pgn:
             path = Path(args.pgn)
@@ -1126,6 +1155,14 @@ def _count_pgn_games(path: Path) -> int:
     return sum(1 for line in text.splitlines() if line.startswith("[Event ")) if text.strip() else 0
 
 
+def _count_drills(name: str, user: str | None, explicit_dir: Path | None) -> int:
+    """Число дрелей в файле: явная папка или своя/легаси через artifact_read."""
+    if explicit_dir is not None:
+        return _count_pgn_games(explicit_dir / name)
+    path = artifact_read(name, user)
+    return _count_pgn_games(path) if path is not None else 0
+
+
 def _run_overview(
     pairs: list[tuple[Game, dict]],
     *,
@@ -1168,9 +1205,8 @@ def _run_overview(
     else:
         print(f"Нет файла {humanity_path} — запусти: python -m trainer humanize --user NICK")
 
-    out_dir = drills_dir if drills_dir is not None else settings.data_dir
-    drills_total = _count_pgn_games(out_dir / "drills.pgn")
-    drills_unnatural = _count_pgn_games(out_dir / "drills_unnatural.pgn")
+    drills_total = _count_drills("drills.pgn", user, drills_dir)
+    drills_unnatural = _count_drills("drills_unnatural.pgn", user, drills_dir)
     print("\n--- Дрели ---")
     print(f"data/drills.pgn: {drills_total} партий · data/drills_unnatural.pgn: {drills_unnatural}")
 
@@ -1191,15 +1227,17 @@ def _cmd_overview(args: argparse.Namespace) -> int:
         with Database() as db:
             db.init_db()
             pairs = _repertoire_pairs(db, args)
-            drills_dir = Path(args.drills_dir) if args.drills_dir else None
+            drills_dir_path = Path(args.drills_dir) if args.drills_dir else None
             humanity_path = (
-                Path(args.humanity) if args.humanity else settings.data_dir / "humanity.json"
+                Path(args.humanity)
+                if args.humanity
+                else artifact_read("humanity.json", args.user)
             )
             _run_overview(
                 pairs,
                 user=args.user,
                 humanity_path=humanity_path,
-                drills_dir=drills_dir,
+                drills_dir=drills_dir_path,
             )
         return 0
     except RuntimeError as exc:
@@ -1220,15 +1258,17 @@ def _cmd_plan(args: argparse.Namespace) -> int:
             db.init_db()
             pairs = _repertoire_pairs(db, args)
             humanity = _load_humanity(
-                Path(args.humanity) if args.humanity else settings.data_dir / "humanity.json"
+                Path(args.humanity)
+                if args.humanity
+                else artifact_read("humanity.json", args.user)
             )
-            drills_dir = Path(args.drills_dir) if args.drills_dir else settings.data_dir
+            drills_dir_path = Path(args.drills_dir) if args.drills_dir else None
             plan_report = build_plan(
                 pairs,
                 user=args.user,
                 humanity=humanity,
-                drills_total=_count_pgn_games(drills_dir / "drills.pgn"),
-                drills_unnatural=_count_pgn_games(drills_dir / "drills_unnatural.pgn"),
+                drills_total=_count_drills("drills.pgn", args.user, drills_dir_path),
+                drills_unnatural=_count_drills("drills_unnatural.pgn", args.user, drills_dir_path),
                 max_depth=args.max_depth,
             )
             print(format_plan(plan_report))
@@ -1250,14 +1290,18 @@ def _cmd_mentor(args: argparse.Namespace) -> int:
         with Database() as db:
             db.init_db()
             pairs = _repertoire_pairs(db, args)
-            drills_dir = Path(args.drills_dir) if args.drills_dir else settings.data_dir
-            humanity_path = Path(args.humanity) if args.humanity else settings.data_dir / "humanity.json"
+            drills_dir_path = Path(args.drills_dir) if args.drills_dir else None
+            humanity_path = (
+                Path(args.humanity)
+                if args.humanity
+                else artifact_read("humanity.json", args.user)
+            )
             plan_report = build_plan(
                 pairs,
                 user=args.user,
                 humanity=_load_humanity(humanity_path),
-                drills_total=_count_pgn_games(drills_dir / "drills.pgn"),
-                drills_unnatural=_count_pgn_games(drills_dir / "drills_unnatural.pgn"),
+                drills_total=_count_drills("drills.pgn", args.user, drills_dir_path),
+                drills_unnatural=_count_drills("drills_unnatural.pgn", args.user, drills_dir_path),
                 max_depth=args.max_depth,
             )
             progress_report = None
@@ -1330,7 +1374,9 @@ def _cmd_progress(args: argparse.Namespace) -> int:
             db.init_db()
             pairs = _repertoire_pairs(db, args)
             humanity = _load_humanity_raw(
-                Path(args.humanity) if args.humanity else settings.data_dir / "humanity.json"
+                Path(args.humanity)
+                if args.humanity
+                else artifact_read("humanity.json", args.user)
             )
             progress_report = build_progress(
                 pairs,
@@ -1366,22 +1412,36 @@ def _cmd_fide(args: argparse.Namespace) -> int:
             format_fide_trend,
         )
 
-        fide_id = str(args.id or settings.fide_id or "").strip()
-        if not fide_id:
-            print("Ошибка: не указан FIDE ID. Передайте --id или задайте FIDE_ID в .env.")
-            return 1
-        player = fetch_fide_player(fide_id)
-        ratings = fetch_fide_ratings(fide_id)
-        trend = build_fide_trend(ratings, windows=args.windows)
-        if player.name:
-            year = f", {player.birth_year}" if player.birth_year else ""
-            print(f"Игрок: {player.name} ({player.federation}{year}) — FIDE {fide_id}")
-        brief = format_fide_brief(trend, user_fide=fide_id)
-        if brief:
-            print(brief)
-        print(format_fide_trend(trend, user_fide=fide_id))
-        if args.json:
-            _dump_json({"id": fide_id, "player": asdict(player), "trend": trend}, args.json)
+        with Database() as db:
+            db.init_db()
+            profile = (
+                db.get_user(args.user)
+                if args.user
+                else db.get_current_user()
+            )
+            nickname = (profile or {}).get("nick")
+            saved_fide = (profile or {}).get("fide_id") if profile else None
+            fide_id = str(args.id or saved_fide or settings.fide_id or "").strip()
+            if not fide_id:
+                print(
+                    "Ошибка: не указан FIDE ID. Передайте --id, привяжите его в профиль "
+                    "(python -m trainer user add NICK --fide ID) или задайте FIDE_ID в .env."
+                )
+                return 1
+            if args.id and nickname:
+                db.set_user_fide(nickname, str(args.id).strip())
+            player = fetch_fide_player(fide_id, user=nickname)
+            ratings = fetch_fide_ratings(fide_id, user=nickname)
+            trend = build_fide_trend(ratings, windows=args.windows)
+            if player.name:
+                year = f", {player.birth_year}" if player.birth_year else ""
+                print(f"Игрок: {player.name} ({player.federation}{year}) — FIDE {fide_id}")
+            brief = format_fide_brief(trend, user_fide=fide_id)
+            if brief:
+                print(brief)
+            print(format_fide_trend(trend, user_fide=fide_id))
+            if args.json:
+                _dump_json({"id": fide_id, "player": asdict(player), "trend": trend}, args.json)
         return 0
     except RuntimeError as exc:
         print(f"Ошибка: {exc}")
@@ -1446,6 +1506,80 @@ def _cmd_tournament(args: argparse.Namespace) -> int:
         return 1
 
 
+def _stderr(text: str) -> None:
+    sys.stderr.write(text + "\n")
+
+
+def _cmd_user(args: argparse.Namespace) -> int:
+    """Подкоманда ``user``: list / whoami / add / switch."""
+    with Database() as db:
+        db.init_db()
+        action = args.action
+        if action == "list":
+            users = db.list_users()
+            if not users:
+                print("Профилей пока нет: добавь через 'user add NICK' или командой с --user.")
+                return 0
+            current = db.get_current_user()
+            for u in users:
+                mark = " *" if current and u["nick_lower"] == current["nick_lower"] else ""
+                fide = u.get("fide_id") or "-"
+                print(
+                    f"  {u['nick']:<30} FIDE {fide:<10} "
+                    f"партий {u.get('games', 0):<5} анализов {u.get('analyses', 0)}{mark}"
+                )
+            return 0
+        if action == "whoami":
+            cur = db.get_current_user()
+            print(cur["nick"] if cur else "никто не закреплён")
+            return 0
+        if action == "add":
+            nick = validate_nick(args.nick)
+            if nick is None:
+                print(f"Ошибка: невалидный ник {args.nick!r}.")
+                return 1
+            db.set_current_user(nick)
+            db.set_user_fide(nick, args.fide)
+            print(f"Закреплён {nick}.")
+            return 0
+        if action == "switch":
+            nick = args.nick or validate_nick(args.nick)
+            if not nick:
+                picked = run(db, ask=input, yes=args.yes)
+                if picked is None:
+                    print("Отмена (ник не задан).")
+                    return 1
+                apply_identity(db, picked)
+                print(f"Закреплён {picked.nick}.")
+                return 0
+            canon = validate_nick(nick)
+            if canon is None:
+                print(f"Ошибка: невалидный ник {nick!r}.")
+                return 1
+            if args.yes or not bool(getattr(sys.stdin, "isatty", lambda: False)()):
+                db.set_current_user(canon)
+                print(f"Закреплён {canon}.")
+                return 0
+            if input(f"Закрепить {canon} как текущего? [д/Н]: ").strip().lower() in (
+                "д",
+                "да",
+                "y",
+                "yes",
+            ):
+                db.set_current_user(canon)
+                print(f"Закреплён {canon}.")
+                return 0
+            print("Отмена.")
+            return 0
+        return _cmd_user_usage()
+    return 1  # unreachable
+
+
+def _cmd_user_usage() -> int:
+    print("Использование: user list | whoami | add NICK [--fide ID] | switch [NICK]")
+    return 2
+
+
 def main(argv: list[str] | None = None) -> int:
     """Точка входа CLI: разбор аргументов и диспетчеризация подкоманд."""
     parser = _make_parser()
@@ -1453,32 +1587,48 @@ def main(argv: list[str] | None = None) -> int:
     if args.command is None:
         parser.print_help()
         return 2
-    if args.command == "coach":
-        return _cmd_coach(args)
-    if args.command == "review":
-        return _cmd_review(args)
-    if args.command == "drills":
-        return _cmd_drills(args)
-    if args.command == "humanize":
-        return _cmd_humanize(args)
-    if args.command == "repertoire":
-        return _cmd_repertoire(args)
-    if args.command == "overview":
-        return _cmd_overview(args)
-    if args.command == "plan":
-        return _cmd_plan(args)
-    if args.command == "mentor":
-        return _cmd_mentor(args)
-    if args.command == "progress":
-        return _cmd_progress(args)
-    if args.command == "fide":
-        return _cmd_fide(args)
+    if args.command == "user":
+        return _cmd_user(args)
     if args.command == "tournament":
         return _cmd_tournament(args)
-    if args.command == "prepare":
-        return _cmd_prepare(args)
-    parser.error(f"Неизвестная команда: {args.command}")
-    return 2
+    if args.command == "fide":
+        return _cmd_fide(args)
+
+    needs_user = {
+        "coach",
+        "review",
+        "drills",
+        "humanize",
+        "repertoire",
+        "overview",
+        "plan",
+        "mentor",
+        "progress",
+        "prepare",
+    }
+    # с --game команда работает точечно и юзер не обязателен
+    if args.command in needs_user and not getattr(args, "game", None):
+        isatty = bool(getattr(sys.stdin, "isatty", lambda: False)())
+        with Database() as db:
+            db.init_db()
+            nick, err = resolve_identity(
+                db, args.user, isatty=isatty, ask=input, notify=_stderr,
+                yes=args.yes,
+            )
+            if err:
+                print(f"Ошибка: {err}")
+                return 1
+            args.user = nick
+    _cmd = globals()["_cmd_" + args.command]
+
+    code = _cmd(args)
+    if code == 0 and args.user:
+        with Database() as db:
+            # первый запуск команды с --user регистрирует профиль: resolve
+            # конфликт не трогает, а touch_user только обновляет last_seen_at
+            db.upsert_user(args.user)
+            db.touch_user(args.user)
+    return code
 
 
 if __name__ == "__main__":

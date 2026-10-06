@@ -98,6 +98,28 @@ class FideCliTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmpdir = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmpdir, True)
+        # Изоляция от продакшен-базы: fide v0.4 лезет в SQL за профилем —
+        # это обязано происходить только на временной базе.
+        isolated = replace(
+            self.cli["settings"],
+            data_dir=self.tmpdir / "data",
+            db_path=self.tmpdir / "data" / "trainer.db",
+            fide_id="",
+        )
+        real_db_cls = self.cli["Database"]
+
+        def temp_db(path=None):
+            return real_db_cls(self.tmpdir / "data" / "trainer.db")
+
+        # runpy возвращает копию глобалов — патчить надо истинные глобалы
+        # модуля, иначе main() продолжит видеть продакшен-БД и конфиг.
+        globals_ = self.cli["main"].__globals__
+        patcher = patch.dict(
+            globals_,
+            {"settings": isolated, "Database": temp_db},
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_happy_path_and_json_output_without_http(self) -> None:
         player = FidePlayer(
@@ -145,8 +167,8 @@ class FideCliTests(unittest.TestCase):
         self.assertTrue(text.strip())
         self.assertIn("Test Player", text)
         self.assertIn("12345678", text)
-        fetch_player.assert_called_once_with("12345678")
-        fetch_ratings.assert_called_once_with("12345678")
+        fetch_player.assert_called_once_with("12345678", user=None)
+        fetch_ratings.assert_called_once_with("12345678", user=None)
         urlopen.assert_not_called()
         self.assertTrue(json_path.is_file())
         data = json.loads(json_path.read_text(encoding="utf-8"))
@@ -158,7 +180,7 @@ class FideCliTests(unittest.TestCase):
         empty_settings = replace(self.cli["settings"], fide_id="")
         output = io.StringIO()
         with (
-            patch.dict(self.cli, {"settings": empty_settings}),
+            patch.dict(self.cli["main"].__globals__, {"settings": empty_settings}),
             patch(
                 "app.fide.fetch_fide_player",
                 side_effect=AssertionError("profile fetch must not run"),

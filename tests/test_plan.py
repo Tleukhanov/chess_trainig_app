@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import io
 import runpy
+import shutil
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 from app.games import Game
 from app.plan import build_plan, format_plan
@@ -183,8 +186,17 @@ class PlanCliTests(unittest.TestCase):
         self.assertEqual(args.command, "plan")
         self.assertEqual(args.max_depth, 10)
         # format_plan печатается _cmd_plan через та же функцию, что тестили выше
-        with redirect_stdout(io.StringIO()):
-            code = cli["main"](["plan", "--user", "__no_such_user__"])
+        db_tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, db_tmp, True)
+        real_db_cls = cli["Database"]
+
+        def temp_db(path=None):
+            return real_db_cls(db_tmp / "trainer.db")
+
+        globals_ = cli["main"].__globals__
+        with patch.dict(globals_, {"Database": temp_db}):
+            with redirect_stdout(io.StringIO()):
+                code = cli["main"](["plan", "--user", "__no_such_user__"])
         self.assertEqual(code, 1)
 
 

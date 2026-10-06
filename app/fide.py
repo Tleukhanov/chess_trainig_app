@@ -173,12 +173,13 @@ def fetch_fide_player(
     *,
     timeout: float = settings.fide_timeout,
     use_cache: bool = True,
+    user: str | None = None,
 ) -> FidePlayer:
-    """Профиль FIDE-игрока; при ``use_cache`` читает и пишет data/fide.json."""
+    """Профиль FIDE-игрока; при ``use_cache`` читает и пишет персональный кеш."""
     requested_id = str(fide_id).strip()
     cached = None
     if use_cache:
-        cached = fide_cache_load().get("profile")
+        cached = fide_cache_load(user).get("profile")
     player = None
     if isinstance(cached, dict) and _same_fide_id(cached.get("id"), requested_id):
         player = FidePlayer.from_api(cached)
@@ -186,7 +187,7 @@ def fetch_fide_player(
         url = _profile_url(requested_id)
         player = FidePlayer.from_api(_http_json(url, timeout=timeout))
         if use_cache:
-            fide_cache_save(profile=player)
+            fide_cache_save(profile=player, user=user)
     return player
 
 
@@ -195,32 +196,37 @@ def fetch_fide_ratings(
     *,
     timeout: float = settings.fide_timeout,
     use_cache: bool = True,
+    user: str | None = None,
 ) -> FideRatings:
     """История рейтингов FIDE-игрока (через прокси Lichess)."""
     requested_id = str(fide_id).strip()
     cached = None
     if use_cache:
-        cached = fide_cache_load().get("ratings")
+        cached = fide_cache_load(user).get("ratings")
     if isinstance(cached, dict) and _same_fide_id(cached.get("id"), requested_id):
         ratings = parse_fide_history(cached)
         if any(ratings.history.values()):
             return ratings
     ratings = parse_fide_history(_http_json(_ratings_url(requested_id), timeout=timeout))
     if use_cache:
-        fide_cache_save(ratings=ratings, ratings_id=requested_id)
+        fide_cache_save(ratings=ratings, ratings_id=requested_id, user=user)
     return ratings
 
 
-# --- кеш data/fide.json ---
+# --- кеш data/fide.json (персональный в data/<ник>/ с v0.4) ---
 
 
-def _cache_path() -> Path:
+def _cache_path(user: str | None = None) -> Path:
+    if user:
+        nick = (user or "").strip().lower()
+        if nick:
+            return settings.data_dir / nick / "fide.json"
     return settings.data_dir / "fide.json"
 
 
-def fide_cache_load() -> dict[str, Any]:
-    """Читает data/fide.json; пустой словарь, если файла нет или он битый."""
-    path = _cache_path()
+def fide_cache_load(user: str | None = None) -> dict[str, Any]:
+    """Читает персональный, иначе общий, data/fide.json; {} если нет/битый."""
+    path = _cache_path(user)
     if not path.exists():
         return {}
     try:
@@ -235,9 +241,10 @@ def fide_cache_save(
     profile: FidePlayer | None = None,
     ratings: FideRatings | None = None,
     ratings_id: str | None = None,
+    user: str | None = None,
 ) -> Path:
-    """Дописывает профиль/историю в data/fide.json; возвращает путь."""
-    data = fide_cache_load()
+    """Дописывает профиль/историю в персональный data/fide.json; путь."""
+    data = fide_cache_load(user)
     if profile is not None:
         data["profile"] = {
             "id": str(profile.id).strip(),
@@ -261,7 +268,7 @@ def fide_cache_save(
         )
         if normalized_ratings_id:
             data["ratings"]["id"] = normalized_ratings_id
-    path = _cache_path()
+    path = _cache_path(user)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     return path

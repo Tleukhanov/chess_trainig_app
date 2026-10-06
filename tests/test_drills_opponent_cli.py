@@ -13,6 +13,7 @@ import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 
+from app import paths as paths_mod
 from app.db import Database
 from app.games import Game
 from tests.test_opponent import mkanalysis, mkgame
@@ -104,8 +105,17 @@ class DrillsOpponentParserTests(unittest.TestCase):
             )
 
     def test_dispatch_reaches_opponent_branch(self) -> None:
-        with redirect_stdout(io.StringIO()):
-            code = self.cli.main(["drills", "--opponent", "Rival"])
+        # изоляция от продакшен-базы: resolve_identity открывает Database()
+        with Database(Path(tempfile.mkdtemp()) / "dispatch.db") as db:
+            db.init_db()
+            real_db_cls = self.cli.Database
+            self.cli.Database = lambda path=None: db
+            try:
+                with redirect_stdout(io.StringIO()):
+                    # --yes: неинтерактивный прогон, без запросов
+                    code = self.cli.main(["--yes", "drills", "--opponent", "Rival"])
+            finally:
+                self.cli.Database = real_db_cls
         # нет --user: понятная ошибка, а не падение
         self.assertEqual(code, 1)
 
@@ -169,10 +179,16 @@ class DrillsOpponentRunTests(unittest.TestCase):
         real_settings = self.cli.settings
         self.cli.settings = dataclasses.replace(real_settings, data_dir=data_dir)
         self.addCleanup(setattr, self.cli, "settings", real_settings)
+        # артефакты пишутся через app.paths.settings, а не __main__.settings
+        real_paths_settings = paths_mod.settings
+        paths_mod.settings = dataclasses.replace(
+            real_paths_settings, data_dir=data_dir
+        )
+        self.addCleanup(setattr, paths_mod, "settings", real_paths_settings)
         code, text = self._run("drills", "--user", "me", "--opponent", "Rival")
         self.assertEqual(code, 0)
         self.assertIn("drills_vs_Rival.pgn", text)
-        self.assertTrue((data_dir / "drills_vs_Rival.pgn").exists())
+        self.assertTrue((data_dir / "me" / "drills_vs_Rival.pgn").exists())
 
     def test_focus_mine_hides_his_drills(self) -> None:
         out = self.tmpdir / "mine.pgn"
@@ -235,7 +251,7 @@ class DrillsOpponentRunTests(unittest.TestCase):
     def test_focus_mine_does_not_need_opponent_cache(self) -> None:
         out = self.tmpdir / "ghost.pgn"
         code, text = self._run(
-            "drills", "--user", "solo", "--opponent", "Ghost", "--focus", "mine",
+            "--yes", "drills", "--user", "solo", "--opponent", "Ghost", "--focus", "mine",
             "--out", str(out),
         )
         self.assertEqual(code, 0)
@@ -245,7 +261,9 @@ class DrillsOpponentRunTests(unittest.TestCase):
         self.assertEqual(out.read_text(encoding="utf-8").count("[Event "), 2)
 
     def test_missing_my_games_points_to_coach(self) -> None:
-        code, text = self._run("drills", "--user", "ghost", "--opponent", "Rival")
+        code, text = self._run(
+            "--yes", "drills", "--user", "ghost", "--opponent", "Rival"
+        )
         self.assertEqual(code, 1)
         self.assertIn("trainer coach", text)
 

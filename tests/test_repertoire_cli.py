@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 from app.db import Database
 from app.games import Game
@@ -357,9 +358,19 @@ class OverviewTests(unittest.TestCase):
         parser = self.cli["_make_parser"]()
         args = parser.parse_args(["overview", "--user", "u"])
         self.assertEqual(args.command, "overview")
-        # неизвестный юзер в реальном кеше → аккуратный код 1, а не падение
-        with redirect_stdout(io.StringIO()):
-            code = self.cli["main"](["overview", "--user", "__no_such_user__"])
+        # неизвестный юзер → аккуратный код 1, а не падение; БД — временная,
+        # чтобы init_db v0.4 (миграция, users/meta) не трогал продакшен.
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        real_db_cls = self.cli["Database"]
+
+        def temp_db(path=None):
+            return real_db_cls(tmp / "trainer.db")
+
+        globals_ = self.cli["main"].__globals__
+        with patch.dict(globals_, {"Database": temp_db}):
+            with redirect_stdout(io.StringIO()):
+                code = self.cli["main"](["overview", "--user", "__no_such_user__"])
         self.assertEqual(code, 1)
 
 

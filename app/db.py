@@ -3,6 +3,9 @@
 Анализ одной партии занимает ~240 секунд (Stockfish depth 14), поэтому кеш
 критичен: анализ детерминирован и для данной (game_id, depth) сохраняется
 навсегда и повторно не пересчитывается.
+
+С v0.4.0 в одной базе живут несколько игроков: партии принадлежат паре
+(id партии, игрок), профили — таблица ``users``.
 """
 
 from __future__ import annotations
@@ -18,10 +21,12 @@ from .config import settings
 from .games import Game
 from .openings import classify_opening
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS games(
-    id TEXT PRIMARY KEY,
-    user TEXT NOT NULL,
+# DDL пересобираемых таблиц. ``{table}`` подставляется и в обычное создание,
+# и в миграции (там нужно врем имя + отсутствие IF NOT EXISTS).
+_GAMES_DDL = """
+CREATE TABLE IF NOT EXISTS {table}(
+    id TEXT NOT NULL,
+    user TEXT NOT NULL COLLATE NOCASE,
     rated INTEGER,
     speed TEXT,
     created_at INTEGER,
@@ -38,16 +43,40 @@ CREATE TABLE IF NOT EXISTS games(
     result_for_user TEXT,
     moves_json TEXT,
     clocks_json TEXT,
-    fetched_at INTEGER
-);
-CREATE TABLE IF NOT EXISTS analyses(
-    game_id TEXT PRIMARY KEY REFERENCES games(id) ON DELETE CASCADE,
+    fetched_at INTEGER,
+    PRIMARY KEY(id, user)
+)
+"""
+
+# Ссылку на games(id) намеренно не держим: после миграции на составной PK
+# она стала бы битой (foreign key mismatch при любой вставке анализа).
+# Каскадного удаления партий в коде нет, а сам анализ — общий для всех:
+# разобрав партию один раз, второй игрок его не пересчитывает.
+_ANALYSES_DDL = """
+CREATE TABLE IF NOT EXISTS {table}(
+    game_id TEXT PRIMARY KEY,
     engine TEXT,
     depth INTEGER,
     analysis_json TEXT,
     analyzed_at INTEGER
-);
-CREATE INDEX IF NOT EXISTS idx_games_user ON games(user);
+)
+"""
+
+_USERS_DDL = """
+CREATE TABLE IF NOT EXISTS {table}(
+    nick_lower TEXT PRIMARY KEY,
+    nick TEXT NOT NULL,
+    fide_id TEXT,
+    bound_at INTEGER,
+    last_seen_at INTEGER
+)
+"""
+
+_META_DDL = """
+CREATE TABLE IF NOT EXISTS {table}(
+    key TEXT PRIMARY KEY,
+    value TEXT
+)
 """
 
 _GAME_COLUMNS = (
@@ -56,6 +85,17 @@ _GAME_COLUMNS = (
     "result_for_user, moves_json, clocks_json, fetched_at"
 )
 _GAME_PLACEHOLDERS = ", ".join("?" for _ in range(19))
+_ANALYSIS_COLUMNS = "game_id, engine, depth, analysis_json, analyzed_at"
+
+_CURRENT_USER_KEY = "current_user"
+
+_SCHEMA = f"""
+{_GAMES_DDL.format(table="games")};
+{_ANALYSES_DDL.format(table="analyses")};
+{_USERS_DDL.format(table="users")};
+{_META_DDL.format(table="meta")};
+CREATE INDEX IF NOT EXISTS idx_games_user ON games(user);
+"""
 
 
 def _j(obj: Any) -> str:
@@ -102,6 +142,104 @@ def _row_to_game(row: sqlite3.Row) -> Game:
     )
 
 
+def _table_ddl(conn: sqlite3.Connection, name: str) -> str:
+    """Возвращает текст CREATE TABLE из схемы БД или пустую строку."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+    ).fetchone()
+    return (row["sql"] or "") if row else ""
+
+
+def _rebuild_table(
+    conn: sqlite3.Connection, ddl: str, tmp: str, table: str, columns: str
+) -> None:
+    """Пересоздаёт таблицу по новому DDL, копируя в неё строки.
+
+    Копирование идёт по явному списку колонок, а не через SELECT *: состав
+    старой схемы мог отличаться, и любое расхождение вылезло бы здесь тихим
+    сдвигом данных. Имя во временном DDL подставляем сами, чтобы не плодить
+    копию текста схемы.
+    """
+    conn.execute(ddl.format(table=tmp))
+    conn.execute(
+        f"INSERT INTO {tmp}({columns}) SELECT {columns} FROM {table}"
+    )
+    conn.execute(f"DROP TABLE {table}")
+    conn.execute(f"ALTER TABLE {tmp} RENAME TO {table}")
+
+
+def _backfill_users(conn: sqlite3.Connection) -> None:
+    """Регистрирует игроков, которых уже видели в партиях, и закрепляет первого.
+
+    Ник на Lichess нечувствителен к регистру, а ключ ``nick_lower`` хранит
+    написание в том виде, в каком оно пришло из кеша — это и есть каноническое
+    для наших запросов. Существующие записи не трогаем (last_seen_at меняет
+    только сам запуск команды, а не миграция).
+    """
+    if not _table_ddl(conn, "games"):
+        return
+    rows = conn.execute(
+        "SELECT user, max(created_at) AS last_at FROM games "
+        "GROUP BY user ORDER BY last_at DESC"
+    ).fetchall()
+    users = [str(row["user"] or "").strip() for row in rows]
+    users = [nick for nick in users if nick]
+    if not users:
+        return
+    now = int(time.time())
+    for nick in users:
+        conn.execute(
+            "INSERT INTO users(nick_lower, nick, bound_at, last_seen_at) "
+            "VALUES (?,?,?,?) ON CONFLICT(nick_lower) DO NOTHING",
+            (nick.lower(), nick, now, now),
+        )
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO NOTHING",
+        (_CURRENT_USER_KEY, users[0]),
+    )
+
+
+def _migrate_v3(path: Path | str) -> None:
+    """Переводит кеш v0.3 (один игрок) на мульти-юзерную схему v0.4.
+
+    Две правки, которые нельзя сделать ALTER-ом:
+
+    * ``games``: PK ``id`` → ``(id, user)``. Партия между двумя людьми
+      принадлежит обоим, а раньше вторая её копия молча терялась из-за
+      ``ON CONFLICT(id) DO NOTHING``;
+    * ``analyses``: снимаем ссылку на ``games(id)`` — на составном PK она
+      стала бы битой (``foreign key mismatch`` на любой вставке анализа).
+
+    Плюс создаёт ``users``/``meta`` и переносит туда игроков из партий.
+
+    Всё на отдельном автокоммитном соединении с ``foreign_keys=OFF``:
+    с включёнными FK пересборка таблиц роняла бы ссылки анализов.
+    """
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute(_USERS_DDL.format(table="users"))
+        conn.execute(_META_DDL.format(table="meta"))
+
+        # analyses раньше игр: пока в нём есть FK на games, пересборка games
+        # оставила бы висячую ссылку.
+        if "REFERENCES games" in _table_ddl(conn, "analyses"):
+            _rebuild_table(
+                conn, _ANALYSES_DDL, "analyses_migrated", "analyses", _ANALYSIS_COLUMNS
+            )
+        if _table_ddl(conn, "games") and "(id, user)" not in _table_ddl(conn, "games"):
+            _rebuild_table(
+                conn, _GAMES_DDL, "games_migrated", "games", _GAME_COLUMNS
+            )
+
+        _backfill_users(conn)
+        conn.commit()
+    finally:
+        conn.close()
+
+
 class Database:
     """SQLite-хранилище партий и результатов их анализа.
 
@@ -132,7 +270,13 @@ class Database:
             conn.close()
 
     def init_db(self) -> None:
-        """Создаёт таблицы и индексы (идемпотентно)."""
+        """Мигрирует схему при необходимости и создаёт таблицы (идемпотентно).
+
+        Порядок важен: сначала миграция пересобирает старые таблицы (индекс
+        на games после этого пропадает), затем штатный DDL докидывает то,
+        чего не хватает, — индекс и новые таблицы.
+        """
+        _migrate_v3(self.path)
         with self._connection() as conn:
             conn.executescript(_SCHEMA)
 
@@ -140,7 +284,9 @@ class Database:
         """Сохраняет партии, возвращая число вставленных (новых) партий.
 
         Повторная запись той же партии идемпотентна: существующая запись
-        не меняется и не считается новой.
+        не меняется и не считается новой. Идентичность — по паре (id, user):
+        одна партия принадлежит обоим соперникам, у каждого своя копия со
+        своим ``user_color``/``opponent``/``result_for_user``.
         """
         fetched_at = int(time.time() * 1000)
         inserted = 0
@@ -169,7 +315,7 @@ class Database:
                 )
                 cur = conn.execute(
                     f"INSERT INTO games({_GAME_COLUMNS}) VALUES ({_GAME_PLACEHOLDERS}) "
-                    "ON CONFLICT(id) DO NOTHING",
+                    "ON CONFLICT(id, user) DO NOTHING",
                     values,
                 )
                 inserted += cur.rowcount
@@ -185,12 +331,26 @@ class Database:
             ).fetchall()
         return [_row_to_game(row) for row in rows]
 
-    def get_game(self, game_id: str) -> Game | None:
-        """Возвращает одну партию по id или None."""
+    def get_game(self, game_id: str, user: str | None = None) -> Game | None:
+        """Возвращает одну партию по id.
+
+        Одна партия может лежать в кеше у нескольких игроков (они между собой
+        играли), поэтому при известном ``user`` выборка сужается до его копии —
+        у разных игроков расходятся ``user_color``/``opponent``/``result_for_user``.
+        Без ``user`` возвращаем любую копию (нужно только сами ходы).
+        """
         with self._connection() as conn:
-            row = conn.execute(
-                "SELECT * FROM games WHERE id = ?", (game_id,)
-            ).fetchone()
+            if user:
+                row = conn.execute(
+                    "SELECT * FROM games WHERE id = ? AND user = ?",
+                    (game_id, user),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM games WHERE id = ? "
+                    "ORDER BY created_at ASC, id ASC LIMIT 1",
+                    (game_id,),
+                ).fetchone()
         return _row_to_game(row) if row else None
 
     def save_analysis(
@@ -267,6 +427,97 @@ class Database:
     def close(self) -> None:
         """Закрывает ресурсы (соединения не держатся, метод для совместимости)."""
         return None
+
+    # --- профили игроков (v0.4) ---
+
+    def upsert_user(self, nick: str, fide_id: str | None = None) -> dict[str, Any]:
+        """Регистрирует игрока или обновляет запись; возвращает профиль.
+
+        ``fide_id`` не затирает существующий: пустой передаётся только там,
+        где человек свой ID не указал.
+        """
+        clean = (nick or "").strip()
+        if not clean:
+            raise ValueError("пустой ник")
+        now = int(time.time())
+        with self._connection() as conn:
+            conn.execute(
+                "INSERT INTO users(nick_lower, nick, fide_id, bound_at, last_seen_at) "
+                "VALUES (?,?,?,?,?) "
+                "ON CONFLICT(nick_lower) DO UPDATE SET "
+                "fide_id = COALESCE(excluded.fide_id, users.fide_id), "
+                "last_seen_at = excluded.last_seen_at",
+                (clean.lower(), clean, fide_id, now, now),
+            )
+        return self.get_user(clean)  # type: ignore[return-value]
+
+    def get_user(self, nick: str | None) -> dict[str, Any] | None:
+        """Профиль игрока по нику (регистронезависимо) или None."""
+        key = (nick or "").strip().lower()
+        if not key:
+            return None
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM users WHERE nick_lower = ?", (key,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_users(self) -> list[dict[str, Any]]:
+        """Все профили с числом партий и анализов для команды ``user list``."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT u.*, "
+                "(SELECT count(*) FROM games g WHERE g.user = u.nick) AS games, "
+                "(SELECT count(*) FROM analyses a JOIN games g2 ON g2.id = a.game_id "
+                " WHERE g2.user = u.nick) AS analyses "
+                "FROM users u ORDER BY u.bound_at ASC, u.nick_lower ASC"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_current_user(self) -> dict[str, Any] | None:
+        """Закреплённый на прошлых запусках игрок (профиль) или None."""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key = ?", (_CURRENT_USER_KEY,)
+            ).fetchone()
+            if not row or not (row["value"] or "").strip():
+                return None
+            user = conn.execute(
+                "SELECT * FROM users WHERE nick_lower = ?",
+                (str(row["value"]).strip().lower(),),
+            ).fetchone()
+        return dict(user) if user else None
+
+    def set_current_user(self, nick: str) -> None:
+        """Закрепляет игрока текущим (регистрирует, если ещё нет)."""
+        clean = (nick or "").strip()
+        if not clean:
+            raise ValueError("пустой ник")
+        self.upsert_user(clean)
+        with self._connection() as conn:
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (_CURRENT_USER_KEY, clean),
+            )
+
+    def set_user_fide(self, nick: str, fide_id: str | None) -> None:
+        """Записывает FIDE ID в профиль игрока."""
+        clean = (nick or "").strip()
+        if not clean:
+            return
+        self.upsert_user(clean, fide_id=fide_id)
+
+    def touch_user(self, nick: str) -> None:
+        """Отмечает, что игрок работал с программой (last_seen_at)."""
+        key = (nick or "").strip().lower()
+        if not key:
+            return
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE users SET last_seen_at = ? WHERE nick_lower = ?",
+                (int(time.time()), key),
+            )
 
     def __enter__(self) -> Database:
         return self

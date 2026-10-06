@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import io
 import runpy
+import shutil
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 from app.games import Game
 from app.progress import (
@@ -222,6 +225,18 @@ class ProgressBriefTests(unittest.TestCase):
 class ProgressCliTests(unittest.TestCase):
     def setUp(self) -> None:
         self.cli = runpy.run_path(str(_ROOT / "__main__.py"), run_name="trainer_progress_test")
+        # progress ходит в Database() → реальную базу; init_db v0.4 пишет в неё.
+        self.tmpdir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmpdir, True)
+        real_db_cls = self.cli["Database"]
+
+        def temp_db(path=None):
+            return real_db_cls(self.tmpdir / "trainer.db")
+
+        globals_ = self.cli["main"].__globals__
+        patcher = patch.dict(globals_, {"Database": temp_db})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_parser_defaults(self) -> None:
         parser = self.cli["_make_parser"]()
