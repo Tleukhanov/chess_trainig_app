@@ -501,6 +501,19 @@ class Database:
                 (_CURRENT_USER_KEY, clean),
             )
 
+    def clear_current_user(self) -> None:
+        """Сбрасывает закреплённого игрока (текущий пользователь не выбран).
+
+        Ключ в meta остаётся, но с пустым значением: иначе бэкфилл при
+        следующем init_db снова закрепил бы первого игрока из кеша.
+        """
+        with self._connection() as conn:
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES (?, '') "
+                "ON CONFLICT(key) DO UPDATE SET value = ''",
+                (_CURRENT_USER_KEY,),
+            )
+
     def set_user_fide(self, nick: str, fide_id: str | None) -> None:
         """Записывает FIDE ID в профиль игрока."""
         clean = (nick or "").strip()
