@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Chess Trainer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="#" data-view="dashboard"><span class="brand-mark">♞</span> chess trainer</a>
+    <nav class="nav" id="nav">
+      <a href="#" data-view="dashboard">Дашборд</a>
+      <a href="#" data-view="overview">Обзор</a>
+      <a href="#" data-view="plan">План</a>
+      <a href="#" data-view="progress">Прогресс</a>
+      <a href="#" data-view="drills">Дрели</a>
+      <a href="#" data-view="coach">Анализ</a>
+      <a href="#" data-view="users">Профили</a>
+    </nav>
+    <div class="userbox" id="userbox"></div>
+  </div>
+</header>
+<main class="page" id="app">
+  <!-- Views will be rendered here -->
+</main>
+<footer class="footer">Chess Trainer v0.4.0 · <a href="https://github.com/Tleukhanov/chess_trainig_app" target="_blank" rel="noopener">GitHub</a></footer>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
