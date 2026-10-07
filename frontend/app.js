@@ -4,6 +4,11 @@ const state = {
   user: null,
   currentView: 'dashboard',
   jobPollTimer: null,
+  gamesFilter: 'all',
+  gameId: null,
+  gameData: null,
+  gamePly: 0,
+  keyHandler: null,
 };
 
 // --- API helpers ---
@@ -28,11 +33,15 @@ async function apiPost(path, formData) {
 
 // --- Navigation ---
 
-const views = ['dashboard', 'overview', 'plan', 'progress', 'drills', 'coach', 'users'];
+const views = ['dashboard', 'overview', 'plan', 'progress', 'games', 'drills', 'coach', 'users'];
 
 function navigate(view) {
   if (!views.includes(view)) view = 'dashboard';
   state.currentView = view;
+  if (view === 'games') {
+    state.gameId = null;
+    state.gameData = null;
+  }
   document.querySelectorAll('#nav a').forEach(a => {
     a.classList.toggle('active', a.dataset.view === view);
   });
@@ -73,6 +82,7 @@ function renderUserbox() {
 
 async function render(view) {
   const app = document.getElementById('app');
+  clearGameKeyboard();
   app.innerHTML = '<div class="card"><p>Загрузка...</p></div>';
 
   try {
@@ -81,6 +91,7 @@ async function render(view) {
       case 'overview': await viewOverview(app); break;
       case 'plan': await viewPlan(app); break;
       case 'progress': await viewProgress(app); break;
+      case 'games': await viewGames(app); break;
       case 'drills': await viewDrills(app); break;
       case 'coach': await viewCoach(app); break;
       case 'users': await viewUsers(app); break;
@@ -356,6 +367,293 @@ async function viewProgress(app) {
       <table class="table-wrap"><thead><tr><th>Метрика</th><th>Было</th><th>Стало</th><th>Δ</th><th>Направление</th><th>Вердикт</th></tr></thead><tbody>${trendRows}</tbody></table>
       <div style="margin-top:12px;font-size:13px"><strong>Улучшается: </strong>${pr.trend.improving.length ? pr.trend.improving.join(', ') : '—'}<br><strong>Ухудшается: </strong>${pr.trend.worsening.length ? pr.trend.worsening.join(', ') : '—'}</div>` : '<p style="color:var(--c-text-muted)">Недостаточно данных для тренда.</p>'}
     </div>`;
+}
+
+async function viewGames(app) {
+  if (!state.user) {
+    app.innerHTML = '<div class="onboarding card"><div class="empty-icon">♟</div><h1>Нет профиля</h1><p>Выбери профиль на странице Профили.</p></div>';
+    return;
+  }
+  if (state.gameId) {
+    await viewGameDetail(app);
+  } else {
+    await viewGameList(app);
+  }
+}
+
+async function viewGameList(app) {
+  state.gameId = null;
+  state.gameData = null;
+  clearGameKeyboard();
+  app.innerHTML = '<div class="card"><p>Загрузка...</p></div>';
+  const data = await api('/api/games?limit=100');
+  const games = data.games;
+  const filtered = state.gamesFilter === 'analyzed' ? games.filter(g => g.analyzed) : games;
+
+  const rows = filtered.map(g => {
+    const res = g.result_for_user || 'draw';
+    const resBadge = res === 'win' ? 'badge-good' : res === 'loss' ? 'badge-bad' : 'badge-neutral';
+    const resLabel = res === 'win' ? 'W' : res === 'loss' ? 'L' : 'D';
+    const opening = (g.opening ? esc(g.opening) : '—') + (g.eco ? ` <span style="color:var(--c-text-muted)">${esc(g.eco)}</span>` : '');
+    return `<tr class="game-row" data-id="${esc(g.id)}">
+      <td>${new Date(g.created_at).toLocaleDateString('ru-RU')}</td>
+      <td>${esc(g.opponent || '—')}</td>
+      <td class="center">${g.user_color === 'white' ? '♔' : '♚'}</td>
+      <td class="center"><span class="badge ${resBadge}">${resLabel}</span></td>
+      <td>${opening}</td>
+      <td class="num">${g.moves}</td>
+      <td class="center">${g.analyzed ? '<span class="badge badge-good">анализ</span>' : '<span class="badge badge-neutral">нет</span>'}</td>
+    </tr>`;
+  }).join('');
+
+  app.innerHTML = `
+    <div class="card-header"><h1>Партии</h1><span class="badge badge-blue">${esc(state.user.nick)}</span></div>
+    <div class="card">
+      <div class="games-filter">
+        <button class="btn btn-secondary ${state.gamesFilter === 'all' ? 'btn-active' : ''}" data-gfilter="all">Все</button>
+        <button class="btn btn-secondary ${state.gamesFilter === 'analyzed' ? 'btn-active' : ''}" data-gfilter="analyzed">Только проанализированные</button>
+      </div>
+      ${filtered.length ? `<table class="table-wrap"><thead><tr><th>Дата</th><th>Соперник</th><th>Цвет</th><th>Результат</th><th>Дебют</th><th class="num">Ходов</th><th>Анализ</th></tr></thead><tbody>${rows}</tbody></table>` : '<p style="color:var(--c-text-muted);padding:16px">Партий нет. Запусти анализ на странице «Анализ».</p>'}
+    </div>`;
+
+  app.querySelectorAll('[data-gfilter]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      state.gamesFilter = btn.dataset.gfilter;
+      viewGameList(app);
+    });
+  });
+  app.querySelectorAll('.game-row').forEach(row => {
+    row.addEventListener('click', () => {
+      state.gameId = row.dataset.id;
+      viewGames(app);
+    });
+  });
+}
+
+async function viewGameDetail(app) {
+  clearGameKeyboard();
+  app.innerHTML = '<div class="card"><p>Загрузка...</p></div>';
+  let data;
+  try {
+    data = await api('/api/games/' + encodeURIComponent(state.gameId));
+  } catch (err) {
+    state.gameId = null;
+    app.innerHTML = `<div class="card"><div class="alert alert-error">${esc(err.message)}</div><a href="#" class="btn btn-secondary" data-view="games">К списку партий</a></div>`;
+    bindLinks(app);
+    return;
+  }
+  state.gameData = data;
+  state.gamePly = 0;
+  drawGameDetail(app);
+  bindGameKeyboard();
+}
+
+function drawGameDetail(app) {
+  const data = state.gameData;
+  const game = data.game;
+  const analysis = data.analysis;
+  const fens = data.fens;
+  const ply = Math.max(0, Math.min(state.gamePly, fens.length - 1));
+  state.gamePly = ply;
+  const moves = game.moves || [];
+
+  const lastMove = ply > 0 ? lastMoveSquares(fens[ply - 1], fens[ply]) : [];
+
+  const res = game.result_for_user || 'draw';
+  const resBadge = res === 'win' ? 'badge-good' : res === 'loss' ? 'badge-bad' : 'badge-neutral';
+  const resLabel = res === 'win' ? 'Победа' : res === 'loss' ? 'Поражение' : 'Ничья';
+
+  const turnChar = fens[ply].split(' ')[1] === 'w' ? 'white' : 'black';
+  const turnLabel = turnChar === 'white' ? 'Белые' : 'Чёрные';
+  const posLabel = ply === 0 ? 'Начальная позиция' : `После хода ${ply}`;
+
+  const moveRows = {};
+  moves.forEach((san, i) => {
+    const num = Math.floor(i / 2) + 1;
+    if (!moveRows[num]) moveRows[num] = { num, w: null, b: null };
+    moveRows[num][i % 2 === 0 ? 'w' : 'b'] = { san, ply: i };
+  });
+
+  const userIsWhite = game.user_color === 'white';
+  const clsForPly = i => {
+    if (!analysis) return '';
+    if ((i % 2 === 0) !== userIsWhite) return '';
+    const entry = analysis.moves && analysis.moves[i];
+    const c = entry && entry.classification;
+    if (c === 'blunder') return ' move-blunder';
+    if (c === 'mistake') return ' move-mistake';
+    if (c === 'inaccuracy') return ' move-inaccuracy';
+    return '';
+  };
+
+  const moveCellHtml = m => m ? `<button class="move-cell${clsForPly(m.ply)}${ply === m.ply ? ' active' : ''}" data-ply="${m.ply}">${esc(m.san)}</button>` : '';
+
+  const moveRowsHtml = moves.length
+    ? Object.values(moveRows).map(r => `
+        <div class="move-row">
+          <span class="move-num">${r.num}.</span>
+          <span class="move-w">${moveCellHtml(r.w)}</span>
+          <span class="move-b">${moveCellHtml(r.b)}</span>
+        </div>`).join('')
+    : '<p style="color:var(--c-text-muted)">Ходов нет.</p>';
+
+  app.innerHTML = `
+    <div class="card-header">
+      <h1 style="margin:0">Партия <code>${esc(game.id)}</code></h1>
+      <span class="badge ${resBadge}">${resLabel}</span>
+    </div>
+    <div style="margin-bottom:16px"><a href="#" class="btn btn-secondary" data-view="games">← К списку партий</a></div>
+    <div class="grid game-layout">
+      <div class="card">
+        ${boardHtml(fens[ply], lastMove)}
+        <div class="board-meta">
+          <span class="badge badge-neutral">Ходят: ${turnLabel}</span>
+          <span class="badge badge-blue">${esc(posLabel)}</span>
+        </div>
+        <div class="board-controls">
+          <button class="btn btn-secondary" id="mv-first" ${ply === 0 ? 'disabled' : ''}>⏮</button>
+          <button class="btn btn-secondary" id="mv-prev" ${ply === 0 ? 'disabled' : ''}>◀</button>
+          <input type="range" id="mv-slider" min="0" max="${fens.length - 1}" value="${ply}">
+          <button class="btn btn-secondary" id="mv-next" ${ply >= fens.length - 1 ? 'disabled' : ''}>▶</button>
+          <button class="btn btn-secondary" id="mv-last" ${ply >= fens.length - 1 ? 'disabled' : ''}>⏭</button>
+        </div>
+        <div class="game-meta">
+          <div>Соперник: <strong>${esc(game.opponent || '—')}</strong> · <strong>${game.user_color === 'white' ? 'белые' : 'чёрные'}</strong> · ${game.rated ? 'рейтинговая' : 'нерейтинговая'} · <strong>${esc(game.speed || '—')}</strong></div>
+          <div>Дебют: <strong>${esc(game.opening || '—')}</strong>${game.eco ? ` <strong>${esc(game.eco)}</strong>` : ''} · ${new Date(game.created_at).toLocaleDateString('ru-RU')}</div>
+        </div>
+      </div>
+      <div class="game-side">
+        <div class="card">
+          <div class="card-header"><span class="card-title">Ходы</span></div>
+          <div class="moves-list">${moveRowsHtml}</div>
+          <div class="game-links">
+            <a class="btn btn-secondary" href="https://lichess.org/${esc(game.id)}" target="_blank" rel="noopener">Открыть на Lichess</a>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-header"><span class="card-title">Анализ</span></div>
+          ${analysis ? gameMetricsHtml(analysis) : '<p style="color:var(--c-text-muted)">Не проанализирована.</p>'}
+        </div>
+      </div>
+    </div>`;
+
+  bindLinks(app);
+  app.querySelectorAll('.move-cell').forEach(cell => {
+    cell.addEventListener('click', () => {
+      state.gamePly = +cell.dataset.ply;
+      drawGameDetail(app);
+    });
+  });
+  document.getElementById('mv-slider').addEventListener('input', e => {
+    state.gamePly = +e.target.value;
+    drawGameDetail(app);
+  });
+  document.getElementById('mv-first').addEventListener('click', () => { state.gamePly = 0; drawGameDetail(app); });
+  document.getElementById('mv-prev').addEventListener('click', () => { state.gamePly = Math.max(0, state.gamePly - 1); drawGameDetail(app); });
+  document.getElementById('mv-next').addEventListener('click', () => { state.gamePly = Math.min(fens.length - 1, state.gamePly + 1); drawGameDetail(app); });
+  document.getElementById('mv-last').addEventListener('click', () => { state.gamePly = fens.length - 1; drawGameDetail(app); });
+}
+
+function gameMetricsHtml(analysis) {
+  const blunders = (analysis.blunders || []).length;
+  const mistakes = (analysis.mistakes || []).length;
+  const inaccuracies = (analysis.inaccuracies || []).length;
+  const missed = (analysis.missed_wins || []).length;
+  const avgLoss = analysis.avg_win_loss != null ? analysis.avg_win_loss.toFixed(1) : '—';
+  const avgBefore = analysis.avg_win_before != null ? analysis.avg_win_before.toFixed(1) : '—';
+  return `
+    <div class="grid grid-3">
+      <div class="stat"><div class="stat-value" style="color:#c5221f">${blunders}</div><div class="stat-label">Зевки</div></div>
+      <div class="stat"><div class="stat-value" style="color:#d64f00">${mistakes}</div><div class="stat-label">Ошибки</div></div>
+      <div class="stat"><div class="stat-value" style="color:#b8860b">${inaccuracies}</div><div class="stat-label">Неточности</div></div>
+      <div class="stat"><div class="stat-value">${missed}</div><div class="stat-label">Упущ. выигрыши</div></div>
+      <div class="stat"><div class="stat-value">${avgLoss}</div><div class="stat-label">Ср. потеря win%</div></div>
+      <div class="stat"><div class="stat-value">${avgBefore}</div><div class="stat-label">Win% до хода</div></div>
+    </div>`;
+}
+
+const PIECE_GLYPHS = {
+  K: '♔', Q: '♕', R: '♖', B: '♗', N: '♘', P: '♙',
+  k: '♚', q: '♛', r: '♜', b: '♝', n: '♞', p: '♟',
+};
+const FILES = 'abcdefgh';
+
+function fenPieces(fen) {
+  const placement = fen.split(' ')[0];
+  const pieces = {};
+  let rank = 8, file = 0;
+  for (const ch of placement) {
+    if (ch === '/') { rank--; file = 0; continue; }
+    if (ch >= '1' && ch <= '8') { file += +ch; continue; }
+    pieces[FILES[file] + rank] = ch;
+    file++;
+  }
+  return pieces;
+}
+
+function lastMoveSquares(fenBefore, fenAfter) {
+  const before = fenPieces(fenBefore);
+  const after = fenPieces(fenAfter);
+  const froms = [];
+  const tos = [];
+  for (let r = 8; r >= 1; r--) {
+    for (let f = 0; f < 8; f++) {
+      const sq = FILES[f] + r;
+      if (before[sq] && !after[sq]) froms.push(sq);
+      if (!before[sq] && after[sq]) tos.push(sq);
+    }
+  }
+  if (froms.length === 2 && tos.length === 1) {
+    // en passant: снятая пешка стоит на вертикали пункта назначения
+    const to = tos[0];
+    const captured = froms.find(s => s[0] === to[0]) || froms[1];
+    const from = froms.find(s => s !== captured) || froms[0];
+    return [from, to, captured];
+  }
+  return froms.concat(tos);
+}
+
+function boardHtml(fen, hlSquares) {
+  const pieces = fenPieces(fen);
+  const hl = hlSquares || [];
+  let html = '';
+  for (let rank = 8; rank >= 1; rank--) {
+    for (let f = 0; f < 8; f++) {
+      const square = FILES[f] + rank;
+      const light = ((f + (8 - rank)) % 2 === 0);
+      const cls = ['sq', light ? 'light' : 'dark'];
+      if (hl.includes(square)) cls.push('lm');
+      const piece = pieces[square];
+      html += `<div class="${cls.join(' ')}">${piece ? `<span class="piece">${PIECE_GLYPHS[piece]}</span>` : ''}</div>`;
+    }
+  }
+  return `<div class="board">${html}</div>`;
+}
+
+function bindGameKeyboard() {
+  clearGameKeyboard();
+  const handler = e => {
+    const fens = state.gameData && state.gameData.fens;
+    if (!fens) return;
+    if (e.key === 'ArrowLeft') {
+      e.preventDefault();
+      state.gamePly = Math.max(0, state.gamePly - 1);
+      drawGameDetail(document.getElementById('app'));
+    } else if (e.key === 'ArrowRight') {
+      e.preventDefault();
+      state.gamePly = Math.min(fens.length - 1, state.gamePly + 1);
+      drawGameDetail(document.getElementById('app'));
+    }
+  };
+  state.keyHandler = handler;
+  document.addEventListener('keydown', handler);
+}
+
+function clearGameKeyboard() {
+  if (state.keyHandler) {
+    document.removeEventListener('keydown', state.keyHandler);
+    state.keyHandler = null;
+  }
 }
 
 async function viewDrills(app) {

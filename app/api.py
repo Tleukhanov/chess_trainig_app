@@ -11,6 +11,8 @@ import time
 import uuid
 import webbrowser
 from dataclasses import asdict, dataclass, field
+
+import chess
 from pathlib import Path
 from typing import Any
 
@@ -346,6 +348,94 @@ def create_api(
         if not job:
             raise HTTPException(404, "Job not found")
         return job.as_dict()
+
+    # --- Games (просмотр партий) ---
+    def _game_summary(g) -> dict:
+        return {
+            "id": g.id,
+            "created_at": g.created_at,
+            "opponent": g.opponent,
+            "user_color": g.user_color,
+            "result_for_user": g.result_for_user,
+            "opening": g.opening,
+            "eco": g.eco,
+            "speed": g.speed,
+            "rated": g.rated,
+            "moves": len(g.moves),
+        }
+
+    def _games_payload(db, user: str, limit: int) -> dict:
+        games = db.get_games(user, limit)
+        ids = [g.id for g in games]
+        analyzed = set(ids) - set(db.get_unanalyzed(ids))
+        items = []
+        for g in games:
+            item = _game_summary(g)
+            item["analyzed"] = g.id in analyzed
+            items.append(item)
+        return {"games": items}
+
+    def _game_dict(g) -> dict:
+        return {
+            "id": g.id,
+            "rated": g.rated,
+            "speed": g.speed,
+            "created_at": g.created_at,
+            "status": g.status,
+            "winner": g.winner,
+            "white": g.white,
+            "black": g.black,
+            "opening": g.opening,
+            "eco": g.eco,
+            "moves": g.moves,
+            "user_color": g.user_color,
+            "opponent": g.opponent,
+            "user_rating": g.user_rating,
+            "user_rating_diff": g.user_rating_diff,
+            "result_for_user": g.result_for_user,
+        }
+
+    def _fens_for(moves: list[str]) -> list[str]:
+        """FEN после каждого хода; на невалидном ходе останавливается."""
+        board = chess.Board()
+        fens = [board.fen()]
+        for san in moves:
+            try:
+                board.push_san(san)
+            except ValueError:
+                break
+            fens.append(board.fen())
+        return fens
+
+    def _game_detail_payload(db, user: str, game_id: str) -> dict:
+        game = db.get_game(game_id, user)
+        if not game:
+            raise RuntimeError("Game not found")
+        return {
+            "game": _game_dict(game),
+            "analysis": db.get_analysis(game_id),
+            "fens": _fens_for(game.moves),
+        }
+
+    @app.get("/api/games")
+    def api_games(request: Request, limit: int = 100):
+        user = _current_user(app.state.db_path)
+        if not user:
+            raise HTTPException(404, "No current user")
+        return _call_data(
+            lambda db: _games_payload(db, user["nick"], limit),
+            app.state.db_path,
+        )
+
+    @app.get("/api/games/{game_id}")
+    def api_game_detail(game_id: str, request: Request):
+        user = _current_user(app.state.db_path)
+        if not user:
+            raise HTTPException(404, "No current user")
+        return _call_data(
+            lambda db: _game_detail_payload(db, user["nick"], game_id),
+            app.state.db_path,
+        )
 
     # Frontend static files — mounted LAST so /api/* routes take precedence.
     frontend_dir = Path(__file__).resolve().parent.parent / "frontend"

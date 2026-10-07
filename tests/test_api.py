@@ -14,6 +14,8 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+import chess
+
 from app.api import create_api
 from app.db import Database
 from app.games import Game
@@ -39,6 +41,32 @@ def mkgame(id: str) -> Game:
         user_rating_diff=0,
         result_for_user="loss",
     )
+
+
+def mkgame_moves(id: str, moves: list[str], **overrides) -> Game:
+    """Партия из mkgame с заменёнными ходами (Game frozen, строим заново)."""
+    base = mkgame(id)
+    kwargs = dict(
+        id=base.id,
+        rated=base.rated,
+        speed=base.speed,
+        created_at=base.created_at,
+        status=base.status,
+        winner=base.winner,
+        white=base.white,
+        black=base.black,
+        opening=base.opening,
+        eco=base.eco,
+        moves=moves,
+        clocks=base.clocks,
+        user_color=base.user_color,
+        opponent=base.opponent,
+        user_rating=base.user_rating,
+        user_rating_diff=base.user_rating_diff,
+        result_for_user=base.result_for_user,
+    )
+    kwargs.update(overrides)
+    return Game(**kwargs)
 
 
 class ApiTestBase(unittest.TestCase):
@@ -185,6 +213,81 @@ class CoachApiTests(ApiTestBase):
             db.init_db()
             db.clear_current_user()
         resp = self.client.post("/api/coach/run", data={"max": "10", "perf": "rapid", "depth": "8", "multipv": "1"})
+        self.assertEqual(resp.status_code, 404)
+
+
+class GameApiTests(ApiTestBase):
+    """Тесты /api/games и /api/games/{id} (список + разбор партии)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.save_games([mkgame("g1")], "tester")
+            db.save_analysis("g1", {"summary": [], "moves": []}, depth=8)
+            db.save_games(
+                [mkgame_moves("g2", ["e4", "e5", "Nf3"], created_at=1)],
+                "tester",
+            )
+            db.set_current_user("tester")
+
+    def test_list_games(self):
+        resp = self.client.get("/api/games?limit=100")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(len(data["games"]), 2)
+        g1 = data["games"][0]
+        self.assertEqual(g1["id"], "g1")
+        self.assertTrue(g1["analyzed"])
+        self.assertEqual(g1["opponent"], "B")
+        self.assertEqual(g1["user_color"], "black")
+        self.assertEqual(g1["result_for_user"], "loss")
+        self.assertEqual(g1["moves"], 1)
+        self.assertEqual(g1["speed"], "rapid")
+        self.assertTrue(g1["rated"])
+        g2 = data["games"][1]
+        self.assertEqual(g2["id"], "g2")
+        self.assertFalse(g2["analyzed"])
+        self.assertEqual(g2["moves"], 3)
+
+    def test_list_games_empty(self):
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.set_current_user("nobody")
+        resp = self.client.get("/api/games?limit=100")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["games"], [])
+
+    def test_game_detail_fens(self):
+        resp = self.client.get("/api/games/g2")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["game"]["id"], "g2")
+        self.assertIsNone(data["analysis"])
+        self.assertEqual(len(data["fens"]), 4)  # 1 + 3 хода
+        self.assertEqual(data["fens"][0], chess.STARTING_FEN)
+        board = chess.Board(data["fens"][-1])
+        self.assertTrue(board.is_valid())
+        self.assertEqual(data["game"]["moves"], ["e4", "e5", "Nf3"])
+
+    def test_game_detail_with_analysis(self):
+        resp = self.client.get("/api/games/g1")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertIsNotNone(data["analysis"])
+        self.assertEqual(len(data["fens"]), 2)
+
+    def test_game_not_found(self):
+        resp = self.client.get("/api/games/nonexistent")
+        self.assertEqual(resp.status_code, 404)
+
+    def test_list_games_no_user(self):
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.clear_current_user()
+        resp = self.client.get("/api/games")
+        self.assertEqual(resp.status_code, 404)
+        resp = self.client.get("/api/games/g1")
         self.assertEqual(resp.status_code, 404)
 
 
