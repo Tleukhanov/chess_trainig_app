@@ -216,6 +216,21 @@ JSON и подсказках для LLM:
   и вариант, продолжение партии) и ей запрещено выдумывать оценки.
 - `review --dry-run` печатает готовые промпты без обращения к API.
 
+## Веб-интерфейс
+
+Веб-версия тренера: бэкенд — чистый JSON API (`app/api.py`, FastAPI),
+фронтенд — отдельная папка `frontend/` (vanilla JS/CSS, без сборки и фреймворков).
+Одинаковые данные с CLI: тот же кеш, та же БД, общий слой `app/data.py`.
+
+- `GET /api/user/current`, `/api/users`, `POST /api/user/add|switch` — профили;
+- `GET /api/overview|plan|progress|drills|report` — отчёты из кеша (без движка и сети);
+- `GET /api/drills.pgn`, `/api/drills.json` — выгрузка дрелей;
+- `POST /api/coach/run` + `GET /api/jobs/{id}` — анализ движком в фоне с прогрессом;
+- `GET /api/docs` — автодокументация OpenAPI.
+
+Запуск: `python -m trainer web` (порт 8000, откроется браузер), `--port 9000`,
+`--no-browser` — без автозапуска браузера.
+
 ## Установка
 
 ```powershell
@@ -304,6 +319,10 @@ python -m trainer coach --yes --user NICK      # без единого вопр�
 # Турнир OTB: ручной ввод результатов, перформанс и прирост рейтинга (без сети)
 python -m trainer tournament --games "Иванов:white:win:2100" --games "Петров:black:draw:2050" --initial 2000
 python -m trainer tournament --games "Иванов:white:win:2100" --json data/tournament.json
+
+# Веб-интерфейс: JSON API + SPA-фронт (http://127.0.0.1:8000)
+python -m trainer web
+python -m trainer web --port 9000 --no-browser
 
 # Тесты
 python -m unittest discover -s tests -v
