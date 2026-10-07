@@ -13,16 +13,18 @@ from pathlib import Path
 from .config import settings
 
 
-def user_dir(user: str | None) -> Path:
+def user_dir(user: str | None, *, root: Path | None = None) -> Path:
     """Каталог игрока ``data/<ник>/`` (регистронезависимый ключ поиска).
 
     Без создания: предназначен и для чтения, и для записи. None → корень
     ``settings.data_dir`` (общие файлы v0.3 / команды без привязки).
+    ``root`` — другой корень данных (тесты, веб на временной папке).
     """
+    base = settings.data_dir if root is None else root
     nick = (user or "").strip().lower()
     if not nick:
-        return settings.data_dir
-    return settings.data_dir / nick
+        return base
+    return base / nick
 
 
 def artifact(name: str, user: str | None) -> Path:
@@ -32,17 +34,18 @@ def artifact(name: str, user: str | None) -> Path:
     return path
 
 
-def artifact_read(name: str, user: str | None) -> Path | None:
+def artifact_read(name: str, user: str | None, *, root: Path | None = None) -> Path | None:
     """Существующий путь артефакта для чтения.
 
     Приоритет: своя папка, затем общий файл ``data/<name>`` (фолбэк v0.3).
-    Ни того ни другого нет → None.
+    Ни того ни другого нет → None. ``root`` — другой корень данных.
     """
     if user:
-        own = user_dir(user) / name
+        own = user_dir(user, root=root) / name
         if own.exists():
             return own
-    legacy = settings.data_dir / name
+    base = settings.data_dir if root is None else root
+    legacy = base / name
     if legacy.exists():
         return legacy
     return None

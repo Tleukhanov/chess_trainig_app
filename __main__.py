@@ -37,6 +37,7 @@ from pathlib import Path
 from app.analyzer import Engine
 from app.coach import build_request, run_coach
 from app.config import settings
+from app import data as shared_data
 from app.db import Database
 from app.drills import collect_drills, drills_to_json, drills_to_pgn, summarize
 from app.fide import (
@@ -264,6 +265,12 @@ def _make_parser() -> argparse.ArgumentParser:
     switch_p = user_actions.add_parser("switch", help="закрепить другого игрока (без ника — выбор из списка)")
     switch_p.add_argument("nick", nargs="?", default=None, help="ник на Lichess")
     switch_p.add_argument("--yes", action="store_true", help="не задавать вопросов (для switch)")
+
+    web = subparsers.add_parser("web", help="веб-интерфейс (FastAPI + uvicorn)")
+    web.add_argument("--host", default="127.0.0.1", help="адрес для прослушивания (по умолчанию %(default)s)")
+    web.add_argument("--port", type=int, default=8000, help="порт (по умолчанию %(default)s)")
+    web.add_argument("--no-browser", action="store_true", help="не открывать браузер автоматически")
+
     return parser
 
 
@@ -700,6 +707,12 @@ def _drills_verdicts(args: argparse.Namespace) -> tuple[list[dict] | None, set[s
     return items, set(args.verdict)
 
 
+def _cmd_web(args: argparse.Namespace) -> int:
+    """Запускает веб-интерфейс (FastAPI API + статический фронтенд)."""
+    from app.api import run_web
+    return run_web(host=args.host, port=args.port, no_browser=args.no_browser)
+
+
 def _write_drills(drills, out: Path) -> None:
     """Пишет дрели в PGN или JSON — по расширению файла."""
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -993,27 +1006,9 @@ def _repertoire_pairs(db: Database, args: argparse.Namespace) -> list[tuple[Game
     """Загружает пары (Game, analysis) для репертуара из кеша.
 
     Работает только по кешу: движок не запускается, сеть не используется.
+    Логика — в app/data.py (общий слой с веб-интерфейсом).
     """
-    if args.game:
-        game = db.get_game(args.game, user=args.user)
-        if game is None:
-            raise RuntimeError(f"Партия {args.game} не найдена в кеше")
-        analysis = db.get_analysis(args.game)
-        if analysis is None:
-            raise RuntimeError(
-                f"Партия {args.game} не проанализирована — сначала прогони "
-                "coach, напр.: python -m trainer coach --user <NICK>"
-            )
-        return [(game, analysis)]
-    if not args.user:
-        raise RuntimeError("Укажи --user или --game")
-    pairs = db.get_analyzed_games(args.user, limit=200)
-    if not pairs:
-        raise RuntimeError(
-            f"Нет проанализированных партий для {args.user}. "
-            "Запусти сначала: python -m trainer coach --user <NICK>"
-        )
-    return pairs
+    return shared_data.repertoire_pairs(db, user=args.user, game=args.game)
 
 
 def _print_opening_stats_table(stats: list[dict], *, limit: int = 12) -> None:
@@ -1123,44 +1118,17 @@ def _cmd_repertoire(args: argparse.Namespace) -> int:
 
 def _load_humanity(path: Path) -> dict | None:
     """Читает data/humanity.json: возвращает {total, natural, borderline, unnatural} или None."""
-    if not path.exists():
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return None
-    verdicts = data.get("verdicts") if isinstance(data, dict) else None
-    if not isinstance(verdicts, dict):
-        return None
-    total = data.get("total_bad")
-    if not isinstance(total, int):
-        total = sum(
-            int(v) for v in verdicts.values() if isinstance(v, (int, float))
-        )
-    counts = {
-        label: int(verdicts.get(label, 0) or 0)
-        for label in ("natural", "borderline", "unnatural")
-    }
-    return {"total": total, **counts}
+    return shared_data.load_humanity(path)
 
 
 def _count_pgn_games(path: Path) -> int:
     """Число партий в PGN-файле (по заголовкам [Event …])."""
-    if not path.exists():
-        return 0
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return 0
-    return sum(1 for line in text.splitlines() if line.startswith("[Event ")) if text.strip() else 0
+    return shared_data.count_pgn_games(path)
 
 
 def _count_drills(name: str, user: str | None, explicit_dir: Path | None) -> int:
     """Число дрелей в файле: явная папка или своя/легаси через artifact_read."""
-    if explicit_dir is not None:
-        return _count_pgn_games(explicit_dir / name)
-    path = artifact_read(name, user)
-    return _count_pgn_games(path) if path is not None else 0
+    return shared_data.count_drills(name, user, explicit_dir)
 
 
 def _run_overview(
@@ -1358,13 +1326,7 @@ def _cmd_mentor(args: argparse.Namespace) -> int:
 
 def _load_humanity_raw(path: Path) -> dict | None:
     """Читает data/humanity.json целиком ({items: [...]}) или None, если нет."""
-    if not path.exists():
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return None
-    return data if isinstance(data, dict) else None
+    return shared_data.load_humanity_raw(path)
 
 
 def _cmd_progress(args: argparse.Namespace) -> int:
@@ -1593,6 +1555,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_tournament(args)
     if args.command == "fide":
         return _cmd_fide(args)
+    if args.command == "web":
+        return _cmd_web(args)
 
     needs_user = {
         "coach",
