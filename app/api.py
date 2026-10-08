@@ -707,6 +707,35 @@ def _task_explain_llm(payload: dict[str, Any]) -> str:
     )
     return text.strip()
 
+# --- Мини-трекер времени ---------------------------------------------------
+
+def _now() -> float:
+    """Текущий unix-время (сек) — отдельная функция ради тестов (патчат)."""
+    return time.time()
+
+
+def _track_key(date: str, user: str) -> str:
+    """Ключ meta с сессией на сайте за дату (на пользователя)."""
+    return f"site_time_{date}_{user}"
+
+
+def _track_state(db: Database, key: str) -> dict[str, float] | None:
+    """Читает сессию трекера {"last", "total"}; нет записи/битый JSON → None."""
+    raw = db.get_meta(key)
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        return {"last": float(data["last"]), "total": float(data["total"])}
+    except (TypeError, ValueError, KeyError):
+        return None
+
+
+def _clock_seconds(clocks: list[float]) -> float:
+    """«Часы в партии»: сумма убываний остатков clocks (без инкрементов)."""
+    return sum(max(0.0, prev - cur) for prev, cur in zip(clocks, clocks[1:]))
+
+
 # --- API factory -----------------------------------------------------------
 
 def create_api(
@@ -1321,6 +1350,52 @@ def create_api(
             daemon=True,
         ).start()
         return {"cached": False, "job_id": job.id, "status": "started"}
+
+    # --- Мини-трекер времени ---
+    @app.post("/api/track/ping")
+    def api_track_ping(request: Request):
+        user = _current_user(app.state.db_path)
+        if not user:
+            raise HTTPException(404, "No current user")
+        now = _now()
+        key = _track_key(_today(), user["nick"])
+        with Database(app.state.db_path) as db:
+            state = _track_state(db, key)
+            if state is None:
+                total = 0.0
+            else:
+                gap = now - state["last"]
+                total = state["total"] + gap if 0.0 <= gap <= 300.0 else state["total"]
+            db.set_meta(key, json.dumps({"last": now, "total": total}))
+        return {"ok": True, "total": int(total)}
+
+    @app.get("/api/track/today")
+    def api_track_today(request: Request):
+        user = _current_user(app.state.db_path)
+        if not user:
+            raise HTTPException(404, "No current user")
+        day = _today()
+        now = _now()
+        with Database(app.state.db_path) as db:
+            state = _track_state(db, _track_key(day, user["nick"]))
+            games = db.get_games(user["nick"], limit=100_000)
+        site_sec = 0.0
+        if state is not None:
+            site_sec = state["total"] + max(0.0, min(now - state["last"], 60.0))
+        lichess_sec = 0.0
+        games_today = 0
+        for game in games:
+            if time.strftime("%Y-%m-%d", time.localtime(game.created_at / 1000)) != day:
+                continue
+            games_today += 1
+            lichess_sec += _clock_seconds(game.clocks)
+        return {
+            "date": day,
+            "site_sec": int(site_sec),
+            "lichess_sec": int(lichess_sec),
+            "total_sec": int(site_sec + lichess_sec),
+            "games_today": games_today,
+        }
 
     # Frontend static files — mounted LAST so /api/* routes take precedence.
     frontend_dir = Path(__file__).resolve().parent.parent / "frontend"

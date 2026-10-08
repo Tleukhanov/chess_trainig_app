@@ -1580,14 +1580,25 @@ function renderMentor(d) {
     </div>`;
 }
 
+function _fmtDur(sec) {
+  const total = Math.max(0, Math.floor(Number(sec) || 0));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  return h > 0 ? `${h} ч ${m} мин` : `${m} мин`;
+}
+
 async function viewUsers(app) {
   const users = await api('/api/users');
   const list = users.users;
   const currentNick = state.user ? state.user.nick : '';
+  const track = state.user ? await api('/api/track/today').catch(() => null) : null;
+  const trackHtml = track
+    ? `<div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--c-border);font-size:13px;color:var(--c-text-muted)">Сегодня: <strong style="color:var(--c-text)">${_fmtDur(track.total_sec)}</strong> · Lichess ${_fmtDur(track.lichess_sec)} · тренер ${_fmtDur(track.site_sec)}</div>`
+    : '';
 
   app.innerHTML = `
     <div class="card-header"><h1>Профили</h1></div>
-    ${state.user ? `<div class="card" style="margin-bottom:16px"><div class="card-header"><span class="card-title">Текущий профиль</span></div><div class="grid grid-3"><div class="stat"><div class="stat-value">${esc(state.user.nick)}</div><div class="stat-label">Ник</div></div><div class="stat"><div class="stat-value">${state.user.fide_id || '—'}</div><div class="stat-label">FIDE ID</div></div><div class="stat"><div class="stat-value">${state.user.games || 0}</div><div class="stat-label">Партий</div></div></div></div>` : '<div class="alert alert-info">Профиль не выбран. Добавь профиль или выбери из списка.</div>'}
+    ${state.user ? `<div class="card" style="margin-bottom:16px"><div class="card-header"><span class="card-title">Текущий профиль</span></div><div class="grid grid-3"><div class="stat"><div class="stat-value">${esc(state.user.nick)}</div><div class="stat-label">Ник</div></div><div class="stat"><div class="stat-value">${state.user.fide_id || '—'}</div><div class="stat-label">FIDE ID</div></div><div class="stat"><div class="stat-value">${state.user.games || 0}</div><div class="stat-label">Партий</div></div></div>${trackHtml}</div>` : '<div class="alert alert-info">Профиль не выбран. Добавь профиль или выбери из списка.</div>'}
     <div class="card">
       <div class="card-header"><span class="card-title">Добавить профиль</span></div>
       <form id="add-user-form" class="form-row" style="gap:16px;align-items:flex-end">
@@ -1725,10 +1736,19 @@ async function loadUser() {
   renderUserbox();
 }
 
+function startTrackPing() {
+  const ping = () => {
+    if (state.user) fetch('/api/track/ping', { method: 'POST' }).catch(() => {});
+  };
+  ping();
+  setInterval(ping, 60000);
+}
+
 async function init() {
   setupTheme();
   setupNav();
   await loadUser();
+  startTrackPing();
   navigate('dashboard');
 }
 

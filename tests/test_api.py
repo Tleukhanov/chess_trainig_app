@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 
 import chess
 
-from app.api import create_api, _task_done_key
+from app.api import create_api, _task_done_key, _today
 from app.db import Database
 from app.fide import FidePlayer, FideRatings
 from app.games import Game
@@ -1071,6 +1071,135 @@ class TaskApiTests(ApiTestBase):
             404,
         )
         self.assertEqual(self.client.post("/api/task/explain").status_code, 404)
+
+
+class TrackApiTests(ApiTestBase):
+    """Тесты мини-трекера времени: /api/track/ping и /api/track/today.
+
+    Время патчится через app.api._now — сеть и реальные часы не участвуют.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._set_current("tester")
+
+    def test_ping_accumulates_site_time(self):
+        clock = {"t": 5_000_000.0}
+        with patch("app.api._now", new=lambda: clock["t"]):
+            first = self.client.post("/api/track/ping")
+            self.assertEqual(first.status_code, 200)
+            self.assertEqual(first.json(), {"ok": True, "total": 0})
+
+            clock["t"] += 120
+            second = self.client.post("/api/track/ping")
+            self.assertEqual(second.json()["total"], 120)
+
+            data = self.client.get("/api/track/today").json()
+        self.assertEqual(data["date"], _today())
+        self.assertEqual(data["site_sec"], 120)
+        self.assertEqual(data["games_today"], 0)
+        self.assertEqual(data["lichess_sec"], 0)
+        self.assertEqual(data["total_sec"], 120)
+
+    def test_ping_gap_over_cap_not_credited(self):
+        clock = {"t": 5_000_000.0}
+        with patch("app.api._now", new=lambda: clock["t"]):
+            self.client.post("/api/track/ping")  # создаёт сессию
+
+            clock["t"] += 1000  # gap > 300с — не начисляем
+            resp = self.client.post("/api/track/ping")
+            self.assertEqual(resp.json()["total"], 0)
+
+            clock["t"] += 60  # last обновлён — этот gap начисляется
+            resp = self.client.post("/api/track/ping")
+            self.assertEqual(resp.json()["total"], 60)
+            data = self.client.get("/api/track/today").json()
+        self.assertEqual(data["site_sec"], 60)
+
+    def test_today_counts_lichess_games(self):
+        today_ms = int(time.time() * 1000)
+        yesterday_ms = int((time.time() - 86_400) * 1000)
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.save_games(
+                [
+                    mkgame_moves(
+                        "tr1",
+                        ["e4", "e5"],
+                        created_at=today_ms,
+                        clocks=[600.0, 598.0, 596.0, 590.0],
+                    ),
+                    mkgame_moves(
+                        "tr2",
+                        ["d4", "d5"],
+                        created_at=yesterday_ms,
+                        clocks=[600.0, 590.0],
+                    ),
+                ],
+                "tester",
+            )
+        data = self.client.get("/api/track/today").json()
+        self.assertEqual(data["games_today"], 1)
+        # убывания 600→598=2, 598→596=2, 596→590=6
+        self.assertEqual(data["lichess_sec"], 10)
+        self.assertEqual(data["site_sec"], 0)
+        self.assertEqual(data["total_sec"], data["site_sec"] + data["lichess_sec"])
+
+    def test_total_sec_sums_site_and_lichess(self):
+        today_ms = int(time.time() * 1000)
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.save_games(
+                [
+                    mkgame_moves(
+                        "tr3",
+                        ["e4"],
+                        created_at=today_ms,
+                        clocks=[600.0, 590.0],
+                    ),
+                ],
+                "tester",
+            )
+        clock = {"t": 5_000_000.0}
+        with patch("app.api._now", new=lambda: clock["t"]):
+            self.client.post("/api/track/ping")
+            clock["t"] += 90
+            self.client.post("/api/track/ping")
+            data = self.client.get("/api/track/today").json()
+        self.assertEqual(data["site_sec"], 90)
+        self.assertEqual(data["lichess_sec"], 10)
+        self.assertEqual(data["total_sec"], 100)
+
+    def test_empty_clocks_count_as_zero(self):
+        today_ms = int(time.time() * 1000)
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.save_games(
+                [mkgame_moves("tr4", ["e4"], created_at=today_ms, clocks=[])],
+                "tester",
+            )
+        data = self.client.get("/api/track/today").json()
+        self.assertEqual(data["games_today"], 1)
+        self.assertEqual(data["lichess_sec"], 0)
+
+    def test_no_user_404(self):
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.clear_current_user()
+        self.assertEqual(self.client.post("/api/track/ping").status_code, 404)
+        self.assertEqual(self.client.get("/api/track/today").status_code, 404)
+
+    def test_ping_stores_valid_json_meta(self):
+        clock = {"t": 5_000_000.0}
+        with patch("app.api._now", new=lambda: clock["t"]):
+            self.client.post("/api/track/ping")
+        with Database(self.db_path) as db:
+            db.init_db()
+            raw = db.get_meta(f"site_time_{_today()}_tester")
+        self.assertIsNotNone(raw)
+        stored = json.loads(raw)
+        self.assertEqual(stored["last"], 5_000_000.0)
+        self.assertEqual(stored["total"], 0)
 
 
 class FrontendTests(ApiTestBase):
