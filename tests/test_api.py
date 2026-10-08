@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 
 import chess
 
-from app.api import create_api
+from app.api import create_api, _task_done_key
 from app.db import Database
 from app.fide import FidePlayer, FideRatings
 from app.games import Game
@@ -785,6 +785,292 @@ class LlmToolApiTests(ApiTestBase):
             db.clear_current_user()
         resp = self.client.post("/api/mentor/run", data={"notes": "x"})
         self.assertEqual(resp.status_code, 404)
+
+
+class TaskApiTests(ApiTestBase):
+    """Тесты «Задачи дня»: /api/task/today, /answer, /explain.
+
+    Сид повторяет формат analysis из analyzer.GameAnalysis.summary():
+    moves[i] = {san, win_before, win_after, drop, classification,
+    best_move_san, best_line, ...}, индексы blunders/mistakes — ply.
+    Движок и сеть не запускаются.
+    """
+
+    @staticmethod
+    def _move(
+        san: str,
+        classification: str,
+        drop: float,
+        win_before: float,
+        win_after: float,
+        best: str,
+        best_line: list[str] | None = None,
+    ) -> dict:
+        return {
+            "san": san,
+            "before": {"cp": 20.0, "mate": None},
+            "after": {"cp": 5.0, "mate": None},
+            "win_before": win_before,
+            "win_after": win_after,
+            "drop": drop,
+            "classification": classification,
+            "best_move_san": best,
+            "best_eval": {"cp": 20.0, "mate": None},
+            "best_win": win_before,
+            "clock_used": None,
+            "time_pressure": None,
+            "best_line": best_line or [],
+            "played_line": [],
+        }
+
+    def _seed_tasks(self) -> None:
+        """Две партии с ошибками пользователя (белые) — пул из 2 кандидатов."""
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.save_games(
+                [
+                    mkgame_moves(
+                        "tk1",
+                        ["e4", "e5", "Nf3", "Nc6", "Bb5", "a6"],
+                        user_color="white",
+                        result_for_user="loss",
+                        opponent="Rival1",
+                        created_at=100,
+                    ),
+                    mkgame_moves(
+                        "tk2",
+                        ["d4", "d5", "Nf3"],
+                        user_color="white",
+                        result_for_user="win",
+                        opponent="Rival2",
+                        created_at=200,
+                    ),
+                ],
+                "tester",
+            )
+            db.save_analysis(
+                "tk1",
+                {
+                    "game_id": "tk1",
+                    "user_color": "white",
+                    "result_for_user": "loss",
+                    "opponent": "Rival1",
+                    "avg_win_loss": 12.5,
+                    "avg_win_before": 55.0,
+                    "blunders": [4],
+                    "mistakes": [],
+                    "inaccuracies": [],
+                    "missed_wins": [],
+                    "time_pressure_blunders": [],
+                    "moves": [
+                        self._move("e4", "best", 0.0, 55.0, 55.0, "e4"),
+                        self._move("e5", "good", 0.0, 45.0, 45.0, "e5"),
+                        self._move("Nf3", "good", 0.0, 50.0, 50.0, "Nf3"),
+                        self._move("Nc6", "good", 0.0, 50.0, 50.0, "Nc6"),
+                        self._move(
+                            "Bb5", "blunder", 25.0, 60.0, 35.0, "Bc4", ["c4", "Nf6"]
+                        ),
+                        self._move("a6", "good", 0.0, 40.0, 40.0, "a6"),
+                    ],
+                },
+                depth=8,
+            )
+            db.save_analysis(
+                "tk2",
+                {
+                    "game_id": "tk2",
+                    "user_color": "white",
+                    "result_for_user": "win",
+                    "opponent": "Rival2",
+                    "avg_win_loss": 6.0,
+                    "avg_win_before": 55.0,
+                    "blunders": [],
+                    "mistakes": [2],
+                    "inaccuracies": [],
+                    "missed_wins": [],
+                    "time_pressure_blunders": [],
+                    "moves": [
+                        self._move("d4", "best", 0.0, 55.0, 55.0, "d4"),
+                        self._move("d5", "good", 0.0, 45.0, 45.0, "d5"),
+                        self._move("Nf3", "mistake", 12.0, 62.0, 50.0, "c4"),
+                    ],
+                },
+                depth=8,
+            )
+            db.set_current_user("tester")
+
+    def _wait_job(self, job_id: str, timeout: float = 15.0) -> dict:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            resp = self.client.get(f"/api/jobs/{job_id}")
+            self.assertEqual(resp.status_code, 200)
+            data = resp.json()
+            if data["status"] != "running":
+                return data
+            time.sleep(0.05)
+        self.fail(f"job {job_id} не завершился за {timeout}с")
+
+    def _wrong_answer(self, payload: dict) -> str:
+        """Легальный ход из позиции задачи, отличный от лучшего."""
+        board = chess.Board(payload["fen"])
+        best = board.parse_san(payload["best_san"])
+        for move in board.legal_moves:
+            if move != best:
+                return board.san(move)
+        self.fail("нет легального хода, отличного от лучшего")
+
+    # --- today ---
+
+    def test_today_deterministic(self):
+        self._seed_tasks()
+        first = self.client.get("/api/task/today")
+        second = self.client.get("/api/task/today")
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        a, b = first.json(), second.json()
+        self.assertEqual(a["game_id"], b["game_id"])
+        self.assertEqual(a["ply"], b["ply"])
+        self.assertEqual(a["fen"], b["fen"])
+        self.assertEqual(a["task_key"], b["task_key"])
+
+    def test_today_payload_structure(self):
+        self._seed_tasks()
+        resp = self.client.get("/api/task/today")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        for key in (
+            "date", "game_id", "ply", "fen", "san_played", "best_san",
+            "classification", "drop", "win_before", "win_after", "opening",
+            "eco", "result_for_user", "opponent", "user_color",
+            "moves_before", "solution", "explanation", "explained", "done",
+        ):
+            self.assertIn(key, data)
+        board = chess.Board(data["fen"])
+        self.assertTrue(board.is_valid())
+        self.assertTrue(board.turn)  # ход белых — позиция ДО хода игрока
+        self.assertIsInstance(data["san_played"], str)
+        self.assertTrue(data["san_played"])
+        self.assertTrue(data["best_san"])
+        self.assertIn(data["classification"], ("blunder", "mistake"))
+        self.assertIsInstance(data["drop"], (int, float))
+        self.assertIsInstance(data["moves_before"], list)
+        self.assertLessEqual(len(data["moves_before"]), 6)
+        self.assertEqual(
+            set(data["solution"]), {"san_played", "best_san", "drop"}
+        )
+        self.assertEqual(data["solution"]["best_san"], data["best_san"])
+        self.assertFalse(data["explained"])
+        self.assertIsNone(data["explanation"])
+        # позиция действительно ДО сыгранного хода
+        board.parse_san(data["san_played"])
+
+    def test_today_choice_stored_in_meta(self):
+        self._seed_tasks()
+        data = self.client.get("/api/task/today").json()
+        with Database(self.db_path) as db:
+            db.init_db()
+            stored = db.get_meta(f"daily_task_{data['date']}_tester")
+        self.assertEqual(stored, data["task_key"])
+
+    # --- answer ---
+
+    def test_answer_wrong_move(self):
+        self._seed_tasks()
+        payload = self.client.get("/api/task/today").json()
+        wrong = self._wrong_answer(payload)
+        resp = self.client.post("/api/task/answer", data={"answer": wrong})
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertFalse(data["correct"])
+        self.assertEqual(data["expected"], payload["best_san"])
+        self.assertEqual(data["drop"], payload["drop"])
+        self.assertEqual(data["win_before"], payload["win_before"])
+        self.assertEqual(data["win_after"], payload["win_after"])
+        self.assertEqual(data["san_played"], payload["san_played"])
+        # решение записано: повторный запрос + ключ в meta
+        again = self.client.get("/api/task/today").json()
+        self.assertTrue(again["done"])
+        with Database(self.db_path) as db:
+            db.init_db()
+            self.assertEqual(
+                db.get_meta(_task_done_key(payload["date"], "tester")), "1"
+            )
+
+    def test_answer_correct_move(self):
+        self._seed_tasks()
+        payload = self.client.get("/api/task/today").json()
+        resp = self.client.post(
+            "/api/task/answer", data={"answer": payload["best_san"]}
+        )
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertTrue(data["correct"])
+        self.assertEqual(data["expected"], payload["best_san"])
+
+    def test_answer_garbage_400(self):
+        self._seed_tasks()
+        self.client.get("/api/task/today")
+        resp = self.client.post("/api/task/answer", data={"answer": "Qz9"})
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("нет такого хода", resp.json()["detail"])
+
+    # --- explain ---
+
+    def test_explain_then_cached(self):
+        self._seed_tasks()
+        with patch.dict(os.environ, {"LLM_API_KEY": "test-key"}), \
+                patch("app.api._task_explain_llm",
+                      return_value="Не увидел связку на c4.") as llm:
+            resp = self.client.post("/api/task/explain")
+            self.assertEqual(resp.status_code, 200)
+            data = resp.json()
+            self.assertFalse(data["cached"])
+            job = self._wait_job(data["job_id"])
+            llm.assert_called_once()
+
+        self.assertEqual(job["status"], "done", job.get("error"))
+        self.assertEqual(job["result"]["explanation"], "Не увидел связку на c4.")
+        payload = self.client.get("/api/task/today").json()
+        self.assertTrue(payload["explained"])
+        self.assertEqual(payload["explanation"], "Не увидел связку на c4.")
+
+        with patch("app.api._task_explain_llm") as llm2:
+            resp = self.client.post("/api/task/explain")
+            self.assertEqual(resp.status_code, 200)
+            data = resp.json()
+            self.assertTrue(data["cached"])
+            self.assertEqual(data["explanation"], "Не увидел связку на c4.")
+            llm2.assert_not_called()
+
+    def test_explain_no_llm_key_job_error(self):
+        self._seed_tasks()
+        with patch.dict(os.environ, {"LLM_API_KEY": ""}):
+            resp = self.client.post("/api/task/explain")
+            self.assertEqual(resp.status_code, 200)
+            job = self._wait_job(resp.json()["job_id"])
+        self.assertEqual(job["status"], "error")
+        self.assertIn("LLM_API_KEY", job["error"])
+
+    # --- пустой пул / нет пользователя ---
+
+    def test_today_no_errors_404(self):
+        self._seed_user("tester", "t")  # анализ без ошибок
+        self._set_current("tester")
+        resp = self.client.get("/api/task/today")
+        self.assertEqual(resp.status_code, 404)
+        self.assertIn("запусти анализ", resp.json()["detail"])
+
+    def test_task_endpoints_no_user_404(self):
+        self._seed_tasks()
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.clear_current_user()
+        self.assertEqual(self.client.get("/api/task/today").status_code, 404)
+        self.assertEqual(
+            self.client.post("/api/task/answer", data={"answer": "e4"}).status_code,
+            404,
+        )
+        self.assertEqual(self.client.post("/api/task/explain").status_code, 404)
 
 
 class FrontendTests(ApiTestBase):

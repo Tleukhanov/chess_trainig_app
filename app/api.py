@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -38,7 +39,7 @@ from .fide import (
 )
 from .games import fetch_user_games
 from .humanize import humanize_report
-from .llm import LLMClient, _is_local_host
+from .llm import ChatMessage, LLMClient, _is_local_host
 from .maia import MaiaLitePolicy
 from .mentor import build_mentor_request, format_mentor_reply, run_mentor
 from .metrics import metric
@@ -475,6 +476,34 @@ def _run_mentor_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None
     finally:
         job.finished = time.time()
 
+
+def _run_task_explain_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None:
+    """Фоновый поток: LLM-объяснение «Задачи дня» → таблица task_explanations."""
+    try:
+        _ensure_llm_key()
+        payload = params["payload"]
+        job.phase = "Объяснение задачи"
+        text = _task_explain_llm(payload)
+        if not text:
+            raise RuntimeError("LLM вернул пустое объяснение")
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            db.save_task_explanation(
+                payload["task_key"],
+                job.user,
+                payload["game_id"],
+                payload["ply"],
+                text,
+            )
+        job.result = {"explanation": text}
+        job.summary = "Объяснение задачи готово"
+        job.status = "done"
+    except Exception as exc:
+        job.status = "error"
+        job.error = str(exc)
+    finally:
+        job.finished = time.time()
+
 # --- helpers ---------------------------------------------------------------
 
 def _current_user(db_path: Path) -> dict | None:
@@ -506,6 +535,177 @@ def _humanity_payload(raw: dict) -> dict:
         "avg_beta": raw.get("avg_beta"),
         "items": [item for item in (raw.get("items") or []) if isinstance(item, dict)],
     }
+
+# --- Задача дня -------------------------------------------------------------
+
+_TASK_ERROR_CLASSES = ("blunder", "mistake")
+
+_TASK_EXPLAIN_SYSTEM = """Ты — шахматный тренер сильного любителя. Говори по-русски, коротко и конкретно.
+Опирайся ТОЛЬКО на переданные факты: сыгранный ход, лучший ход движка, оценки win%,
+классификацию и контекст ходов. НЕ выдумывай варианты, угрозы и оценки, которых нет в данных."""
+
+
+def _today() -> str:
+    """Сегодняшняя локальная дата сервера в формате YYYY-MM-DD."""
+    return time.strftime("%Y-%m-%d")
+
+
+def _task_choice_key(date: str, user: str) -> str:
+    """Ключ meta с зафиксированным выбором задачи на дату (на пользователя)."""
+    return f"daily_task_{date}_{user}"
+
+
+def _task_done_key(date: str, user: str) -> str:
+    """Ключ meta: задача за дату решена (ответ дан)."""
+    return f"daily_done_{date}_{user}"
+
+
+def _task_pool(db: Database, user: str) -> list[dict[str, Any]]:
+    """Пул кандидатов в задачу дня: ошибки (blunder/mistake) самого пользователя.
+
+    FEN позиции ДО хода считается на месте при проходе партии; попутно
+    проверяется parity — если сторона, чей ход, не совпала с цветом игрока,
+    запись пропускается. Сортировка стабильная: (created_at, game_id, ply).
+    """
+    pool: list[dict[str, Any]] = []
+    for game, analysis in db.get_analyzed_games(user, limit=500):
+        user_is_white = game.user_color == "white"
+        entries = analysis.get("moves") or []
+        board = chess.Board()
+        for ply, san in enumerate(game.moves):
+            entry = entries[ply] if ply < len(entries) else None
+            is_user_move = (ply % 2 == 0) == user_is_white
+            user_side = chess.WHITE if user_is_white else chess.BLACK
+            if (
+                is_user_move
+                and board.turn == user_side
+                and isinstance(entry, dict)
+                and entry.get("classification") in _TASK_ERROR_CLASSES
+                and isinstance(entry.get("drop"), (int, float))
+                and entry.get("best_move_san")
+            ):
+                pool.append(
+                    {
+                        "game": game,
+                        "ply": ply,
+                        "fen": board.fen(),
+                        "move": entry,
+                        "created_at": game.created_at,
+                        "task_key": f"{game.id}|{ply}",
+                    }
+                )
+            try:
+                board.push_san(san)
+            except ValueError:
+                break
+    pool.sort(key=lambda item: (item["created_at"], item["game"].id, item["ply"]))
+    return pool
+
+
+def _pick_daily_task(db: Database, user: str, date: str) -> dict[str, Any]:
+    """Одна детерминированная задача на день: выбор фиксируется в meta.
+
+    Первый запрос за день выбирает задачу (sha256(дата+user) % len(pool))
+    и записывает её; повторные читают записанную. Если записанная задача
+    больше не найдена в пуле (удалили партию) — выбирается новая.
+    """
+    pool = _task_pool(db, user)
+    if not pool:
+        raise RuntimeError(
+            f"Для {user} нет проанализированных ошибок — сначала запусти анализ "
+            "(страница «Анализ»), тогда появится задача дня."
+        )
+    key = _task_choice_key(date, user)
+    stored = db.get_meta(key)
+    if stored:
+        for item in pool:
+            if item["task_key"] == stored:
+                return item
+    digest = int(hashlib.sha256(f"{date}{user}".encode("utf-8")).hexdigest(), 16)
+    chosen = pool[digest % len(pool)]
+    db.set_meta(key, chosen["task_key"])
+    return chosen
+
+
+def _task_payload(db: Database, user: str, date: str | None = None) -> dict[str, Any]:
+    """JSON для /api/task/today: позиция до хода, решение и объяснение."""
+    day = date or _today()
+    item = _pick_daily_task(db, user, day)
+    game = item["game"]
+    move = item["move"]
+    ply = item["ply"]
+    best = str(move.get("best_move_san"))
+    explanation = db.get_task_explanation(item["task_key"])
+    return {
+        "date": day,
+        "task_key": item["task_key"],
+        "game_id": game.id,
+        "ply": ply,
+        "fen": item["fen"],
+        "san_played": str(move.get("san") or game.moves[ply]),
+        "best_san": best,
+        "best_line": [str(s) for s in (move.get("best_line") or [])],
+        "classification": move.get("classification"),
+        "drop": move.get("drop"),
+        "win_before": move.get("win_before"),
+        "win_after": move.get("win_after"),
+        "opening": game.opening,
+        "eco": game.eco,
+        "result_for_user": game.result_for_user,
+        "opponent": game.opponent,
+        "user_color": game.user_color,
+        "moves_before": game.moves[max(0, ply - 6) : ply],
+        "solution": {
+            "san_played": str(move.get("san") or game.moves[ply]),
+            "best_san": best,
+            "drop": move.get("drop"),
+        },
+        "explanation": explanation,
+        "explained": explanation is not None,
+        "done": db.get_meta(_task_done_key(day, user)) == "1",
+    }
+
+
+def _fmt_win(value: Any) -> str:
+    """Оформление win% для промпта (один знак, '—' для None)."""
+    if not isinstance(value, (int, float)):
+        return "—"
+    return f"{value:.1f}"
+
+
+def _task_explain_messages(payload: dict[str, Any]) -> list[ChatMessage]:
+    """Промпт LLM-объяснения задачи (по-русски, только факты из данных)."""
+    color = "белые" if payload["user_color"] == "white" else "чёрные"
+    context = " ".join(payload["moves_before"]) or "—"
+    line = payload.get("best_line") or []
+    lines = [
+        f"Позиция (FEN): {payload['fen']}",
+        f"Партия: ты играл за {color}; дебют: {payload['opening'] or '—'} "
+        f"({payload['eco'] or '—'}); соперник: {payload['opponent'] or '—'}; "
+        f"результат: {payload['result_for_user']}.",
+        f"Контекст — ходы до позиции: {context}",
+        f"Твой ход: {payload['san_played']} — классификация {payload['classification']}, "
+        f"win% {_fmt_win(payload['win_before'])} → {_fmt_win(payload['win_after'])}, "
+        f"потеря {_fmt_win(payload['drop'])}.",
+        f"Лучший ход движка: {payload['best_san']}"
+        + (f"; его продолжение: {' '.join(line)}" if line else "")
+        + ".",
+        "Объясни по-русски в 3-5 предложений: в чём ошибка моего хода, какую идею "
+        "или угрозу я не увидел и о чём думать в похожих позициях. Только факты из данных выше.",
+    ]
+    return [
+        ChatMessage("system", _TASK_EXPLAIN_SYSTEM),
+        ChatMessage("user", "\n".join(lines)),
+    ]
+
+
+def _task_explain_llm(payload: dict[str, Any]) -> str:
+    """Один вызов LLM для объяснения задачи; возвращает текст без обёртки."""
+    llm = LLMClient()
+    text = llm.chat(
+        _task_explain_messages(payload), temperature=0.4, max_tokens=700
+    )
+    return text.strip()
 
 # --- API factory -----------------------------------------------------------
 
@@ -1058,6 +1258,69 @@ def create_api(
             target=_run_mentor_job, args=(app, job, params), daemon=True
         ).start()
         return {"job_id": job.id, "status": "started"}
+
+    # --- Задача дня ---
+    @app.get("/api/task/today")
+    def api_task_today(request: Request):
+        user = _current_user(app.state.db_path)
+        if not user:
+            raise HTTPException(404, "No current user")
+        return _call_data(
+            lambda db: _task_payload(db, user["nick"]), app.state.db_path
+        )
+
+    @app.post("/api/task/answer")
+    def api_task_answer(request: Request, answer: str = Form(...)):
+        user = _current_user(app.state.db_path)
+        if not user:
+            raise HTTPException(404, "No current user")
+
+        def _check(db: Database) -> dict[str, Any]:
+            payload = _task_payload(db, user["nick"])
+            board = chess.Board(payload["fen"])
+            try:
+                given = board.parse_san(answer.strip())
+            except ValueError as exc:
+                raise HTTPException(400, "нет такого хода") from exc
+            try:
+                best = board.parse_san(payload["best_san"])
+            except ValueError:
+                best = None
+            correct = best is not None and given == best
+            db.set_meta(_task_done_key(payload["date"], user["nick"]), "1")
+            return {
+                "correct": correct,
+                "expected": payload["best_san"],
+                "drop": payload["drop"],
+                "win_before": payload["win_before"],
+                "win_after": payload["win_after"],
+                "san_played": payload["san_played"],
+            }
+
+        return _call_data(_check, app.state.db_path)
+
+    @app.post("/api/task/explain")
+    def api_task_explain(request: Request):
+        user = _current_user(app.state.db_path)
+        if not user:
+            raise HTTPException(404, "No current user")
+        payload = _call_data(
+            lambda db: _task_payload(db, user["nick"]), app.state.db_path
+        )
+        if payload.get("explanation"):
+            return {"cached": True, "explanation": payload["explanation"]}
+        job = CoachJob(
+            id=uuid.uuid4().hex,
+            user=user["nick"],
+            phase="Объяснение задачи",
+        )
+        _register_job(job)
+        threading.Thread(
+            target=_run_task_explain_job,
+            args=(app, job, {"payload": payload}),
+            daemon=True,
+        ).start()
+        return {"cached": False, "job_id": job.id, "status": "started"}
 
     # Frontend static files — mounted LAST so /api/* routes take precedence.
     frontend_dir = Path(__file__).resolve().parent.parent / "frontend"

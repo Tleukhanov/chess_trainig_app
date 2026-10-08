@@ -10,6 +10,15 @@ const state = {
   gamePly: 0,
   keyHandler: null,
   tool: 'repertoire',
+  task: null,
+  taskKey: null,
+  taskResult: null,
+  taskAnswerText: '',
+  taskRevealed: false,
+  taskExplanation: null,
+  taskExplaining: false,
+  taskJobId: null,
+  taskError: null,
 };
 
 // --- API helpers ---
@@ -61,7 +70,7 @@ function setupTheme() {
 
 // --- Navigation ---
 
-const views = ['dashboard', 'overview', 'plan', 'progress', 'games', 'drills', 'coach', 'tools', 'users'];
+const views = ['dashboard', 'overview', 'plan', 'progress', 'games', 'drills', 'task', 'coach', 'tools', 'users'];
 
 function navigate(view) {
   if (!views.includes(view)) view = 'dashboard';
@@ -125,6 +134,7 @@ async function render(view) {
       case 'progress': await viewProgress(app); break;
       case 'games': await viewGames(app); break;
       case 'drills': await viewDrills(app); break;
+      case 'task': await viewTask(app); break;
       case 'coach': await viewCoach(app); break;
       case 'tools': await viewTools(app); break;
       case 'users': await viewUsers(app); break;
@@ -148,9 +158,10 @@ async function viewDashboard(app) {
     return;
   }
 
-  const [plan, progress] = await Promise.all([
+  const [plan, progress, task] = await Promise.all([
     api('/api/plan'),
     api('/api/progress?windows=5'),
+    api('/api/task/today').catch(() => null),
   ]);
 
   const scorePct = plan.score_pct != null ? plan.score_pct.toFixed(1) + '%' : '—';
@@ -230,8 +241,25 @@ async function viewDashboard(app) {
     motifsHtml = '<p style="color:var(--c-text-muted)">Нет данных.</p>';
   }
 
+  let taskCardHtml = '';
+  if (task) {
+    const taskBadge = task.done
+      ? '<span class="badge badge-good">решено сегодня ✓</span>'
+      : '<span class="badge badge-neutral">не решено</span>';
+    const taskCls = task.done && task.classification
+      ? `<span class="badge ${task.classification === 'blunder' ? 'badge-bad' : 'badge-neutral'}">${esc(task.classification)}</span>`
+      : '';
+    taskCardHtml = `
+      <div class="card">
+        <div class="card-header"><span class="card-title">Задача дня</span>${taskBadge}</div>
+        <div style="color:var(--c-text-muted);font-size:13px;margin-bottom:10px">${esc(task.date)} · ${esc(task.opening || '—')}${task.eco ? ` (${esc(task.eco)})` : ''} ${taskCls}</div>
+        <a href="#" class="btn btn-primary" data-view="task">Открыть</a>
+      </div>`;
+  }
+
   app.innerHTML = `
     <div class="card-header"><h1>Дашборд</h1><span class="badge badge-blue">${esc(state.user.nick)}</span></div>
+    ${taskCardHtml}
     <div class="grid grid-4">
       <div class="card stat"><div class="stat-value">${plan.games}</div><div class="stat-label">Партий</div></div>
       <div class="card stat"><div class="stat-value">${scorePct}</div><div class="stat-label">Счёт</div></div>
@@ -756,6 +784,238 @@ async function viewDrillsWithParams(app, params) {
     if (fd.get('verdict')) p.set('verdict', fd.get('verdict'));
     viewDrillsWithParams(app, p);
   });
+}
+
+// --- Задача дня ---
+
+async function viewTask(app) {
+  if (!state.user) {
+    app.innerHTML = '<div class="onboarding card"><div class="empty-icon">♟</div><h1>Задача дня</h1><p>Профиль не выбран — выбери его на странице Профили.</p><a href="#" class="btn btn-primary" data-view="users">Профили</a></div>';
+    bindLinks(app);
+    return;
+  }
+
+  let task;
+  try {
+    task = await api('/api/task/today');
+  } catch (err) {
+    app.innerHTML = `
+      <div class="card-header"><h1>Задача дня</h1></div>
+      <div class="onboarding card"><div class="empty-icon">♟</div><h1>Задач нет</h1><p>${esc(err.message)}</p><a href="#" class="btn btn-primary" data-view="coach">Запустить анализ</a></div>`;
+    bindLinks(app);
+    return;
+  }
+
+  if (state.taskKey !== task.task_key) {
+    state.taskKey = task.task_key;
+    state.taskResult = null;
+    state.taskAnswerText = '';
+    state.taskError = null;
+    state.taskExplanation = task.explanation || null;
+    state.taskExplaining = false;
+    state.taskJobId = null;
+    state.taskRevealed = !!task.done;
+  } else if (!state.taskExplanation && task.explanation) {
+    state.taskExplanation = task.explanation;
+  }
+  state.task = task;
+  drawTask(app);
+  // вернулись на страницу, пока шло объяснение — возобновляем поллинг джобы
+  if (state.taskExplaining && !state.jobPollTimer && state.taskJobId) {
+    taskPollExplanation(app, state.taskJobId);
+  }
+}
+
+function taskExplainControlsHtml() {
+  if (state.taskExplanation) return '';
+  if (state.taskExplaining) {
+    return '<p style="color:var(--c-text-muted);font-size:13px;margin:0">Объясняю…</p>';
+  }
+  return '<button type="button" class="btn btn-secondary" id="task-explain">Объяснить</button>';
+}
+
+function taskSolutionHtml(task) {
+  const drop = typeof task.drop === 'number' ? task.drop : null;
+  const dropBadge = drop != null
+    ? `<span class="badge ${drop >= 20 ? 'badge-bad' : 'badge-neutral'}">потеря ${drop >= 0 ? '−' : '+'}${Math.abs(drop).toFixed(1)}%</span>`
+    : '';
+  const before = task.win_before != null ? Number(task.win_before).toFixed(1) : '—';
+  const after = task.win_after != null ? Number(task.win_after).toFixed(1) : '—';
+  return `
+    <div class="card">
+      <div class="card-header"><span class="card-title">Решение</span>${dropBadge}</div>
+      <div>Твой ход: <span class="drill-san" style="color:var(--c-err-blunder)">${esc(task.san_played)}</span></div>
+      <div>Лучший: <span class="drill-best">${esc(task.best_san)}</span></div>
+      <div style="color:var(--c-text-muted);font-size:13px;margin-top:6px">Win%: ${before} → ${after}</div>
+    </div>`;
+}
+
+function drawTask(app) {
+  const task = state.task;
+  if (!task) {
+    app.innerHTML = '<div class="card"><p>Загрузка...</p></div>';
+    return;
+  }
+
+  const answered = !!state.taskResult || !!task.done;
+  const colorLabel = task.user_color === 'white' ? 'белые' : 'чёрные';
+  const clsBadge = answered && task.classification
+    ? `<span class="badge ${task.classification === 'blunder' ? 'badge-bad' : 'badge-neutral'}">${esc(task.classification)}</span>`
+    : '';
+
+  let panel = '';
+  if (state.taskResult) {
+    const ok = state.taskResult.correct;
+    panel = `
+      <div class="card">
+        <div class="card-header"><span class="card-title">Ответ</span>
+          <span class="badge ${ok ? 'badge-good' : 'badge-bad'}">${ok ? 'верно ✓' : 'неверно'}</span></div>
+        ${taskExplainControlsHtml()}
+      </div>`;
+  } else if (task.done) {
+    panel = `
+      <div class="card">
+        <div class="card-header"><span class="card-title">Ответ</span>
+          <span class="badge badge-good">решено сегодня ✓</span></div>
+        ${taskExplainControlsHtml()}
+      </div>`;
+  } else {
+    panel = `
+      <div class="card">
+        <div class="card-header"><span class="card-title">Твой ход</span></div>
+        <form id="task-answer-form" class="form-row" style="gap:8px;align-items:flex-end">
+          <div class="form-group" style="flex:1;min-width:160px;margin-bottom:0">
+            <label for="task-answer">Ход (SAN)</label>
+            <input type="text" id="task-answer" name="answer" placeholder="например, Nf3"
+                   value="${esc(state.taskAnswerText)}" autocomplete="off" spellcheck="false" required>
+          </div>
+          <button class="btn btn-primary" style="height:38px">Ответить</button>
+        </form>
+        <div style="margin-top:8px"><a href="#" id="task-show-solution" class="btn btn-link">Показать решение</a></div>
+      </div>`;
+  }
+
+  const explanationHtml = state.taskExplanation
+    ? `<div class="card"><div class="card-header"><span class="card-title">Почему так</span></div><div class="mentor-reply">${esc(state.taskExplanation)}</div></div>`
+    : '';
+
+  app.innerHTML = `
+    <div class="card-header"><h1>Задача дня</h1><span class="badge badge-blue">${esc(state.user.nick)}</span></div>
+    <div class="grid game-layout">
+      <div class="card">
+        ${boardHtml(task.fen)}
+        <div class="board-meta">
+          <span class="badge badge-blue">${esc(task.date)}</span>
+          <span class="badge badge-neutral">${esc(task.opening || '—')}${task.eco ? ` ${esc(task.eco)}` : ''}</span>
+          <span class="badge badge-neutral">ты: ${colorLabel}</span>
+          ${clsBadge}
+        </div>
+      </div>
+      <div class="game-side">
+        ${state.taskError ? `<div class="alert alert-error">${esc(state.taskError)}</div>` : ''}
+        ${panel}
+        ${state.taskRevealed ? taskSolutionHtml(task) : ''}
+        ${explanationHtml}
+      </div>
+    </div>`;
+
+  bindLinks(app);
+  const form = document.getElementById('task-answer-form');
+  if (form) {
+    form.addEventListener('submit', onTaskAnswer);
+    const input = document.getElementById('task-answer');
+    input.addEventListener('input', () => { state.taskAnswerText = input.value; });
+    input.focus();
+  }
+  const showSolution = document.getElementById('task-show-solution');
+  if (showSolution) {
+    showSolution.addEventListener('click', e => {
+      e.preventDefault();
+      state.taskRevealed = true;
+      drawTask(app);
+    });
+  }
+  const explainBtn = document.getElementById('task-explain');
+  if (explainBtn) explainBtn.addEventListener('click', () => taskExplain(app));
+}
+
+async function onTaskAnswer(e) {
+  e.preventDefault();
+  const app = document.getElementById('app');
+  const input = document.getElementById('task-answer');
+  const answer = (input ? input.value : state.taskAnswerText).trim();
+  if (!answer) return;
+  state.taskAnswerText = answer;
+  state.taskError = null;
+  try {
+    const fd = new FormData();
+    fd.set('answer', answer);
+    const res = await apiPost('/api/task/answer', fd);
+    state.taskResult = res;
+    state.taskRevealed = true;
+    state.task.done = true;
+  } catch (err) {
+    state.taskError = err.message;
+  }
+  drawTask(app);
+}
+
+async function taskExplain(app) {
+  state.taskExplaining = true;
+  state.taskError = null;
+  drawTask(app);
+  let res;
+  try {
+    res = await apiPost('/api/task/explain', new FormData());
+  } catch (err) {
+    state.taskExplaining = false;
+    state.taskJobId = null;
+    state.taskError = err.message;
+    drawTask(app);
+    return;
+  }
+  if (res.cached) {
+    state.taskExplaining = false;
+    state.taskJobId = null;
+    state.taskExplanation = res.explanation;
+    drawTask(app);
+    return;
+  }
+  state.taskJobId = res.job_id;
+  taskPollExplanation(app, res.job_id);
+}
+
+function taskPollExplanation(app, jobId) {
+  if (state.jobPollTimer) clearInterval(state.jobPollTimer);
+  state.jobPollTimer = setInterval(async () => {
+    let job;
+    try {
+      job = await api('/api/jobs/' + jobId);
+    } catch {
+      clearInterval(state.jobPollTimer);
+      state.jobPollTimer = null;
+      state.taskExplaining = false;
+      state.taskJobId = null;
+      state.taskError = 'Не удалось получить объяснение';
+      drawTask(app);
+      return;
+    }
+    if (job.status === 'done') {
+      clearInterval(state.jobPollTimer);
+      state.jobPollTimer = null;
+      state.taskExplaining = false;
+      state.taskJobId = null;
+      state.taskExplanation = (job.result && job.result.explanation) || '';
+      drawTask(app);
+    } else if (job.status === 'error') {
+      clearInterval(state.jobPollTimer);
+      state.jobPollTimer = null;
+      state.taskExplaining = false;
+      state.taskJobId = null;
+      state.taskError = job.error || 'Не удалось получить объяснение';
+      drawTask(app);
+    }
+  }, 700);
 }
 
 async function viewCoach(app) {

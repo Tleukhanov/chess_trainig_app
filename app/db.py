@@ -79,6 +79,19 @@ CREATE TABLE IF NOT EXISTS {table}(
 )
 """
 
+# Объяснения «Задачи дня»: одна строка на задачу (game_id|ply), хранятся
+# навсегда и переиспользуются без повторного обращения к LLM.
+_TASK_EXPLANATIONS_DDL = """
+CREATE TABLE IF NOT EXISTS {table}(
+    task_key TEXT PRIMARY KEY,
+    user TEXT,
+    game_id TEXT,
+    ply INTEGER,
+    explanation TEXT,
+    created_at INTEGER
+)
+"""
+
 _GAME_COLUMNS = (
     "id, user, rated, speed, created_at, status, winner, white, black, "
     "opening, eco, user_color, opponent, user_rating, user_rating_diff, "
@@ -94,7 +107,9 @@ _SCHEMA = f"""
 {_ANALYSES_DDL.format(table="analyses")};
 {_USERS_DDL.format(table="users")};
 {_META_DDL.format(table="meta")};
+{_TASK_EXPLANATIONS_DDL.format(table="task_explanations")};
 CREATE INDEX IF NOT EXISTS idx_games_user ON games(user);
+CREATE INDEX IF NOT EXISTS idx_task_explanations_user ON task_explanations(user);
 """
 
 
@@ -512,6 +527,59 @@ class Database:
                 "INSERT INTO meta(key, value) VALUES (?, '') "
                 "ON CONFLICT(key) DO UPDATE SET value = ''",
                 (_CURRENT_USER_KEY,),
+            )
+
+    # --- meta (произвольные пары ключ/значение) ---
+
+    def get_meta(self, key: str) -> str | None:
+        """Значение из meta по ключу или None (ключ не задан)."""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key = ?", (key,)
+            ).fetchone()
+        return row["value"] if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        """Записывает (UPSERT) значение в meta."""
+        with self._connection() as conn:
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+
+    # --- объяснения «Задачи дня» ---
+
+    def get_task_explanation(self, task_key: str) -> str | None:
+        """Сохранённое LLM-объяснение задачи (game_id|ply) или None."""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT explanation FROM task_explanations WHERE task_key = ?",
+                (task_key,),
+            ).fetchone()
+        return row["explanation"] if row else None
+
+    def save_task_explanation(
+        self,
+        task_key: str,
+        user: str,
+        game_id: str,
+        ply: int,
+        explanation: str,
+    ) -> None:
+        """Сохраняет (UPSERT) объяснение задачи навсегда."""
+        with self._connection() as conn:
+            conn.execute(
+                "INSERT INTO task_explanations"
+                "(task_key, user, game_id, ply, explanation, created_at) "
+                "VALUES (?,?,?,?,?,?) "
+                "ON CONFLICT(task_key) DO UPDATE SET "
+                "user = excluded.user, "
+                "game_id = excluded.game_id, "
+                "ply = excluded.ply, "
+                "explanation = excluded.explanation, "
+                "created_at = excluded.created_at",
+                (task_key, user, game_id, ply, explanation, int(time.time())),
             )
 
     def set_user_fide(self, nick: str, fide_id: str | None) -> None:
