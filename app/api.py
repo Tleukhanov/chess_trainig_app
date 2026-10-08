@@ -558,6 +558,29 @@ def create_api(
             db.touch_user(clean)
         return {"ok": True, "nick": clean}
 
+    @app.post("/api/user/delete")
+    def api_user_delete(nick: str = Form(...)):
+        """Удаляет профиль и его партии/анализ из БД (файлы data/<ник>/ остаются)."""
+        clean = nick.strip()
+        if not clean:
+            raise HTTPException(400, "Ник не может быть пустым")
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            db.delete_user(clean)
+        return {"ok": True, "nick": clean}
+
+    @app.post("/api/user/fide")
+    def api_user_fide(nick: str = Form(...), fide_id: str = Form("")):
+        """Задаёт (или пустым значением очищает) FIDE ID профиля."""
+        clean = nick.strip()
+        if not clean:
+            raise HTTPException(400, "Ник не может быть пустым")
+        value = fide_id.strip()
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            db.set_user_fide(clean, value or None)
+        return {"ok": True, "nick": clean, "fide_id": value or None}
+
     # --- Data endpoints ---
     @app.get("/api/overview")
     def api_overview(request: Request):

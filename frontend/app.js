@@ -32,6 +32,33 @@ async function apiPost(path, formData) {
   return resp.json();
 }
 
+// --- Тема (светлая/тёмная) ---
+
+function readStoredTheme() {
+  try { return localStorage.getItem('theme'); } catch { return null; }
+}
+
+function applyTheme(theme) {
+  document.documentElement.dataset.theme = theme;
+  const btn = document.querySelector('[data-theme-toggle]');
+  if (btn) {
+    const dark = theme === 'dark';
+    btn.textContent = dark ? '☀' : '☾';
+    btn.title = dark ? 'Светлая тема' : 'Тёмная тема';
+  }
+}
+
+function setupTheme() {
+  applyTheme(readStoredTheme() === 'dark' ? 'dark' : 'light');
+  const btn = document.querySelector('[data-theme-toggle]');
+  if (!btn) return;
+  btn.addEventListener('click', () => {
+    const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+    applyTheme(next);
+    try { localStorage.setItem('theme', next); } catch { /* приватный режим */ }
+  });
+}
+
 // --- Navigation ---
 
 const views = ['dashboard', 'overview', 'plan', 'progress', 'games', 'drills', 'coach', 'tools', 'users'];
@@ -569,9 +596,9 @@ function gameMetricsHtml(analysis) {
   const avgBefore = analysis.avg_win_before != null ? analysis.avg_win_before.toFixed(1) : '—';
   return `
     <div class="grid grid-3">
-      <div class="stat"><div class="stat-value" style="color:#c5221f">${blunders}</div><div class="stat-label">Зевки</div></div>
-      <div class="stat"><div class="stat-value" style="color:#d64f00">${mistakes}</div><div class="stat-label">Ошибки</div></div>
-      <div class="stat"><div class="stat-value" style="color:#b8860b">${inaccuracies}</div><div class="stat-label">Неточности</div></div>
+      <div class="stat"><div class="stat-value" style="color:var(--c-err-blunder)">${blunders}</div><div class="stat-label">Зевки</div></div>
+      <div class="stat"><div class="stat-value" style="color:var(--c-err-mistake)">${mistakes}</div><div class="stat-label">Ошибки</div></div>
+      <div class="stat"><div class="stat-value" style="color:var(--c-err-inaccuracy)">${inaccuracies}</div><div class="stat-label">Неточности</div></div>
       <div class="stat"><div class="stat-value">${missed}</div><div class="stat-label">Упущ. выигрыши</div></div>
       <div class="stat"><div class="stat-value">${avgLoss}</div><div class="stat-label">Ср. потеря win%</div></div>
       <div class="stat"><div class="stat-value">${avgBefore}</div><div class="stat-label">Win% до хода</div></div>
@@ -1296,6 +1323,7 @@ function renderMentor(d) {
 async function viewUsers(app) {
   const users = await api('/api/users');
   const list = users.users;
+  const currentNick = state.user ? state.user.nick : '';
 
   app.innerHTML = `
     <div class="card-header"><h1>Профили</h1></div>
@@ -1310,20 +1338,103 @@ async function viewUsers(app) {
     </div>
     <div class="card" style="margin-top:16px">
       <div class="card-header"><span class="card-title">Все профили (${list.length})</span></div>
-      ${list.length ? `<table class="table-wrap"><thead><tr><th>Ник</th><th>FIDE</th><th>Партий</th><th>Анализов</th><th>Последний вход</th><th>Действия</th></tr></thead><tbody>${list.map(u => `<tr><td${u.nick === (state.user ? state.user.nick : '') ? ' style="font-weight:600"' : ''}>${esc(u.nick)}${u.nick === (state.user ? state.user.nick : '') ? ' <span class="badge badge-blue">текущий</span>' : ''}</td><td>${esc(u.fide_id || '—')}</td><td class="num">${u.games}</td><td class="num">${u.analyses}</td><td>${u.last_seen_at ? new Date(u.last_seen_at * 1000).toLocaleDateString('ru-RU') : '—'}</td><td><form method="post" action="/api/user/switch" style="display:inline"><input type="hidden" name="nick" value="${esc(u.nick)}"><button class="btn ${u.nick === (state.user ? state.user.nick : '') ? 'btn-secondary' : 'btn-primary'}" style="font-size:12px;padding:4px 10px" ${u.nick === (state.user ? state.user.nick : '') ? 'disabled' : ''}>${u.nick === (state.user ? state.user.nick : '') ? 'Закреплён' : 'Закрепить'}</button></form></td></tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted);padding:16px">Профилей нет. Добавь первый выше.</p>'}
+      ${list.length ? `<table class="table-wrap"><thead><tr><th>Ник</th><th>FIDE</th><th>Партий</th><th>Анализов</th><th>Последний вход</th><th>Действия</th></tr></thead><tbody>${list.map(u => {
+        const isCurrent = u.nick === currentNick;
+        return `<tr>
+          <td${isCurrent ? ' style="font-weight:600"' : ''}>${esc(u.nick)}${isCurrent ? ' <span class="badge badge-blue">текущий</span>' : ''}</td>
+          <td class="fide-cell" data-nick="${esc(u.nick)}"><span class="fide-value">${esc(u.fide_id || '—')}</span><a href="#" class="fide-edit">изменить</a></td>
+          <td class="num">${u.games}</td>
+          <td class="num">${u.analyses}</td>
+          <td>${u.last_seen_at ? new Date(u.last_seen_at * 1000).toLocaleDateString('ru-RU') : '—'}</td>
+          <td class="row-actions">
+            <form method="post" action="/api/user/switch"><input type="hidden" name="nick" value="${esc(u.nick)}"><button class="btn ${isCurrent ? 'btn-secondary' : 'btn-primary'}" style="font-size:12px;padding:4px 10px" ${isCurrent ? 'disabled' : ''}>${isCurrent ? 'Закреплён' : 'Закрепить'}</button></form>
+            <button type="button" class="btn btn-link user-delete" data-nick="${esc(u.nick)}">удалить</button>
+          </td>
+        </tr>`;
+      }).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted);padding:16px">Профилей нет. Добавь первый выше.</p>'}
     </div>`;
+
+  const rerender = async () => {
+    await loadUser();
+    navigate('users');
+  };
 
   document.getElementById('add-user-form').addEventListener('submit', async e => {
     e.preventDefault();
     const fd = new FormData(e.target);
     try {
       await apiPost('/api/user/add', fd);
-      await loadUser();
-      navigate('users');
+      await rerender();
     } catch (err) {
       alert(err.message);
     }
   });
+
+  app.querySelectorAll('form[action="/api/user/switch"]').forEach(form => {
+    form.addEventListener('submit', async e => {
+      e.preventDefault();
+      try {
+        await apiPost('/api/user/switch', new FormData(form));
+        await rerender();
+      } catch (err) {
+        alert(err.message);
+      }
+    });
+  });
+
+  app.querySelectorAll('.fide-edit').forEach(link => {
+    link.addEventListener('click', e => {
+      e.preventDefault();
+      openFideEdit(link, rerender);
+    });
+  });
+
+  app.querySelectorAll('.user-delete').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const nick = btn.dataset.nick;
+      const ok = confirm(
+        `Удалить профиль ${nick}? Партии и анализы уйдут из БД, файлы в data/ не трогаются.`
+      );
+      if (!ok) return;
+      const fd = new FormData();
+      fd.set('nick', nick);
+      try {
+        await apiPost('/api/user/delete', fd);
+        await rerender();
+      } catch (err) {
+        alert(err.message);
+      }
+    });
+  });
+}
+
+function openFideEdit(link, rerender) {
+  const td = link.closest('.fide-cell');
+  if (!td) return;
+  const nick = td.dataset.nick;
+  const shown = td.querySelector('.fide-value');
+  const value = shown && shown.textContent !== '—' ? shown.textContent : '';
+  td.innerHTML = `<form class="fide-form">
+      <input type="text" name="fide_id" value="${esc(value)}" placeholder="4130005">
+      <button class="btn btn-primary" style="font-size:12px;padding:3px 8px" title="Сохранить">✓</button>
+      <button type="button" class="btn btn-secondary fide-cancel" style="font-size:12px;padding:3px 8px" title="Отмена">✕</button>
+    </form>`;
+  const form = td.querySelector('.fide-form');
+  const input = form.querySelector('input');
+  input.focus();
+  input.select();
+  form.addEventListener('submit', async e => {
+    e.preventDefault();
+    const fd = new FormData(form);
+    fd.set('nick', nick);
+    try {
+      await apiPost('/api/user/fide', fd);
+      await rerender();
+    } catch (err) {
+      alert(err.message);
+    }
+  });
+  form.querySelector('.fide-cancel').addEventListener('click', () => rerender());
 }
 
 // --- Utilities ---
@@ -1355,6 +1466,7 @@ async function loadUser() {
 }
 
 async function init() {
+  setupTheme();
   setupNav();
   await loadUser();
   navigate('dashboard');

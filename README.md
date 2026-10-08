@@ -222,11 +222,18 @@ JSON и подсказках для LLM:
 фронтенд — отдельная папка `frontend/` (vanilla JS/CSS, без сборки и фреймворков).
 Одинаковые данные с CLI: тот же кеш, та же БД, общий слой `app/data.py`.
 
-- `GET /api/user/current`, `/api/users`, `POST /api/user/add|switch` — профили;
-- `GET /api/overview|plan|progress|drills|report` — отчёты из кеша (без движка и сети);
-- `GET /api/drills.pgn`, `/api/drills.json` — выгрузка дрелей;
-- `POST /api/coach/run` + `GET /api/jobs/{id}` — анализ движком в фоне с прогрессом;
-- `GET /api/docs` — автодокументация OpenAPI.
+Страницы: Дашборд, Обзор, План, Прогресс, **Партии** (список + просмотр разбора:
+доска, ходы с подсветкой своих ошибок, метрики), Дрели, Анализ (фоновый разбор
+движком с прогрессом), **Инструменты** (репертуар, подготовка к сопернику,
+человечность, турнир, FIDE, LLM-разбор «Разбор» и LLM-тренер «Тренер»),
+Профили (добавить/переключить/удалить, FIDE ID). Светлая и тёмная тема
+(переключатель в шапке).
+
+API: профили (`/api/user/*`), отчёты (`/api/overview|plan|progress|drills|report`),
+партии (`/api/games`, `/api/games/{id}` — с FEN по ходам), выгрузки
+(`/api/drills.pgn|json`), инструменты (`/api/repertoire|humanize|tournament|...`),
+долгие операции — через `POST /api/*/run` → `GET /api/jobs/{id}` (анализ, соперник,
+LLM), документация — `GET /api/docs`.
 
 Запуск: `python -m trainer web` (порт 8000, откроется браузер), `--port 9000`,
 `--no-browser` — без автозапуска браузера.

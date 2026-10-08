@@ -515,11 +515,52 @@ class Database:
             )
 
     def set_user_fide(self, nick: str, fide_id: str | None) -> None:
-        """Записывает FIDE ID в профиль игрока."""
+        """Записывает FIDE ID в профиль игрока; None — очищает поле.
+
+        upsert_user намеренно не затирает существующий ID (COALESCE), поэтому
+        явная запись идёт отдельным UPDATE: он и профиль создаёт при необходимости,
+        и пустое значение реально обнуляет, а не «не меняет».
+        """
         clean = (nick or "").strip()
         if not clean:
             return
-        self.upsert_user(clean, fide_id=fide_id)
+        self.upsert_user(clean)
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE users SET fide_id = ? WHERE nick_lower = ?",
+                (fide_id or None, clean.lower()),
+            )
+
+    def delete_user(self, nick: str) -> bool:
+        """Удаляет профиль, его партии и анализ этих партий. True — профиль был.
+
+        Порядок: сначала analyses (ссылок на games не нарушаем), затем games,
+        затем users. ``analyses`` привязан только к ``game_id`` (без user) и общий
+        для всех: удаляются лишь записи, чьи партии принадлежат исключительно
+        этому игроку — общий кеш партий между двумя профилями остаётся.
+
+        Файлы на диске (data/<ник>/) не трогаются — только строки БД.
+        Если удалялся закреплённый игрок — он сбрасывается.
+        """
+        key = (nick or "").strip().lower()
+        if not key:
+            return False
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key = ?", (_CURRENT_USER_KEY,)
+            ).fetchone()
+            is_current = bool(row) and (str(row["value"] or "").strip().lower() == key)
+            conn.execute(
+                "DELETE FROM analyses WHERE game_id IN "
+                "(SELECT id FROM games WHERE user = ?) "
+                "AND game_id NOT IN (SELECT id FROM games WHERE user <> ?)",
+                (key, key),
+            )
+            conn.execute("DELETE FROM games WHERE user = ?", (key,))
+            cur = conn.execute("DELETE FROM users WHERE nick_lower = ?", (key,))
+        if is_current:
+            self.clear_current_user()
+        return cur.rowcount > 0
 
     def touch_user(self, nick: str) -> None:
         """Отмечает, что игрок работал с программой (last_seen_at)."""

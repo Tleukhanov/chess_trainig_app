@@ -1501,7 +1501,10 @@ def _cmd_user(args: argparse.Namespace) -> int:
                 print(f"Ошибка: невалидный ник {args.nick!r}.")
                 return 1
             db.set_current_user(nick)
-            db.set_user_fide(nick, args.fide)
+            # --fide не задан (None) — поле не трогаем: None у set_user_fide
+            # значит «очистить» (явное удаление FIDE ID).
+            if args.fide is not None:
+                db.set_user_fide(nick, str(args.fide).strip() or None)
             print(f"Закреплён {nick}.")
             return 0
         if action == "switch":

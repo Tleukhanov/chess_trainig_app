@@ -133,6 +133,70 @@ class UserApiTests(ApiTestBase):
         users = resp.json()["users"]
         self.assertEqual(len(users), 2)
 
+    def test_delete_user_leaves_other(self):
+        self.client.post("/api/user/add", data={"nick": "ada", "fide": ""})
+        self.client.post("/api/user/add", data={"nick": "bob", "fide": ""})
+        resp = self.client.post("/api/user/delete", data={"nick": "ada"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.json()["ok"])
+        users = self.client.get("/api/users").json()["users"]
+        self.assertEqual(len(users), 1)
+        self.assertEqual(users[0]["nick"], "bob")
+
+    def test_delete_last_user_allowed(self):
+        self.client.post("/api/user/add", data={"nick": "ada", "fide": ""})
+        resp = self.client.post("/api/user/delete", data={"nick": "ada"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self.client.get("/api/users").json()["users"], [])
+
+    def test_delete_current_user_clears_current(self):
+        self.client.post("/api/user/add", data={"nick": "ada", "fide": ""})
+        self.client.post("/api/user/add", data={"nick": "bob", "fide": ""})
+        # add закрепляет последнего добавленного — текущий bob
+        resp = self.client.get("/api/user/current")
+        self.assertEqual(resp.json()["user"]["nick"], "bob")
+        resp = self.client.post("/api/user/delete", data={"nick": "bob"})
+        self.assertEqual(resp.status_code, 200)
+        resp = self.client.get("/api/user/current")
+        self.assertEqual(resp.status_code, 404)
+
+    def test_delete_user_removes_games_and_analyses(self):
+        self._seed_user("tester", "t")
+        self._set_current("tester")
+        resp = self.client.post("/api/user/delete", data={"nick": "tester"})
+        self.assertEqual(resp.status_code, 200)
+        with Database(self.db_path) as db:
+            db.init_db()
+            self.assertEqual(db.get_games("tester"), [])
+            self.assertFalse(db.has_analysis("t1"))
+            self.assertIsNone(db.get_user("tester"))
+        self.assertEqual(self.client.get("/api/user/current").status_code, 404)
+
+    def test_delete_unknown_user_still_ok(self):
+        resp = self.client.post("/api/user/delete", data={"nick": "ghost"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.json()["ok"])
+
+    def test_fide_set_updates_profile(self):
+        self.client.post("/api/user/add", data={"nick": "ada", "fide": "42"})
+        resp = self.client.post(
+            "/api/user/fide", data={"nick": "ada", "fide_id": "4100000"}
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["fide_id"], "4100000")
+        users = self.client.get("/api/users").json()["users"]
+        self.assertEqual(users[0]["fide_id"], "4100000")
+
+    def test_fide_empty_clears_profile(self):
+        self.client.post("/api/user/add", data={"nick": "ada", "fide": "42"})
+        resp = self.client.post(
+            "/api/user/fide", data={"nick": "ada", "fide_id": ""}
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsNone(resp.json()["fide_id"])
+        users = self.client.get("/api/users").json()["users"]
+        self.assertIsNone(users[0]["fide_id"])
+
 
 class DataApiTests(ApiTestBase):
     """Тесты /api/overview, /api/plan, /api/progress, /api/drills, /api/report."""
