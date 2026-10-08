@@ -848,6 +848,8 @@ const TOOL_LABELS = {
   humanity: 'Человечность',
   tournament: 'Турнир',
   fide: 'FIDE',
+  review: 'Разбор',
+  mentor: 'Тренер',
 };
 
 const TOOL_COLOR_RU = { white: 'белые', black: 'чёрные' };
@@ -856,7 +858,8 @@ const FIDE_CONTROL_RU = { standard: 'Классика', rapid: 'Рапид', bli
 async function viewTools(app) {
   const tool = TOOL_LABELS[state.tool] ? state.tool : 'repertoire';
   state.tool = tool;
-  const needsUser = tool === 'repertoire' || tool === 'opponent' || tool === 'humanity';
+  const needsUser = tool === 'repertoire' || tool === 'opponent' || tool === 'humanity'
+    || tool === 'review' || tool === 'mentor';
   if (needsUser && !state.user) {
     app.innerHTML = '<div class="onboarding card"><div class="empty-icon">🛠</div><h1>Нет профиля</h1><p>Выбери профиль на странице Профили.</p></div>';
     return;
@@ -924,6 +927,26 @@ function toolFormHtml(tool) {
         <button type="submit" class="btn btn-primary" style="width:fit-content">Посчитать</button>
       </form>`;
   }
+  if (tool === 'review') {
+    return `
+      <form id="tool-form">
+        <div class="form-row">
+          <div class="form-group"><label>Макс. партий <input type="number" name="max" value="3" min="1" max="50"></label></div>
+          <div class="form-group" style="flex:2;min-width:200px"><label>Конкретная партия (опц.) <input type="text" name="game_id" placeholder="2SXfzXV2"></label></div>
+          <div class="form-group"><label>Ключевых моментов <input type="number" name="moments" value="6" min="1" max="20"></label></div>
+        </div>
+        <button type="submit" class="btn btn-primary" style="width:fit-content">Разобрать</button>
+      </form>
+      <p style="color:var(--c-text-muted);font-size:13px;margin-top:12px">LLM разбирает ключевые моменты (blunder/mistake) твоих проанализированных партий — что ты терял и что надо было сыграть. Требует LLM_API_KEY (см. README).</p>`;
+  }
+  if (tool === 'mentor') {
+    return `
+      <form id="tool-form">
+        <div class="form-group"><label>Заметки для тренера (опц.)<textarea name="notes" rows="3" placeholder="Хочу сильнее играть эндшпиль, особенно ладейные..."></textarea></label></div>
+        <button type="submit" class="btn btn-primary" style="width:fit-content">Спросить тренера</button>
+      </form>
+      <p style="color:var(--c-text-muted);font-size:13px;margin-top:12px">Тренер строит план по твоим партиям, дебютам, ошибкам и прогрессу — и выдаёт личные задания. Требует LLM_API_KEY (см. README).</p>`;
+  }
   const prefill = state.user && state.user.fide_id ? state.user.fide_id : '';
   return `
     <form id="tool-form">
@@ -962,6 +985,10 @@ function bindToolForm(tool) {
         startToolJob((await apiPost('/api/fide/run', fd)).job_id, renderFide);
       } else if (tool === 'humanity') {
         startToolJob((await api('/api/humanize?refresh=1')).job_id, renderHumanity);
+      } else if (tool === 'review') {
+        startToolJob((await apiPost('/api/review/run', fd)).job_id, renderReview);
+      } else if (tool === 'mentor') {
+        startToolJob((await apiPost('/api/mentor/run', fd)).job_id, renderMentor);
       }
     } catch (err) {
       toolError(err);
@@ -1203,6 +1230,66 @@ function renderFide(d) {
       ${winRows.length ? `<h3 style="font-size:14px;margin:16px 0 8px">Окна истории</h3>
         <table class="table-wrap"><thead><tr><th>Контроль</th><th class="num">№</th><th class="num">Периодов</th><th>Период</th><th class="num">Было → стало</th><th class="num">Δ</th></tr></thead>
         <tbody>${winRows.join('')}</tbody></table>` : '<p style="color:var(--c-text-muted)">История рейтингов пуста.</p>'}
+    </div>`;
+}
+
+function renderReview(d) {
+  const box = document.getElementById('tool-result');
+  const games = d.games || [];
+  const resBadge = r => r === 'win' ? 'badge-good' : r === 'loss' ? 'badge-bad' : 'badge-neutral';
+  const resLabel = r => r === 'win' ? 'Победа' : r === 'loss' ? 'Поражение' : 'Ничья';
+  const promptBlocks = (d.prompts || []).map(p => `
+    <div style="margin-top:10px"><strong style="font-size:12px">${esc(p.game_id || '')} · ${esc(p.role)}</strong>
+    <div class="prompt-block">${esc(p.content)}</div></div>`).join('');
+
+  const gameCards = games.map((g, idx) => {
+    const moments = (g.moments || []).map(m => {
+      const cls = m.classification || '—';
+      return `
+        <div style="margin-top:8px">
+          <code>${esc(m.san || '—')}</code>
+          <span class="badge ${cls === 'blunder' ? 'badge-bad' : cls === 'mistake' ? 'badge-neutral' : 'badge-good'}">${esc(cls)}</span>
+          <span style="color:var(--c-text-muted);font-size:12px">полуход ${m.ply || '—'}${m.drop != null ? ` · потеря win% ${m.drop.toFixed(1)}` : ''}</span>
+          <div style="margin-top:2px">${m.text ? esc(m.text) : '<span style="color:var(--c-text-muted)">(нет объяснения)</span>'}</div>
+        </div>`;
+    }).join('');
+    return `
+      <div class="card"${idx ? ' style="margin-top:12px"' : ''}>
+        <div class="card-header">
+          <span class="card-title">${esc(g.game_id)} · ${esc(g.white)} — ${esc(g.black)}</span>
+          <span class="badge ${resBadge(g.result)}">${resLabel(g.result)}</span>
+        </div>
+        <p style="color:var(--c-text-muted);font-size:13px;margin:0 0 8px">${esc(g.opening || '—')}${g.avg_win_loss != null ? ` · ср. потеря win% ${g.avg_win_loss.toFixed(1)}` : ''}</p>
+        ${moments || '<p style="color:var(--c-text-muted)">Ключевых моментов нет.</p>'}
+        ${g.summary ? `<p style="margin-top:8px"><strong>Итог:</strong> ${esc(g.summary)}</p>` : ''}
+      </div>`;
+  }).join('');
+
+  box.innerHTML = `
+    ${d.dry_run ? '<div class="alert alert-info">Режим dry-run: LLM не вызывался — ниже готовые промпты.</div>' : ''}
+    ${games.length ? gameCards : '<div class="card"><p style="color:var(--c-text-muted)">Разбора нет: в отобранных партиях не нашлось ключевых моментов (blunder/mistake).</p></div>'}
+    ${d.dry_run && promptBlocks ? `<div class="card" style="margin-top:12px"><div class="card-header"><span class="card-title">Готовые промпты</span></div>${promptBlocks}</div>` : ''}`;
+}
+
+function renderMentor(d) {
+  const box = document.getElementById('tool-result');
+  if (d.dry_run) {
+    const prompts = (d.prompts || []).map(p => `
+      <div style="margin-top:10px"><strong style="font-size:12px">${esc(p.role)}</strong>
+      <div class="prompt-block">${esc(p.content)}</div></div>`).join('');
+    box.innerHTML = `
+      <div class="alert alert-info">Режим dry-run: тренер не вызывался — промпты готовы.</div>
+      <div class="card"><div class="card-header"><span class="card-title">Промпты тренера</span></div>${prompts || '<p style="color:var(--c-text-muted)">Промптов нет.</p>'}</div>`;
+    return;
+  }
+  box.innerHTML = `
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">План тренера${d.user ? ` · ${esc(d.user)}` : ''}</span>
+        ${d.model ? `<span class="badge badge-blue">${esc(d.model)}</span>` : ''}
+      </div>
+      ${d.notes ? `<div class="alert alert-warn">Учтены заметки: ${esc(d.notes)}</div>` : ''}
+      <div class="mentor-reply">${esc(d.reply || '(пустой ответ тренера)')}</div>
     </div>`;
 }
 

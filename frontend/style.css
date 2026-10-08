@@ -219,6 +219,10 @@ td.center { text-align: center; }
 .job-detail { font-size: 13px; color: var(--c-text); }
 .job-error { color: var(--c-badge-bad); margin-top: 8px; }
 
+/* LLM tools (review / mentor) */
+.mentor-reply { white-space: pre-wrap; line-height: 1.6; }
+.prompt-block { white-space: pre-wrap; font-family: "SF Mono", "Fira Mono", Menlo, Consolas, monospace; font-size: 12px; background: var(--c-bg-box-alt); border: 1px solid var(--c-border); border-radius: 4px; padding: 8px 10px; margin-top: 6px; }
+
 /* Drills table */
 .drill-row td { font-size: 12px; }
 .drill-san { font-family: "SF Mono", "Fira Mono", Menlo, Consolas, monospace; font-weight: 600; }

@@ -7,8 +7,10 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
+import urllib.parse
 import uuid
 import webbrowser
 from dataclasses import asdict, dataclass, field
@@ -23,6 +25,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import data as shared_data
 from .analyzer import Engine
+from .coach import build_request, run_coach
 from .config import settings
 from .db import Database
 from .drills import drills_to_json, drills_to_pgn
@@ -35,9 +38,14 @@ from .fide import (
 )
 from .games import fetch_user_games
 from .humanize import humanize_report
+from .llm import LLMClient, _is_local_host
 from .maia import MaiaLitePolicy
+from .mentor import build_mentor_request, format_mentor_reply, run_mentor
+from .metrics import metric
 from .opponent import build_confrontations, build_opponent_profile
 from .paths import user_dir
+from .plan import build_plan
+from .progress import build_progress
 from .repertoire import Repertoire, opening_stats
 from .report import build_report
 
@@ -262,6 +270,205 @@ def _run_fide_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None:
         job.status = "done"
         job.summary = f"FIDE {params['id']}: {player.name or 'профиль получен'}"
 
+    except Exception as exc:
+        job.status = "error"
+        job.error = str(exc)
+    finally:
+        job.finished = time.time()
+
+
+def _ensure_llm_key() -> None:
+    """Проверяет, что LLM-ключ доступен (иначе job сразу уйдёт в error)."""
+    if os.environ.get("LLM_API_KEY"):
+        return
+    base = os.environ.get("LLM_BASE_URL") or settings.llm_base_url
+    host = urllib.parse.urlparse(base).hostname
+    if not _is_local_host(host):
+        raise RuntimeError(
+            "Нет LLM_API_KEY — задай его в переменной окружения или .env "
+            "(см. README, раздел про LLM)"
+        )
+
+
+def _select_analyzed_pairs(
+    db: Database,
+    user: str,
+    game_id: str | None = None,
+    max_games: int | None = None,
+) -> list:
+    """Отбирает пары (игра, анализ) для LLM-инструментов: конкретная
+    партия либо топ-партии по blunders+mistakes. Ошибки — RuntimeError."""
+    if game_id:
+        game = db.get_game(game_id)
+        if game is None:
+            raise RuntimeError(f"Партия {game_id} не найдена в кеше")
+        analysis = db.get_analysis(game_id)
+        if analysis is None:
+            raise RuntimeError(
+                f"Партия {game_id} не проанализирована — сначала запусти анализ."
+            )
+        return [(game, analysis)]
+    pairs = db.get_analyzed_games(user, limit=500)
+    if not pairs:
+        raise RuntimeError(
+            f"Нет проанализированных партий для {user} — сначала запусти анализ "
+            "(страница «Анализ»)."
+        )
+    pairs.sort(
+        key=lambda p: (
+            -(len(p[1].get("blunders") or []) + len(p[1].get("mistakes") or [])),
+            -(metric(p[1], "avg_win_loss") or 0.0),
+        )
+    )
+    if max_games:
+        pairs = pairs[:max_games]
+    return pairs
+
+
+def _player_name(player: dict | None) -> str:
+    """Имя игрока из словаря white/black партии, '—' если нет."""
+    if not player:
+        return "—"
+    name = player.get("name") or player.get("username")
+    return str(name) if name else "—"
+
+
+def _review_entry(game, analysis, idx, moments: dict, summary: str | None) -> dict:
+    """Формирует запись «Одна партия» для разбора (поля как в CLI-выводе)."""
+    moves = analysis.get("moves") or []
+    entry_moments = []
+    for ply in idx:
+        move = moves[ply] if ply < len(moves) else {}
+        drop = move.get("drop")
+        entry_moments.append(
+            {
+                "ply": ply + 1,
+                "san": move.get("san"),
+                "classification": move.get("classification"),
+                "drop": drop if isinstance(drop, (int, float)) else None,
+                "text": moments.get(ply),
+            }
+        )
+    return {
+        "game_id": game.id,
+        "white": _player_name(game.white),
+        "black": _player_name(game.black),
+        "result": analysis.get("result_for_user") or game.result_for_user or "draw",
+        "opening": game.opening or "",
+        "avg_win_loss": metric(analysis, "avg_win_loss", default=None),
+        "moments": entry_moments,
+        "summary": summary,
+    }
+
+
+def _run_review_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None:
+    """Фоновый поток: LLM-разбор ключевых моментов партий (команда review)."""
+    try:
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            pairs = _select_analyzed_pairs(
+                db, job.user, params.get("game_id"), params["max"]
+            )
+
+        job.phase = "Разбор партий"
+        llm = None
+        if not params["dry_run"]:
+            _ensure_llm_key()
+            llm = LLMClient()
+
+        games = []
+        prompts = []
+        for game, analysis in pairs:
+            messages, idx = build_request(game, analysis, params["moments"])
+            if not messages:
+                continue
+            if params["dry_run"]:
+                prompts.extend(
+                    {"game_id": game.id, "role": m.role, "content": m.content}
+                    for m in messages
+                )
+                games.append(_review_entry(game, analysis, idx, {}, None))
+                continue
+            moments, summary = run_coach(
+                game, analysis, llm, max_moments=params["moments"]
+            )
+            games.append(_review_entry(game, analysis, idx, moments, summary))
+
+        job.result = {"games": games}
+        if params["dry_run"]:
+            job.result["dry_run"] = True
+            job.result["prompts"] = prompts
+            job.summary = f"Промптов собрано: {len(prompts)} для {len(games)} партий"
+        else:
+            job.summary = f"Разобрано партий: {len(games)}"
+        job.status = "done"
+    except Exception as exc:
+        job.status = "error"
+        job.error = str(exc)
+    finally:
+        job.finished = time.time()
+
+
+def _run_mentor_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None:
+    """Фоновый поток: LLM-тренер (план по партиям + прогресс + заметки)."""
+    try:
+        nick = job.user
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            pairs = _select_analyzed_pairs(db, nick, params.get("game_id"), None)
+
+        job.phase = "Сборка плана"
+        humanity_path = shared_data.humanity_path(nick, root=app.state.data_dir)
+        plan_report = build_plan(
+            pairs,
+            user=nick,
+            humanity=shared_data.load_humanity(humanity_path),
+            drills_total=shared_data.count_drills(
+                "drills.pgn", nick, root=app.state.data_dir
+            ),
+            drills_unnatural=shared_data.count_drills(
+                "drills_unnatural.pgn", nick, root=app.state.data_dir
+            ),
+            max_depth=params["max_depth"],
+        )
+
+        progress_report = None
+        if not params["no_progress"]:
+            job.phase = "Сборка прогресса"
+            progress_report = build_progress(
+                pairs,
+                user=nick,
+                humanity=shared_data.load_humanity_raw(humanity_path),
+                windows=5,
+            )
+
+        request = build_mentor_request(
+            plan_report,
+            extra=params.get("notes") or "",
+            progress=progress_report,
+        )
+
+        if params["dry_run"]:
+            job.result = {
+                "dry_run": True,
+                "user": nick,
+                "notes": params.get("notes") or "",
+                "prompts": [{"role": m.role, "content": m.content} for m in request],
+            }
+            job.summary = "Mentor: собраны промпты без вызова LLM"
+        else:
+            job.phase = "Ответ тренера"
+            _ensure_llm_key()
+            llm = LLMClient()
+            reply = run_mentor(llm, request)
+            job.result = {
+                "user": plan_report.get("user"),
+                "model": llm.model,
+                "notes": params.get("notes") or "",
+                "reply": format_mentor_reply(reply),
+            }
+            job.summary = f"План тренера по {plan_report.get('games', 0)} партиям"
+        job.status = "done"
     except Exception as exc:
         job.status = "error"
         job.error = str(exc)
@@ -747,6 +954,86 @@ def create_api(
         _register_job(job)
         params = {"id": fide_id, "windows": windows}
         threading.Thread(target=_run_fide_job, args=(app, job, params), daemon=True).start()
+        return {"job_id": job.id, "status": "started"}
+
+    @app.post("/api/review/run")
+    def api_review_run(
+        request: Request,
+        max: int = Form(3),
+        game_id: str = Form(""),
+        moments: int = Form(6),
+        dry_run: str | None = Form(None),
+    ):
+        user = _current_user(app.state.db_path)
+        if not user:
+            raise HTTPException(404, "No current user")
+        if not 1 <= max <= 50:
+            raise HTTPException(400, "max должен быть от 1 до 50")
+        if not 1 <= moments <= 20:
+            raise HTTPException(400, "moments должен быть от 1 до 20")
+        gid = game_id.strip()
+        try:
+            with Database(app.state.db_path) as db:
+                db.init_db()
+                _select_analyzed_pairs(db, user["nick"], gid, max if gid else 1)
+        except RuntimeError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+        job = CoachJob(
+            id=uuid.uuid4().hex,
+            user=user["nick"],
+            phase="Разбор партий",
+        )
+        _register_job(job)
+        params = {
+            "max": max,
+            "game_id": gid or None,
+            "moments": moments,
+            "dry_run": dry_run == "on",
+        }
+        threading.Thread(
+            target=_run_review_job, args=(app, job, params), daemon=True
+        ).start()
+        return {"job_id": job.id, "status": "started"}
+
+    @app.post("/api/mentor/run")
+    def api_mentor_run(
+        request: Request,
+        notes: str = Form(""),
+        game_id: str = Form(""),
+        max_depth: int = Form(16),
+        dry_run: str | None = Form(None),
+        no_progress: str | None = Form(None),
+    ):
+        user = _current_user(app.state.db_path)
+        if not user:
+            raise HTTPException(404, "No current user")
+        if not 1 <= max_depth <= 64:
+            raise HTTPException(400, "max_depth должен быть от 1 до 64")
+        gid = game_id.strip()
+        try:
+            with Database(app.state.db_path) as db:
+                db.init_db()
+                _select_analyzed_pairs(db, user["nick"], gid, 1 if gid else None)
+        except RuntimeError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+        job = CoachJob(
+            id=uuid.uuid4().hex,
+            user=user["nick"],
+            phase="Сборка плана",
+        )
+        _register_job(job)
+        params = {
+            "notes": notes,
+            "game_id": gid or None,
+            "max_depth": max_depth,
+            "dry_run": dry_run == "on",
+            "no_progress": no_progress == "on",
+        }
+        threading.Thread(
+            target=_run_mentor_job, args=(app, job, params), daemon=True
+        ).start()
         return {"job_id": job.id, "status": "started"}
 
     # Frontend static files — mounted LAST so /api/* routes take precedence.

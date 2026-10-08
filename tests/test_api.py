@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import tempfile
 import time
@@ -574,6 +575,152 @@ class ToolsApiTests(ApiTestBase):
         self.assertEqual(standard["rows"][0]["delta"], 10)
         self.assertEqual(standard["delta"], 30)
         self.assertEqual(standard["direction"], "up")
+
+
+class LlmToolApiTests(ApiTestBase):
+    """Тесты LLM-инструментов: /api/review/run и /api/mentor/run.
+
+    Сеть не используется: либо мок функции вызова LLM, либо dry-run.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.save_games(
+                [mkgame_moves("rv1", ["e4", "e5", "Nf3", "Nf6"])], "tester"
+            )
+            db.save_analysis(
+                "rv1",
+                {
+                    "user_color": "black",
+                    "result_for_user": "loss",
+                    "avg_win_loss": 12.5,
+                    "avg_win_before": 70.0,
+                    "blunders": [3],
+                    "mistakes": [],
+                    "missed_wins": [],
+                    "moves": [
+                        {"san": "e4", "classification": "good", "drop": 0.0,
+                         "win_before": 55.0, "win_after": 55.0},
+                        {"san": "e5", "classification": "best", "drop": 0.0,
+                         "win_before": 45.0, "win_after": 45.0},
+                        {"san": "Nf3", "classification": "good", "drop": 0.0,
+                         "win_before": 50.0, "win_after": 50.0},
+                        {"san": "Nf6", "classification": "blunder", "drop": 25.0,
+                         "win_before": 60.0, "win_after": 35.0},
+                    ],
+                },
+                depth=8,
+            )
+            db.set_current_user("tester")
+
+    def _wait_job(self, job_id: str, timeout: float = 15.0) -> dict:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            resp = self.client.get(f"/api/jobs/{job_id}")
+            self.assertEqual(resp.status_code, 200)
+            data = resp.json()
+            if data["status"] != "running":
+                return data
+            time.sleep(0.05)
+        self.fail(f"job {job_id} не завершился за {timeout}с")
+
+    # --- review ---
+
+    def test_review_run_creates_job(self):
+        with patch.dict(os.environ, {"LLM_API_KEY": "test-key"}), \
+                patch("app.api.run_coach",
+                      return_value=({3: "не увидел угрозу на f6"}, "потерял инициативу")):
+            resp = self.client.post("/api/review/run", data={"max": "3"})
+            self.assertEqual(resp.status_code, 200)
+            job = self._wait_job(resp.json()["job_id"])
+
+        self.assertEqual(job["status"], "done", job.get("error"))
+        result = job["result"]
+        self.assertEqual(len(result["games"]), 1)
+        game = result["games"][0]
+        self.assertEqual(game["game_id"], "rv1")
+        self.assertEqual(game["result"], "loss")
+        self.assertEqual(game["white"], "A")
+        self.assertEqual(game["black"], "B")
+        self.assertEqual(game["avg_win_loss"], 12.5)
+        self.assertEqual(len(game["moments"]), 1)
+        moment = game["moments"][0]
+        self.assertEqual(moment["ply"], 4)
+        self.assertEqual(moment["san"], "Nf6")
+        self.assertEqual(moment["classification"], "blunder")
+        self.assertEqual(moment["drop"], 25.0)
+        self.assertEqual(moment["text"], "не увидел угрозу на f6")
+        self.assertEqual(game["summary"], "потерял инициативу")
+
+    def test_review_dry_run_no_llm(self):
+        resp = self.client.post("/api/review/run", data={"max": "3", "dry_run": "on"})
+        self.assertEqual(resp.status_code, 200)
+        job = self._wait_job(resp.json()["job_id"])
+        self.assertEqual(job["status"], "done", job.get("error"))
+        result = job["result"]
+        self.assertTrue(result["dry_run"])
+        self.assertEqual(len(result["games"]), 1)
+        self.assertTrue(result["prompts"])
+        user_msg = result["prompts"][1]
+        self.assertEqual(user_msg["role"], "user")
+        self.assertIn("Момент 1", user_msg["content"])
+
+    def test_review_no_user_404(self):
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.clear_current_user()
+        resp = self.client.post("/api/review/run", data={"max": "3"})
+        self.assertEqual(resp.status_code, 404)
+
+    def test_review_no_analyzed_games_404(self):
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.set_current_user("ghost")
+        resp = self.client.post("/api/review/run", data={"max": "3"})
+        self.assertEqual(resp.status_code, 404)
+        self.assertIn("проанализированных", resp.json()["detail"])
+
+    def test_review_no_llm_key_job_error(self):
+        with patch.dict(os.environ, {"LLM_API_KEY": ""}):
+            resp = self.client.post("/api/review/run", data={"max": "3"})
+            self.assertEqual(resp.status_code, 200)
+            job = self._wait_job(resp.json()["job_id"])
+        self.assertEqual(job["status"], "error")
+        self.assertIn("LLM_API_KEY", job["error"])
+
+    # --- mentor ---
+
+    def test_mentor_run_creates_job(self):
+        import textwrap
+        reply = textwrap.dedent("""\
+            1) Дебют — закрепить e4-e5.
+            2) Узоры — вилка на f6.
+            Итог через месяц: ...
+        """)
+        with patch.dict(os.environ, {"LLM_API_KEY": "test-key"}), \
+                patch("app.api.run_mentor", return_value=reply) as rm:
+            resp = self.client.post(
+                "/api/mentor/run", data={"notes": "Хочу эндшпиль"}
+            )
+            self.assertEqual(resp.status_code, 200)
+            job = self._wait_job(resp.json()["job_id"])
+            rm.assert_called_once()
+
+        self.assertEqual(job["status"], "done", job.get("error"))
+        result = job["result"]
+        self.assertEqual(result["user"], "tester")
+        self.assertEqual(result["notes"], "Хочу эндшпиль")
+        self.assertEqual(result["reply"], reply.rstrip())
+        self.assertIsNotNone(result.get("model"))
+
+    def test_mentor_no_user_404(self):
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.clear_current_user()
+        resp = self.client.post("/api/mentor/run", data={"notes": "x"})
+        self.assertEqual(resp.status_code, 404)
 
 
 class FrontendTests(ApiTestBase):
