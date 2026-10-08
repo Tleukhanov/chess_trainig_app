@@ -355,6 +355,20 @@ td.center { text-align: center; }
 .alert-error { background: var(--c-alert-error-bg); color: var(--c-alert-error-fg); border: 1px solid var(--c-alert-error-border); }
 .alert-success { background: var(--c-alert-success-bg); color: var(--c-alert-success-fg); border: 1px solid var(--c-alert-success-border); }
 
+/* Мини-трекер: ручной ввод минут на Lichess (инлайн в профиле) */
+.track-manual-form { display: inline-flex; gap: 4px; align-items: center; margin-left: 6px; }
+.track-manual-form input {
+  width: 84px;
+  padding: 3px 6px;
+  border: 1px solid var(--c-border);
+  border-radius: 4px;
+  font-size: 12px;
+  background: var(--c-bg-box);
+  color: var(--c-text);
+}
+.track-manual-form input:focus { outline: none; border-color: var(--c-link); }
+.track-manual-err { display: none; padding: 3px 8px; margin: 4px 0 0; font-size: 12px; }
+
 /* Empty state */
 .empty { text-align: center; padding: 48px 24px; color: var(--c-text-muted); }
 .empty-icon { font-size: 48px; margin-bottom: 12px; opacity: 0.5; }

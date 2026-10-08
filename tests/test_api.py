@@ -1201,6 +1201,67 @@ class TrackApiTests(ApiTestBase):
         self.assertEqual(stored["last"], 5_000_000.0)
         self.assertEqual(stored["total"], 0)
 
+    def test_manual_minutes_accumulate_and_add_to_total(self):
+        before = self.client.get("/api/track/today").json()["total_sec"]
+
+        first = self.client.post(
+            "/api/track/lichess_manual", data={"minutes": "30"}
+        )
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(
+            first.json(), {"manual_sec": 1800, "date": _today()}
+        )
+
+        second = self.client.post(
+            "/api/track/lichess_manual", data={"minutes": "15"}
+        )
+        self.assertEqual(second.json()["manual_sec"], 45 * 60)
+
+        data = self.client.get("/api/track/today").json()
+        self.assertEqual(data["manual_sec"], 45 * 60)
+        self.assertEqual(data["total_sec"], before + 45 * 60)
+        self.assertEqual(
+            data["total_sec"],
+            data["site_sec"] + data["lichess_sec"] + data["manual_sec"],
+        )
+
+    def test_manual_minutes_out_of_range_400(self):
+        for bad in ("0", "601", "-5", "abc", "30.5", ""):
+            with self.subTest(minutes=bad):
+                resp = self.client.post(
+                    "/api/track/lichess_manual", data={"minutes": bad}
+                )
+                self.assertEqual(resp.status_code, 400)
+        self.assertEqual(
+            self.client.post("/api/track/lichess_manual").status_code, 400
+        )
+        data = self.client.get("/api/track/today").json()
+        self.assertEqual(data["manual_sec"], 0)
+
+    def test_manual_minutes_no_user_404(self):
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.clear_current_user()
+        resp = self.client.post(
+            "/api/track/lichess_manual", data={"minutes": "30"}
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    def test_manual_yesterday_not_in_today_total(self):
+        yesterday = time.strftime(
+            "%Y-%m-%d", time.localtime(time.time() - 86_400)
+        )
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.set_meta(f"lichess_manual_{yesterday}_tester", str(30 * 60))
+        before = self.client.get("/api/track/today").json()["total_sec"]
+
+        self.client.post("/api/track/lichess_manual", data={"minutes": "10"})
+
+        data = self.client.get("/api/track/today").json()
+        self.assertEqual(data["manual_sec"], 10 * 60)
+        self.assertEqual(data["total_sec"], before + 10 * 60)
+
 
 class FrontendTests(ApiTestBase):
     """Тесты статического фронтенда."""

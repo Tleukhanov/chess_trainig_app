@@ -1587,13 +1587,76 @@ function _fmtDur(sec) {
   return h > 0 ? `${h} ч ${m} мин` : `${m} мин`;
 }
 
+function _trackLineHtml(track) {
+  const lichess = (Number(track.lichess_sec) || 0) + (Number(track.manual_sec) || 0);
+  return `Сегодня: <strong style="color:var(--c-text)">${_fmtDur(track.total_sec)}</strong> · Lichess ${_fmtDur(lichess)} · тренер ${_fmtDur(track.site_sec)}`;
+}
+
+async function refreshTrackLine() {
+  if (!state.user) return;
+  const track = await api('/api/track/today').catch(() => null);
+  const line = document.getElementById('track-line');
+  if (track && line) line.innerHTML = _trackLineHtml(track);
+}
+
+function closeLichessManual() {
+  const link = document.querySelector('.track-manual-add');
+  const slot = document.getElementById('track-manual-slot');
+  if (slot) slot.innerHTML = '';
+  if (link) link.style.display = '';
+}
+
+function openLichessManual() {
+  const link = document.querySelector('.track-manual-add');
+  const slot = document.getElementById('track-manual-slot');
+  if (!link || !slot) return;
+  link.style.display = 'none';
+  slot.innerHTML = `<form class="track-manual-form">
+      <input type="number" min="1" max="600" step="1" placeholder="минут">
+      <button class="btn btn-primary" style="font-size:12px;padding:4px 10px">Добавить</button>
+      <button type="button" class="btn btn-link track-manual-cancel">✕</button>
+    </form><div class="alert alert-error track-manual-err"></div>`;
+  const form = slot.querySelector('.track-manual-form');
+  const input = form.querySelector('input');
+  const err = slot.querySelector('.track-manual-err');
+  const fail = msg => {
+    err.textContent = msg;
+    err.style.display = 'inline-block';
+    input.focus();
+  };
+  input.focus();
+  form.addEventListener('submit', async e => {
+    e.preventDefault();
+    err.style.display = 'none';
+    const raw = input.value.trim();
+    const n = Number(raw);
+    if (raw === '' || !Number.isInteger(n) || n < 1 || n > 600) {
+      fail('От 1 до 600 минут');
+      return;
+    }
+    const fd = new FormData();
+    fd.set('minutes', String(n));
+    try {
+      await apiPost('/api/track/lichess_manual', fd);
+      await refreshTrackLine();
+      closeLichessManual();
+    } catch (apiErr) {
+      fail(apiErr.message);
+    }
+  });
+  form.querySelector('.track-manual-cancel').addEventListener('click', closeLichessManual);
+}
+
 async function viewUsers(app) {
   const users = await api('/api/users');
   const list = users.users;
   const currentNick = state.user ? state.user.nick : '';
   const track = state.user ? await api('/api/track/today').catch(() => null) : null;
   const trackHtml = track
-    ? `<div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--c-border);font-size:13px;color:var(--c-text-muted)">Сегодня: <strong style="color:var(--c-text)">${_fmtDur(track.total_sec)}</strong> · Lichess ${_fmtDur(track.lichess_sec)} · тренер ${_fmtDur(track.site_sec)}</div>`
+    ? `<div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--c-border);font-size:13px;color:var(--c-text-muted)">
+        <div id="track-line">${_trackLineHtml(track)}</div>
+        <div style="margin-top:2px"><a href="#" class="btn btn-link track-manual-add">+ время на Lichess</a><span id="track-manual-slot"></span></div>
+      </div>`
     : '';
 
   app.innerHTML = `
@@ -1659,6 +1722,14 @@ async function viewUsers(app) {
       openFideEdit(link, rerender);
     });
   });
+
+  const manualLink = app.querySelector('.track-manual-add');
+  if (manualLink) {
+    manualLink.addEventListener('click', e => {
+      e.preventDefault();
+      openLichessManual();
+    });
+  }
 
   app.querySelectorAll('.user-delete').forEach(btn => {
     btn.addEventListener('click', async () => {

@@ -731,6 +731,33 @@ def _track_state(db: Database, key: str) -> dict[str, float] | None:
         return None
 
 
+def _lichess_manual_key(date: str, user: str) -> str:
+    """Ключ meta с ручными минутами на Lichess за дату (на пользователя)."""
+    return f"lichess_manual_{date}_{user}"
+
+
+def _manual_seconds(db: Database, key: str) -> int:
+    """Накопленные ручные секунды Lichess по ключу; нет записи/мусор → 0."""
+    raw = db.get_meta(key)
+    if not raw:
+        return 0
+    try:
+        return max(0, int(str(raw).strip()))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _parse_minutes(raw: Any) -> int:
+    """Строковые минуты из формы → целое 1..600; иначе HTTP 400."""
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        raise HTTPException(400, "Минуты: целое число от 1 до 600")
+    if not 1 <= value <= 600:
+        raise HTTPException(400, "Минуты: целое число от 1 до 600")
+    return value
+
+
 def _clock_seconds(clocks: list[float]) -> float:
     """«Часы в партии»: сумма убываний остатков clocks (без инкрементов)."""
     return sum(max(0.0, prev - cur) for prev, cur in zip(clocks, clocks[1:]))
@@ -1369,6 +1396,19 @@ def create_api(
             db.set_meta(key, json.dumps({"last": now, "total": total}))
         return {"ok": True, "total": int(total)}
 
+    @app.post("/api/track/lichess_manual")
+    def api_track_lichess_manual(request: Request, minutes: str = Form("")):
+        user = _current_user(app.state.db_path)
+        if not user:
+            raise HTTPException(404, "No current user")
+        value = _parse_minutes(minutes)
+        day = _today()
+        key = _lichess_manual_key(day, user["nick"])
+        with Database(app.state.db_path) as db:
+            total = _manual_seconds(db, key) + value * 60
+            db.set_meta(key, str(total))
+        return {"manual_sec": total, "date": day}
+
     @app.get("/api/track/today")
     def api_track_today(request: Request):
         user = _current_user(app.state.db_path)
@@ -1378,6 +1418,7 @@ def create_api(
         now = _now()
         with Database(app.state.db_path) as db:
             state = _track_state(db, _track_key(day, user["nick"]))
+            manual_sec = _manual_seconds(db, _lichess_manual_key(day, user["nick"]))
             games = db.get_games(user["nick"], limit=100_000)
         site_sec = 0.0
         if state is not None:
@@ -1393,7 +1434,8 @@ def create_api(
             "date": day,
             "site_sec": int(site_sec),
             "lichess_sec": int(lichess_sec),
-            "total_sec": int(site_sec + lichess_sec),
+            "manual_sec": int(manual_sec),
+            "total_sec": int(site_sec + lichess_sec + manual_sec),
             "games_today": games_today,
         }
 
