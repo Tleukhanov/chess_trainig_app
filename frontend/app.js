@@ -9,6 +9,7 @@ const state = {
   gameData: null,
   gamePly: 0,
   keyHandler: null,
+  tool: 'repertoire',
 };
 
 // --- API helpers ---
@@ -33,7 +34,7 @@ async function apiPost(path, formData) {
 
 // --- Navigation ---
 
-const views = ['dashboard', 'overview', 'plan', 'progress', 'games', 'drills', 'coach', 'users'];
+const views = ['dashboard', 'overview', 'plan', 'progress', 'games', 'drills', 'coach', 'tools', 'users'];
 
 function navigate(view) {
   if (!views.includes(view)) view = 'dashboard';
@@ -83,6 +84,10 @@ function renderUserbox() {
 async function render(view) {
   const app = document.getElementById('app');
   clearGameKeyboard();
+  if (state.jobPollTimer) {
+    clearInterval(state.jobPollTimer);
+    state.jobPollTimer = null;
+  }
   app.innerHTML = '<div class="card"><p>Загрузка...</p></div>';
 
   try {
@@ -94,6 +99,7 @@ async function render(view) {
       case 'games': await viewGames(app); break;
       case 'drills': await viewDrills(app); break;
       case 'coach': await viewCoach(app); break;
+      case 'tools': await viewTools(app); break;
       case 'users': await viewUsers(app); break;
       default: app.innerHTML = '<div class="card"><p>Неизвестная страница</p></div>';
     }
@@ -832,6 +838,372 @@ function showJob(app, jobId) {
       }
     } catch { clearInterval(state.jobPollTimer); }
   }, 1000);
+}
+
+// --- Tools (репертуар / соперник / человечность / турнир / FIDE) ---
+
+const TOOL_LABELS = {
+  repertoire: 'Репертуар',
+  opponent: 'Соперник',
+  humanity: 'Человечность',
+  tournament: 'Турнир',
+  fide: 'FIDE',
+};
+
+const TOOL_COLOR_RU = { white: 'белые', black: 'чёрные' };
+const FIDE_CONTROL_RU = { standard: 'Классика', rapid: 'Рапид', blitz: 'Блиц' };
+
+async function viewTools(app) {
+  const tool = TOOL_LABELS[state.tool] ? state.tool : 'repertoire';
+  state.tool = tool;
+  const needsUser = tool === 'repertoire' || tool === 'opponent' || tool === 'humanity';
+  if (needsUser && !state.user) {
+    app.innerHTML = '<div class="onboarding card"><div class="empty-icon">🛠</div><h1>Нет профиля</h1><p>Выбери профиль на странице Профили.</p></div>';
+    return;
+  }
+
+  const tabs = Object.entries(TOOL_LABELS).map(([key, label]) =>
+    `<button type="button" class="btn btn-secondary ${key === tool ? 'btn-active' : ''}" data-tool="${key}">${label}</button>`
+  ).join('');
+
+  app.innerHTML = `
+    <div class="card-header"><h1>Инструменты</h1>${state.user ? `<span class="badge badge-blue">${esc(state.user.nick)}</span>` : ''}</div>
+    <div class="card">
+      <div class="games-filter" style="margin-bottom:16px">${tabs}</div>
+      ${toolFormHtml(tool)}
+    </div>
+    <div id="tool-result"></div>`;
+
+  app.querySelectorAll('[data-tool]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      state.tool = btn.dataset.tool;
+      viewTools(app);
+    });
+  });
+  bindToolForm(tool);
+}
+
+function toolFormHtml(tool) {
+  if (tool === 'repertoire') {
+    return `
+      <form id="tool-form">
+        <div class="form-row">
+          <div class="form-group"><label>Цвет <select name="color"><option value="white">белые</option><option value="black">чёрные</option><option value="both" selected>оба</option></select></label></div>
+          <div class="form-group"><label>Глубина линии (ходов) <input type="number" name="max_depth" value="16" min="1" max="64"></label></div>
+        </div>
+        <button type="submit" class="btn btn-primary" style="width:fit-content">Показать</button>
+      </form>`;
+  }
+  if (tool === 'opponent') {
+    return `
+      <form id="tool-form">
+        <div class="form-row">
+          <div class="form-group" style="flex:2;min-width:200px"><label>Ник соперника <input type="text" name="opponent" required placeholder="GarryKasparov"></label></div>
+          <div class="form-group"><label>Макс. партий <input type="number" name="max" value="30" min="1" max="200"></label></div>
+          <div class="form-group"><label>Тип <select name="perf"><option value="rapid" selected>rapid</option><option value="blitz">blitz</option><option value="classical">classical</option><option value="bullet">bullet</option></select></label></div>
+        </div>
+        <button type="submit" class="btn btn-primary" style="width:fit-content">Собрать</button>
+      </form>
+      <p style="color:var(--c-text-muted);font-size:13px;margin-top:12px">Загружает его партии с Lichess, прогоняет через Stockfish и строит лист подготовки: дебюты, слабости, точки встречи с твоим репертуаром. Долго.</p>`;
+  }
+  if (tool === 'humanity') {
+    return `
+      <form id="tool-form">
+        <p style="color:var(--c-text-muted);font-size:13px;margin:0 0 12px">Кеш — файл humanity.json. «Посчитать» заново оценивает ошибки через MaiaLite (долго, движок).</p>
+        <div class="form-row" style="gap:8px">
+          <button type="submit" class="btn btn-primary">Посчитать</button>
+          <button type="button" class="btn btn-secondary" id="tool-cache">Показать кеш</button>
+        </div>
+      </form>`;
+  }
+  if (tool === 'tournament') {
+    return `
+      <form id="tool-form">
+        <div class="form-group"><label>Партии — по одной на строку: Имя:white:win:2100<textarea name="games" rows="5" placeholder="Иванов:white:win:2100&#10;Петров:black:draw:1980" required></textarea></label></div>
+        <div class="form-group"><label>Твой рейтинг до турнира (для прироста, опц.) <input type="number" name="initial" placeholder="1850"></label></div>
+        <button type="submit" class="btn btn-primary" style="width:fit-content">Посчитать</button>
+      </form>`;
+  }
+  const prefill = state.user && state.user.fide_id ? state.user.fide_id : '';
+  return `
+    <form id="tool-form">
+      <div class="form-row">
+        <div class="form-group"><label>FIDE ID <input type="text" name="id" required placeholder="4130005" value="${esc(prefill)}"></label></div>
+      </div>
+      <button type="submit" class="btn btn-primary" style="width:fit-content">Показать</button>
+    </form>`;
+}
+
+function bindToolForm(tool) {
+  const form = document.getElementById('tool-form');
+  if (!form) return;
+  const cacheBtn = document.getElementById('tool-cache');
+  if (cacheBtn) {
+    cacheBtn.addEventListener('click', async () => {
+      try {
+        renderHumanity(await api('/api/humanize'));
+      } catch (err) {
+        toolError(err);
+      }
+    });
+  }
+  form.addEventListener('submit', async e => {
+    e.preventDefault();
+    const fd = new FormData(form);
+    try {
+      if (tool === 'repertoire') {
+        const params = new URLSearchParams({ color: fd.get('color'), max_depth: fd.get('max_depth') || '16' });
+        renderRepertoire(await api('/api/repertoire?' + params));
+      } else if (tool === 'opponent') {
+        startToolJob((await apiPost('/api/prepare/run', fd)).job_id, renderOpponent);
+      } else if (tool === 'tournament') {
+        renderTournament(await apiPost('/api/tournament/run', fd));
+      } else if (tool === 'fide') {
+        startToolJob((await apiPost('/api/fide/run', fd)).job_id, renderFide);
+      } else if (tool === 'humanity') {
+        startToolJob((await api('/api/humanize?refresh=1')).job_id, renderHumanity);
+      }
+    } catch (err) {
+      toolError(err);
+    }
+  });
+}
+
+function toolError(err) {
+  const box = document.getElementById('tool-result');
+  if (box) box.innerHTML = `<div class="alert alert-error">${esc(err.message)}</div>`;
+}
+
+function startToolJob(jobId, onDone) {
+  const box = document.getElementById('tool-result');
+  box.innerHTML = `
+    <div class="card job-card">
+      <div class="card-header"><span class="card-title">Задача <code>${jobId.slice(0, 8)}</code></span><span class="badge badge-blue" id="tool-status">RUNNING</span></div>
+      <div class="job-progress"><div class="job-progress-bar" id="tool-bar" style="width:0%"></div></div>
+      <div class="job-phase" id="tool-phase">Запуск...</div>
+      <div class="job-detail" id="tool-detail">0 / 0</div>
+      <div id="tool-error"></div>
+    </div>`;
+
+  if (state.jobPollTimer) clearInterval(state.jobPollTimer);
+  state.jobPollTimer = setInterval(async () => {
+    const bar = document.getElementById('tool-bar');
+    if (!bar) { clearInterval(state.jobPollTimer); state.jobPollTimer = null; return; }
+    let j;
+    try {
+      j = await api('/api/jobs/' + jobId);
+    } catch {
+      clearInterval(state.jobPollTimer);
+      state.jobPollTimer = null;
+      return;
+    }
+    bar.style.width = j.total ? (j.done * 100 / j.total) + '%' : '0%';
+    document.getElementById('tool-phase').textContent = j.phase;
+    document.getElementById('tool-detail').textContent = j.done + ' / ' + j.total;
+    document.getElementById('tool-status').textContent = j.status.toUpperCase();
+    if (j.error) {
+      document.getElementById('tool-error').innerHTML = `<div class="job-error">${esc(j.error)}</div>`;
+    }
+    if (j.status === 'done' || j.status === 'error') {
+      clearInterval(state.jobPollTimer);
+      state.jobPollTimer = null;
+      if (j.status === 'done') onDone(j.result || {});
+    }
+  }, 700);
+}
+
+function renderRepertoire(d) {
+  const box = document.getElementById('tool-result');
+  const lines = d.lines || [];
+  const weakTotal = Object.values(d.weak || {}).reduce((a, b) => a + b, 0);
+  const both = d.color === 'both';
+  const openings = (d.openings || []).slice(0, 8);
+  box.innerHTML = `
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Линии репертуара (${lines.length}) · партий ${d.games}</span>
+        <span class="badge ${weakTotal ? 'badge-bad' : 'badge-good'}">слабых: ${weakTotal}</span>
+      </div>
+      ${lines.length ? `<table class="table-wrap">
+        <thead><tr>${both ? '<th>Цвет</th>' : ''}<th>Ходы</th><th class="num">Партий</th><th class="num">Хорошо</th><th class="num">Плохо</th><th class="num">Прочность</th></tr></thead>
+        <tbody>${lines.map(l => `<tr>
+          ${both ? `<td>${TOOL_COLOR_RU[l.color] || esc(l.color)}</td>` : ''}
+          <td><code>${esc((l.moves || []).join(' '))}</code></td>
+          <td class="num">${l.count}</td><td class="num">${l.ok}</td><td class="num">${l.bad}</td>
+          <td class="num">${l.path_ok_rate != null ? Math.round(l.path_ok_rate * 100) + '%' : '—'}</td>
+        </tr>`).join('')}</tbody></table>`
+        : '<p style="color:var(--c-text-muted);padding:8px">Нет данных: запусти анализ партий.</p>'}
+      ${openings.length ? `
+        <h3 style="font-size:14px;margin:16px 0 8px">Дебюты — ошибки по названиям</h3>
+        <table class="table-wrap"><thead><tr><th>Дебют</th><th>ECO</th><th class="num">Партий</th><th class="num">Очков %</th><th class="num">Ошибок/партию</th><th class="num">Ср. потеря</th></tr></thead>
+        <tbody>${openings.map(o => `<tr><td>${esc(o.opening)}</td><td>${esc(o.eco || '—')}</td><td class="num">${o.games}</td><td class="num">${o.points_pct.toFixed(1)}%</td><td class="num">${o.errors_per_game.toFixed(2)}</td><td class="num">${o.avg_drop.toFixed(1)}%</td></tr>`).join('')}</tbody></table>` : ''}
+    </div>`;
+}
+
+function renderOpponent(d) {
+  const box = document.getElementById('tool-result');
+  const p = d.profile || {};
+  const conf = d.confrontations || [];
+  const rating = p.rating || {};
+  const ratingText = rating.first != null ? `${rating.first} → ${rating.last} (${rating.delta >= 0 ? '+' : ''}${rating.delta})` : '—';
+  const speed = Object.entries(p.speed || {}).map(([k, v]) => `${esc(k)}: ${v}`).join(', ') || '—';
+
+  const openRows = [];
+  for (const color of ['white', 'black']) {
+    for (const o of ((p.openings || {})[color] || [])) {
+      openRows.push(`<tr>
+        <td>${TOOL_COLOR_RU[color]}</td>
+        <td>${esc(o.opening)}${o.variant !== o.opening ? ` <span style="color:var(--c-text-muted)">(${esc(o.variant)})</span>` : ''}</td>
+        <td class="num">${o.games}</td><td class="num">${o.points_pct.toFixed(1)}%</td>
+        <td class="num">${o.errors_per_game.toFixed(2)}</td><td class="num">${o.avg_drop.toFixed(1)}%</td>
+      </tr>`);
+    }
+  }
+
+  const weakness = p.weaknesses || {};
+  const weakRows = [
+    ...(weakness.phases || []).map(w => `<tr><td>фаза</td><td>${esc(w.label)}</td><td class="num">${w.bad_moves}</td><td class="num">${w.avg_drop != null ? w.avg_drop.toFixed(1) + '%' : '—'}</td></tr>`),
+    ...(weakness.motifs || []).map(w => `<tr><td>мотив</td><td>${esc(w.motif)}</td><td class="num">${w.bad_moves}</td><td class="num">${w.avg_drop != null ? w.avg_drop.toFixed(1) + '%' : '—'}</td></tr>`),
+  ];
+
+  box.innerHTML = `
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Подготовка: ${esc(p.opponent || '')}</span>
+        <span class="badge badge-blue">${p.games != null ? p.games : 0} партий</span>
+      </div>
+      ${p.small_sample ? '<div class="alert alert-warn">Меньше 20 партий — выводы о репертуаре соперника шумные.</div>' : ''}
+      <div class="grid grid-4">
+        <div class="stat"><div class="stat-value">${p.score_pct != null ? p.score_pct.toFixed(1) + '%' : '—'}</div><div class="stat-label">Его очки</div></div>
+        <div class="stat"><div class="stat-value">${ratingText}</div><div class="stat-label">Его рейтинг</div></div>
+        <div class="stat"><div class="stat-value" style="font-size:15px">${esc(p.trend || '—')}</div><div class="stat-label">Качество игры</div></div>
+        <div class="stat"><div class="stat-value" style="font-size:15px">${speed}</div><div class="stat-label">Контроль времени</div></div>
+      </div>
+      <h3 style="font-size:14px;margin:8px 0">Его дебюты</h3>
+      ${openRows.length ? `<table class="table-wrap"><thead><tr><th>Цвет</th><th>Дебют</th><th class="num">Партий</th><th class="num">Очков %</th><th class="num">Ошибок/партию</th><th class="num">Ср. потеря</th></tr></thead><tbody>${openRows.join('')}</tbody></table>`
+        : '<p style="color:var(--c-text-muted)">Нет данных о его дебютах.</p>'}
+      <h3 style="font-size:14px;margin:16px 0 8px">Где он ошибается</h3>
+      ${weakRows.length ? `<table class="table-wrap"><thead><tr><th>Тип</th><th>Что</th><th class="num">Плохих ходов</th><th class="num">Ср. потеря</th></tr></thead><tbody>${weakRows.join('')}</tbody></table>`
+        : '<p style="color:var(--c-text-muted)">Ошибок не найдено.</p>'}
+      <h3 style="font-size:14px;margin:16px 0 8px">Точки встречи (его дебют → твой ответ)</h3>
+      ${conf.length ? `<table class="table-wrap"><thead><tr><th>Дебют</th><th>Он</th><th>Твой ответ</th><th class="num">Его ошибок/парт.</th><th class="num">Твоих ошибок/парт.</th></tr></thead>
+        <tbody>${conf.map(c => `<tr>
+          <td>${esc(c.opening)}</td>
+          <td>${TOOL_COLOR_RU[c.his_color]}: ${c.his_games} парт.</td>
+          <td><code>${esc(c.your_reply)}</code> (${c.your_reply_games} парт.)</td>
+          <td class="num">${c.his_errors_per_game.toFixed(2)}</td>
+          <td class="num">${c.your_errors_per_game.toFixed(2)}</td>
+        </tr>`).join('')}</tbody></table>`
+        : '<p style="color:var(--c-text-muted)">Пересечений с твоим репертуаром не нашлось: готовиться пока не к чему.</p>'}
+    </div>`;
+}
+
+function renderHumanity(d) {
+  const box = document.getElementById('tool-result');
+  const s = d.summary || {};
+  const items = (d.items || []).slice(0, 60);
+  const verdictBadge = v => v === 'natural' ? 'badge-good' : v === 'unnatural' ? 'badge-bad' : 'badge-neutral';
+  box.innerHTML = `
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Человечность ошибок</span>
+        ${d.avg_beta != null ? `<span class="badge badge-blue">ср. β ${d.avg_beta}</span>` : ''}
+      </div>
+      <div class="grid grid-4">
+        <div class="stat"><div class="stat-value">${s.total || 0}</div><div class="stat-label">Всего</div></div>
+        <div class="stat"><div class="stat-value">${s.natural || 0}</div><div class="stat-label">Естественные</div></div>
+        <div class="stat"><div class="stat-value">${s.borderline || 0}</div><div class="stat-label">Пограничные</div></div>
+        <div class="stat"><div class="stat-value">${s.unnatural || 0}</div><div class="stat-label">Неестественные</div></div>
+      </div>
+      ${items.length ? `<table class="table-wrap">
+        <thead><tr><th>Партия</th><th class="num">П.</th><th>Ход</th><th>Класс</th><th class="num">Потеря</th><th class="num">β</th><th>Вердикт</th></tr></thead>
+        <tbody>${items.map(i => `<tr>
+          <td>${esc(String(i.game_id || '').slice(0, 8))}</td>
+          <td class="num">${i.ply}</td>
+          <td class="drill-san">${esc(i.san || '')}</td>
+          <td>${esc(i.classification || '—')}</td>
+          <td class="num">${i.drop != null ? i.drop.toFixed(1) + '%' : '—'}</td>
+          <td class="num">${i.beta != null ? i.beta : '—'}</td>
+          <td><span class="badge ${verdictBadge(i.verdict)}">${esc(i.verdict || '—')}</span></td>
+        </tr>`).join('')}</tbody></table>`
+        : '<p style="color:var(--c-text-muted);padding:8px">Ошибок нет.</p>'}
+    </div>`;
+}
+
+function renderTournament(r) {
+  const box = document.getElementById('tool-result');
+  const rows = r.rows || [];
+  const deltaText = r.delta != null ? (r.delta >= 0 ? '+' : '') + r.delta : '—';
+  box.innerHTML = `
+    <div class="card">
+      <div class="card-header"><span class="card-title">Итоги турнира</span></div>
+      <div class="grid grid-4">
+        <div class="stat"><div class="stat-value">${r.games}</div><div class="stat-label">Партий</div></div>
+        <div class="stat"><div class="stat-value">${r.points}</div><div class="stat-label">Очков</div></div>
+        <div class="stat"><div class="stat-value">${r.performance != null ? r.performance : '—'}</div><div class="stat-label">Перформанс</div></div>
+        <div class="stat"><div class="stat-value">${deltaText}</div><div class="stat-label">Прирост рейтинга</div></div>
+      </div>
+      <p style="color:var(--c-text-muted);font-size:13px">Средний рейтинг соперника: ${r.avg_opponent != null ? r.avg_opponent : '—'}</p>
+      ${rows.length ? `<table class="table-wrap">
+        <thead><tr><th>Соперник</th><th>Цвет</th><th class="num">Рейтинг</th><th>Результат</th><th class="num">Очки</th></tr></thead>
+        <tbody>${rows.map(row => `<tr>
+          <td>${esc(row.opponent)}</td>
+          <td>${esc(row.color)}</td>
+          <td class="num">${row.opponent_rating != null ? row.opponent_rating : '—'}</td>
+          <td><span class="badge ${row.result === 'Победа' ? 'badge-good' : row.result === 'Поражение' ? 'badge-bad' : 'badge-neutral'}">${esc(row.result)}</span></td>
+          <td class="num">${row.points}</td>
+        </tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted)">Партий нет.</p>'}
+    </div>`;
+}
+
+function renderFide(d) {
+  const box = document.getElementById('tool-result');
+  const p = d.player || {};
+  const trend = d.trend || {};
+  const controls = trend.controls || [];
+  const ratingOrDash = v => v != null ? v : '—';
+
+  const winRows = [];
+  const summaryRows = controls.map(c => {
+    for (const row of (c.rows || [])) {
+      winRows.push(`<tr>
+        <td>${FIDE_CONTROL_RU[c.key] || esc(c.key)}</td>
+        <td class="num">${row.index}</td>
+        <td class="num">${row.periods}</td>
+        <td>${esc(row.first_period)} → ${esc(row.last_period)}</td>
+        <td class="num">${row.first_rating} → ${row.last_rating}</td>
+        <td class="num">${row.delta >= 0 ? '+' : ''}${row.delta}</td>
+      </tr>`);
+    }
+    const dir = c.direction === 'up' ? '↑' : c.direction === 'down' ? '↓' : '→';
+    return `<tr>
+      <td>${FIDE_CONTROL_RU[c.key] || esc(c.key)}</td>
+      <td class="num">${ratingOrDash(c.current)}</td>
+      <td class="num">${c.delta != null ? (c.delta >= 0 ? '+' : '') + c.delta : '—'}</td>
+      <td class="center">${dir}</td>
+      <td class="num">${c.points}</td>
+    </tr>`;
+  }).join('');
+
+  box.innerHTML = `
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">${esc(p.name || 'FIDE ' + (d.id || ''))}</span>
+        <span class="badge badge-blue">FIDE ${esc(d.id || '')}</span>
+      </div>
+      <p style="color:var(--c-text-muted);font-size:13px">Федерация: ${esc(p.federation || '—')} · Год рождения: ${ratingOrDash(p.birth_year)} · Лучший текущий: ${ratingOrDash(trend.best_current)}</p>
+      <div class="grid grid-3">
+        <div class="stat"><div class="stat-value">${ratingOrDash(p.standard)}</div><div class="stat-label">Классика</div></div>
+        <div class="stat"><div class="stat-value">${ratingOrDash(p.rapid)}</div><div class="stat-label">Рапид</div></div>
+        <div class="stat"><div class="stat-value">${ratingOrDash(p.blitz)}</div><div class="stat-label">Блиц</div></div>
+      </div>
+      ${summaryRows ? `<h3 style="font-size:14px;margin:8px 0">Тренд по контролем</h3>
+        <table class="table-wrap"><thead><tr><th>Контроль</th><th class="num">Сейчас</th><th class="num">Δ за окна</th><th class="center">Направление</th><th class="num">Периодов</th></tr></thead>
+        <tbody>${summaryRows}</tbody></table>` : ''}
+      ${winRows.length ? `<h3 style="font-size:14px;margin:16px 0 8px">Окна истории</h3>
+        <table class="table-wrap"><thead><tr><th>Контроль</th><th class="num">№</th><th class="num">Периодов</th><th>Период</th><th class="num">Было → стало</th><th class="num">Δ</th></tr></thead>
+        <tbody>${winRows.join('')}</tbody></table>` : '<p style="color:var(--c-text-muted)">История рейтингов пуста.</p>'}
+    </div>`;
 }
 
 async function viewUsers(app) {

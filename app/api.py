@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 import uuid
@@ -25,7 +26,19 @@ from .analyzer import Engine
 from .config import settings
 from .db import Database
 from .drills import drills_to_json, drills_to_pgn
+from .fide import (
+    TournamentGame,
+    build_fide_trend,
+    build_tournament_report,
+    fetch_fide_player,
+    fetch_fide_ratings,
+)
 from .games import fetch_user_games
+from .humanize import humanize_report
+from .maia import MaiaLitePolicy
+from .opponent import build_confrontations, build_opponent_profile
+from .paths import user_dir
+from .repertoire import Repertoire, opening_stats
 from .report import build_report
 
 # --- job registry ----------------------------------------------------------
@@ -41,6 +54,7 @@ class CoachJob:
     current: str = ""
     summary: str = ""
     error: str = ""
+    result: dict[str, Any] | None = None
     started: float = field(default_factory=time.time)
     finished: float | None = None
 
@@ -55,6 +69,7 @@ class CoachJob:
             "current": self.current,
             "summary": self.summary,
             "error": self.error,
+            "result": self.result,
             "started": self.started,
             "finished": self.finished,
         }
@@ -122,6 +137,137 @@ def _run_coach_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None:
     finally:
         job.finished = time.time()
 
+def _run_prepare_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None:
+    """Фоновый поток: его партии → анализ → профиль + точки встречи."""
+    try:
+        with Database(app.state.db_path) as db:
+            db.init_db()
+
+            your_pairs = db.get_analyzed_games(job.user, limit=500)
+            if not your_pairs:
+                raise RuntimeError(
+                    f"Нет твоих проанализированных партий для {job.user} — "
+                    "сначала запусти анализ на странице «Анализ»."
+                )
+
+            job.phase = "Загрузка партий соперника"
+            games = fetch_user_games(
+                params["opponent"],
+                since_ts=None,
+                max_games=params["max"],
+                perf=params["perf"],
+            )
+            db.save_games(games, params["opponent"])
+
+            qualified = [g for g in games if g.is_finished() and g.moves]
+            ids = [g.id for g in qualified]
+            unanalyzed = set(db.get_unanalyzed(ids)) if ids else set()
+            target = [g for g in qualified if g.id in unanalyzed]
+
+            job.total = len(target)
+            job.phase = "Анализ движком"
+
+            fresh: dict[str, dict[str, Any]] = {}
+            if target:
+                with Engine(
+                    depth=settings.stockfish_depth,
+                    multipv=settings.stockfish_multipv,
+                ) as engine:
+                    for i, game in enumerate(target, 1):
+                        summary = engine.analyze_game(game).summary()
+                        db.save_analysis(game.id, summary, depth=settings.stockfish_depth)
+                        fresh[game.id] = summary
+                        job.done = i
+                        job.current = game.id
+
+            job.phase = "Профиль соперника"
+            his_pairs: list[tuple[Any, dict[str, Any]]] = []
+            for game in qualified:
+                summary = fresh.get(game.id) or db.get_analysis(game.id)
+                if summary is not None:
+                    his_pairs.append((game, summary))
+            if not his_pairs:
+                raise RuntimeError("Нет партий соперника с анализом — готовиться не к чему.")
+
+            profile = build_opponent_profile(his_pairs, params["opponent"], top=8, color="both")
+            confrontations = build_confrontations(profile, your_pairs, top=8)
+            job.result = {
+                "profile": {k: v for k, v in profile.items() if k != "progress"},
+                "confrontations": confrontations,
+            }
+            job.status = "done"
+            job.summary = f"Партий соперника с анализом: {len(his_pairs)}"
+
+    except Exception as exc:
+        job.status = "error"
+        job.error = str(exc)
+    finally:
+        job.finished = time.time()
+
+def _run_humanize_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None:
+    """Фоновый поток: оценка человечности ошибок (MaiaLite) → humanity.json."""
+    try:
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            pairs = db.get_analyzed_games(job.user, limit=500)
+        if not pairs:
+            raise RuntimeError(
+                f"Нет проанализированных партий для {job.user} — сначала запусти анализ."
+            )
+
+        job.total = len(pairs)
+        job.phase = "Оценка человечности"
+        with MaiaLitePolicy() as policy:
+            report = humanize_report(pairs, policy, k=8)
+
+        out = user_dir(job.user, root=app.state.data_dir) / "humanity.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        job.result = _humanity_payload(report)
+        job.status = "done"
+        job.summary = f"Человечность посчитана: {job.result['summary']['total']} ошибок"
+
+    except Exception as exc:
+        job.status = "error"
+        job.error = str(exc)
+    finally:
+        job.finished = time.time()
+
+def _run_fide_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None:
+    """Фоновый поток: профиль + история рейтингов FIDE (сеть, кеш)."""
+    try:
+        nick = job.user or None
+
+        job.phase = "Загрузка профиля FIDE"
+        player = fetch_fide_player(params["id"], user=nick)
+
+        job.phase = "Загрузка истории рейтингов"
+        ratings = fetch_fide_ratings(params["id"], user=nick)
+        trend = build_fide_trend(ratings, windows=params["windows"])
+
+        job.result = {
+            "id": params["id"],
+            "player": {
+                "id": player.id,
+                "name": player.name,
+                "federation": player.federation,
+                "birth_year": player.birth_year,
+                "standard": player.standard,
+                "rapid": player.rapid,
+                "blitz": player.blitz,
+            },
+            "trend": trend,
+        }
+        job.status = "done"
+        job.summary = f"FIDE {params['id']}: {player.name or 'профиль получен'}"
+
+    except Exception as exc:
+        job.status = "error"
+        job.error = str(exc)
+    finally:
+        job.finished = time.time()
+
 # --- helpers ---------------------------------------------------------------
 
 def _current_user(db_path: Path) -> dict | None:
@@ -137,6 +283,22 @@ def _call_data(fn, db_path: Path):
             return fn(db)
     except RuntimeError as exc:
         raise HTTPException(404, str(exc)) from exc
+
+
+def _humanity_payload(raw: dict) -> dict:
+    """Читаемый срез humanity.json: сводка + все ошибки по порядку."""
+    verdicts = raw.get("verdicts") or {}
+    return {
+        "summary": {
+            "total": int(raw.get("total_bad") or 0),
+            "natural": int(verdicts.get("natural") or 0),
+            "borderline": int(verdicts.get("borderline") or 0),
+            "unnatural": int(verdicts.get("unnatural") or 0),
+            "no_data": int(verdicts.get("no-data") or 0),
+        },
+        "avg_beta": raw.get("avg_beta"),
+        "items": [item for item in (raw.get("items") or []) if isinstance(item, dict)],
+    }
 
 # --- API factory -----------------------------------------------------------
 
@@ -436,6 +598,156 @@ def create_api(
             lambda db: _game_detail_payload(db, user["nick"], game_id),
             app.state.db_path,
         )
+
+    # --- Tools: репертуар / соперник / человечность / турнир / FIDE ---
+    def _repertoire_payload(db, user: str, color: str, max_depth: int) -> dict:
+        pairs = shared_data.repertoire_pairs(db, user)
+        rep = Repertoire()
+        for game, analysis in pairs:
+            rep.add_game(game, analysis, max_depth=max_depth)
+        colors = ("white", "black") if color == "both" else (color,)
+        lines = []
+        weak: dict[str, int] = {}
+        for c in colors:
+            found = sorted(rep.lines(c, min_count=1), key=lambda line: -line.count)[:60]
+            lines.extend({"color": c, **shared_data.line_to_dict(line)} for line in found)
+            weak[c] = len(rep.weak_lines(c, min_count=1))
+        return {
+            "color": color,
+            "games": len(pairs),
+            "max_depth": max_depth,
+            "lines": lines,
+            "weak": weak,
+            "openings": opening_stats(pairs, user=user),
+        }
+
+    @app.get("/api/repertoire")
+    def api_repertoire(request: Request, color: str = "both", max_depth: int = 16):
+        if color not in ("white", "black", "both"):
+            raise HTTPException(400, "color должен быть white, black или both")
+        if not 1 <= max_depth <= 64:
+            raise HTTPException(400, "max_depth должен быть от 1 до 64")
+        user = _current_user(app.state.db_path)
+        if not user:
+            raise HTTPException(404, "No current user")
+        return _call_data(
+            lambda db: _repertoire_payload(db, user["nick"], color, max_depth),
+            app.state.db_path,
+        )
+
+    @app.post("/api/prepare/run")
+    def api_prepare_run(
+        request: Request,
+        opponent: str = Form(""),
+        max: int = Form(30),
+        perf: str = Form("rapid"),
+    ):
+        user = _current_user(app.state.db_path)
+        if not user:
+            raise HTTPException(404, "No current user")
+        opp = opponent.strip()
+        if not opp:
+            raise HTTPException(400, "Укажи ник соперника")
+        if not 1 <= max <= 200:
+            raise HTTPException(400, "max должен быть от 1 до 200")
+        job = CoachJob(
+            id=uuid.uuid4().hex,
+            user=user["nick"],
+            phase="Загрузка партий соперника",
+        )
+        _register_job(job)
+        params = {"opponent": opp, "max": max, "perf": perf}
+        threading.Thread(target=_run_prepare_job, args=(app, job, params), daemon=True).start()
+        return {"job_id": job.id, "status": "started"}
+
+    @app.get("/api/humanize")
+    def api_humanize(request: Request, refresh: str = ""):
+        user = _current_user(app.state.db_path)
+        if not user:
+            raise HTTPException(404, "No current user")
+        if refresh in ("1", "true", "on", "yes"):
+            job = CoachJob(
+                id=uuid.uuid4().hex,
+                user=user["nick"],
+                phase="Оценка человечности",
+            )
+            _register_job(job)
+            threading.Thread(
+                target=_run_humanize_job, args=(app, job, {}), daemon=True
+            ).start()
+            return {"job_id": job.id, "status": "started"}
+        path = shared_data.humanity_path(user["nick"], root=app.state.data_dir)
+        raw = shared_data.load_humanity_raw(path)
+        if not raw:
+            raise HTTPException(404, "Нет данных humanize — нажми «Посчитать»")
+        return _humanity_payload(raw)
+
+    @app.post("/api/tournament/run")
+    def api_tournament_run(
+        request: Request,
+        games: str = Form(""),
+        initial: str = Form(""),
+    ):
+        parsed: list[TournamentGame] = []
+        for spec in (line.strip() for line in games.splitlines()):
+            if not spec:
+                continue
+            parts = [part.strip() for part in spec.split(":")]
+            if len(parts) < 3 or not parts[0]:
+                raise HTTPException(
+                    400,
+                    f"Неверный формат партии: {spec!r} "
+                    "(ожидается ОППОНЕНТ:ЦВЕТ:РЕЗУЛЬТАТ[:РЕЙТИНГ_СОПЕРНИКА])",
+                )
+            opponent, color, result = parts[0], parts[1], parts[2]
+            opponent_rating = None
+            if len(parts) > 3 and parts[3]:
+                try:
+                    opponent_rating = int(parts[3])
+                except ValueError:
+                    raise HTTPException(400, f"Рейтинг соперника не число: {parts[3]!r}")
+            if color not in ("white", "black"):
+                raise HTTPException(400, f"Цвет должен быть white или black, получено: {color!r}")
+            if result not in ("win", "draw", "loss"):
+                raise HTTPException(400, f"Результат должен быть win/draw/loss, получено: {result!r}")
+            parsed.append(
+                TournamentGame(
+                    opponent=opponent,
+                    color=color,
+                    result=result,
+                    opponent_rating=opponent_rating,
+                )
+            )
+        if not parsed:
+            raise HTTPException(
+                400,
+                "Нет партий — построчно «Имя:white:win:2100», по одной партии на строку.",
+            )
+        initial_rating = None
+        if initial.strip():
+            try:
+                initial_rating = int(initial.strip())
+            except ValueError:
+                raise HTTPException(400, f"Инициал рейтинга — число: {initial!r}")
+        return build_tournament_report(parsed, initial_rating=initial_rating)
+
+    @app.post("/api/fide/run")
+    def api_fide_run(request: Request, id: str = Form(""), windows: int = Form(4)):
+        fide_id = id.strip()
+        if not fide_id:
+            raise HTTPException(400, "Укажи FIDE ID")
+        if not 1 <= windows <= 52:
+            raise HTTPException(400, "windows должен быть от 1 до 52")
+        user = _current_user(app.state.db_path)
+        job = CoachJob(
+            id=uuid.uuid4().hex,
+            user=user["nick"] if user else "",
+            phase="Загрузка профиля FIDE",
+        )
+        _register_job(job)
+        params = {"id": fide_id, "windows": windows}
+        threading.Thread(target=_run_fide_job, args=(app, job, params), daemon=True).start()
+        return {"job_id": job.id, "status": "started"}
 
     # Frontend static files — mounted LAST so /api/* routes take precedence.
     frontend_dir = Path(__file__).resolve().parent.parent / "frontend"

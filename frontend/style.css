@@ -178,6 +178,17 @@ h3 { font-size: 15px; font-weight: 600; margin-top: 16px; }
 }
 .form-group input:focus,
 .form-group select:focus { outline: none; border-color: var(--c-link); box-shadow: 0 0 0 2px rgba(54,146,231,0.15); }
+.form-group textarea {
+  width: 100%;
+  padding: 8px 12px;
+  border: 1px solid var(--c-border);
+  border-radius: 4px;
+  font-size: 13px;
+  background: var(--c-bg-box);
+  color: var(--c-text);
+  resize: vertical;
+}
+.form-group textarea:focus { outline: none; border-color: var(--c-link); box-shadow: 0 0 0 2px rgba(54,146,231,0.15); }
 .form-row { display: flex; gap: 16px; flex-wrap: wrap; }
 .form-row .form-group { flex: 1; min-width: 180px; }
 
