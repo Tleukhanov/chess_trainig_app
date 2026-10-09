@@ -972,6 +972,37 @@ class TaskApiTests(ApiTestBase):
             stored = db.get_meta(f"daily_task_{data['date']}_tester")
         self.assertEqual(stored, data["task_key"])
 
+    # --- legal ---
+
+    def test_legal_moves(self):
+        self._seed_tasks()
+        today = self.client.get("/api/task/today").json()
+        resp = self.client.get("/api/task/legal")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["task_key"], today["task_key"])
+        self.assertEqual(data["fen"], today["fen"])
+        self.assertTrue(data["moves"])
+        board = chess.Board(data["fen"])
+        valid = set(chess.SQUARE_NAMES)
+        for m in data["moves"]:
+            self.assertIn(m["from"], valid)
+            self.assertIn(m["to"], valid)
+            board.parse_san(m["san"])
+        self.assertIn(today["best_san"], [m["san"] for m in data["moves"]])
+
+    def test_legal_no_user_404(self):
+        self._seed_tasks()
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.clear_current_user()
+        self.assertEqual(self.client.get("/api/task/legal").status_code, 404)
+
+    def test_legal_no_errors_404(self):
+        self._seed_user("tester", "t")  # анализ без ошибок
+        self._set_current("tester")
+        self.assertEqual(self.client.get("/api/task/legal").status_code, 404)
+
     # --- answer ---
 
     def test_answer_wrong_move(self):

@@ -345,12 +345,43 @@ async function viewPlan(app) {
     return;
   }
   const plan = await api('/api/plan');
+  const [taskToday, track, report] = await Promise.all([
+    api('/api/task/today').catch(() => null),
+    api('/api/track/today').catch(() => null),
+    api('/api/report').catch(() => null),
+  ]);
+
+  let todayHtml = '';
+  if (taskToday || track || report) {
+    const rows = [];
+    if (taskToday) {
+      const done = !!taskToday.done;
+      rows.push(`<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:6px 0"><span class="badge ${done ? 'badge-good' : 'badge-neutral'}">${done ? 'выполнено' : 'осталось'}</span><span style="flex:1;min-width:180px">Задача дня${done ? ' — решена' : ' — не решена'}</span><button class="btn btn-secondary" data-plan-act="task" style="font-size:12px;padding:4px 10px">Открыть</button></div>`);
+    }
+    if (track) {
+      rows.push(`<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:6px 0"><span class="badge badge-blue">время</span><span style="flex:1;min-width:180px">Время сегодня: ${_fmtDur(track.total_sec)}</span><button class="btn btn-secondary" data-plan-act="users" style="font-size:12px;padding:4px 10px">Профили</button></div>`);
+    }
+    if (plan && plan.drills) {
+      const un = Number(plan.drills.unnatural) || 0;
+      const total = Number(plan.drills.total) || 0;
+      const clean = un === 0;
+      rows.push(`<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:6px 0"><span class="badge ${clean ? 'badge-good' : 'badge-neutral'}">${clean ? 'чисто' : 'повторить'}</span><span style="flex:1;min-width:180px">${clean ? 'Дрели: неестественных нет' : `Повторить ${un} неестественных из ${total}`}</span><button class="btn btn-secondary" data-plan-act="drills" style="font-size:12px;padding:4px 10px">Дрели</button></div>`);
+    }
+    const worst = report && report.worst_games && report.worst_games[0];
+    if (worst) {
+      rows.push(`<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:6px 0"><span class="badge badge-bad">разобрать</span><span style="flex:1;min-width:180px">Разобрать: ${esc(worst.opponent || '—')} (${esc(String(worst.game_id).slice(0, 8))}…)</span><button class="btn btn-secondary" data-plan-act="worst" data-game-id="${esc(worst.game_id)}" style="font-size:12px;padding:4px 10px">Открыть</button></div>`);
+    }
+    if (rows.length) {
+      todayHtml = `<div class="card"><div class="card-header"><span class="card-title">План на сегодня</span></div>${rows.join('')}</div>`;
+    }
+  }
 
   const scorePct = plan.score_pct != null ? plan.score_pct.toFixed(1) + '%' : '—';
   const avgWinLoss = plan.avg_win_loss != null ? plan.avg_win_loss.toFixed(2) : '—';
 
   app.innerHTML = `
     <div class="card-header"><h1>План тренировки</h1><span class="badge badge-blue">${esc(state.user.nick)}</span></div>
+    ${todayHtml}
     <div class="grid grid-4">
       <div class="card stat"><div class="stat-value">${plan.games}</div><div class="stat-label">Партий</div></div>
       <div class="card stat"><div class="stat-value">${scorePct}</div><div class="stat-label">Счёт</div></div>
@@ -382,6 +413,23 @@ async function viewPlan(app) {
       <div class="card-header"><span class="card-title">Человечность ошибок</span></div>
       ${plan.humanity ? `<div class="grid grid-4"><div class="stat"><div class="stat-value">${plan.humanity.total}</div><div class="stat-label">Всего</div></div><div class="stat"><div class="stat-value">${plan.humanity.natural}</div><div class="stat-label">Естественные</div></div><div class="stat"><div class="stat-value">${plan.humanity.borderline}</div><div class="stat-label">Пограничные</div></div><div class="stat"><div class="stat-value">${plan.humanity.unnatural}</div><div class="stat-label">Неестественные</div></div></div><div style="margin-top:8px"><strong>Доля неестественных: </strong>${plan.humanity.unnatural_share_pct.toFixed(1)}%</div>` : '<p style="color:var(--c-text-muted)">Нет данных humanize.</p>'}
     </div>`;
+
+  app.querySelectorAll('[data-plan-act]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const act = btn.dataset.planAct;
+      if (act === 'task') navigate('task');
+      else if (act === 'users') navigate('users');
+      else if (act === 'drills') navigate('drills');
+      else if (act === 'worst' && btn.dataset.gameId) {
+        state.gameId = btn.dataset.gameId;
+        state.currentView = 'games';
+        document.querySelectorAll('#nav a').forEach(a => {
+          a.classList.toggle('active', a.dataset.view === 'games');
+        });
+        viewGames(app);
+      }
+    });
+  });
 }
 
 async function viewProgress(app) {
@@ -685,7 +733,7 @@ function boardHtml(fen, hlSquares) {
       const cls = ['sq', light ? 'light' : 'dark'];
       if (hl.includes(square)) cls.push('lm');
       const piece = pieces[square];
-      html += `<div class="${cls.join(' ')}">${piece ? `<span class="piece">${PIECE_GLYPHS[piece]}</span>` : ''}</div>`;
+      html += `<div class="${cls.join(' ')}" data-square="${square}">${piece ? `<span class="piece">${PIECE_GLYPHS[piece]}</span>` : ''}</div>`;
     }
   }
   return `<div class="board">${html}</div>`;
@@ -899,6 +947,11 @@ function drawTask(app) {
     ? `<div class="card"><div class="card-header"><span class="card-title">Почему так</span></div><div class="mentor-reply">${esc(state.taskExplanation)}</div></div>`
     : '';
 
+  const revealedNoAnswer = state.taskRevealed && !state.taskResult && !task.done;
+  const revealedExplainHtml = (revealedNoAnswer && !state.taskExplanation)
+    ? `<div class="card"><div class="card-header"><span class="card-title">Объяснение LLM</span></div>${taskExplainControlsHtml()}</div>`
+    : '';
+
   app.innerHTML = `
     <div class="card-header"><h1>Задача дня</h1><span class="badge badge-blue">${esc(state.user.nick)}</span></div>
     <div class="grid game-layout">
@@ -910,11 +963,13 @@ function drawTask(app) {
           <span class="badge badge-neutral">ты: ${colorLabel}</span>
           ${clsBadge}
         </div>
+        ${answered ? '' : '<div style="color:var(--c-text-muted);font-size:13px;margin-top:8px">кликни фигуру, затем клетку — или введи ход текстом</div>'}
       </div>
       <div class="game-side">
         ${state.taskError ? `<div class="alert alert-error">${esc(state.taskError)}</div>` : ''}
         ${panel}
         ${state.taskRevealed ? taskSolutionHtml(task) : ''}
+        ${revealedExplainHtml}
         ${explanationHtml}
       </div>
     </div>`;
@@ -937,13 +992,52 @@ function drawTask(app) {
   }
   const explainBtn = document.getElementById('task-explain');
   if (explainBtn) explainBtn.addEventListener('click', () => taskExplain(app));
+  if (!state.taskResult && !task.done) {
+    api('/api/task/legal').then(legal => {
+      if (!legal || !state.task || legal.task_key !== state.task.task_key) return;
+      if (state.taskResult || state.task.done) return;
+      const moves = (legal.moves || []).filter(m => m && m.from && m.to && m.san);
+      if (!moves.length) return;
+      const squares = app.querySelectorAll('.sq[data-square]');
+      if (!squares.length) return;
+      let selected = null;
+      const clearHl = () => squares.forEach(sq => sq.classList.remove('lm'));
+      squares.forEach(sq => {
+        sq.addEventListener('click', () => {
+          const sqName = sq.dataset.square;
+          if (selected) {
+            const targets = moves.filter(m => m.from === selected);
+            const cands = targets.filter(m => m.to === sqName);
+            if (cands.length) {
+              const pick = cands.find(m => (m.san || '').includes('=Q')) || cands[0];
+              submitTaskAnswer(app, pick.san);
+              return;
+            }
+          }
+          if (moves.some(m => m.from === sqName)) {
+            if (selected === sqName) {
+              selected = null;
+              clearHl();
+              return;
+            }
+            selected = sqName;
+            clearHl();
+            const goals = new Set(moves.filter(m => m.from === sqName).map(m => m.to));
+            squares.forEach(el => {
+              if (el.dataset.square === sqName || goals.has(el.dataset.square)) el.classList.add('lm');
+            });
+            return;
+          }
+          selected = null;
+          clearHl();
+        });
+      });
+    }).catch(() => {});
+  }
 }
 
-async function onTaskAnswer(e) {
-  e.preventDefault();
-  const app = document.getElementById('app');
-  const input = document.getElementById('task-answer');
-  const answer = (input ? input.value : state.taskAnswerText).trim();
+async function submitTaskAnswer(app, san) {
+  const answer = String(san == null ? '' : san).trim();
   if (!answer) return;
   state.taskAnswerText = answer;
   state.taskError = null;
@@ -958,6 +1052,13 @@ async function onTaskAnswer(e) {
     state.taskError = err.message;
   }
   drawTask(app);
+}
+
+async function onTaskAnswer(e) {
+  e.preventDefault();
+  const app = document.getElementById('app');
+  const input = document.getElementById('task-answer');
+  await submitTaskAnswer(app, input ? input.value : state.taskAnswerText);
 }
 
 async function taskExplain(app) {
@@ -1068,11 +1169,21 @@ async function viewCoach(app) {
 
   document.getElementById('coach-form').addEventListener('submit', async e => {
     e.preventDefault();
+    const btn = e.target.querySelector('button[type="submit"]');
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = 'Запущено…';
+    }
     const fd = new FormData(e.target);
     try {
       const result = await apiPost('/api/coach/run', fd);
       showJob(app, result.job_id);
+      document.getElementById('job-container').scrollIntoView({ behavior: 'smooth', block: 'start' });
     } catch (err) {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = 'Запустить';
+      }
       document.getElementById('job-container').innerHTML = `<div class="alert alert-error">${esc(err.message)}</div>`;
     }
   });
@@ -1085,6 +1196,17 @@ async function viewCoach(app) {
       if (running) showJob(app, running.id);
     }
   } catch { /* ignore */ }
+}
+
+function unlockCoachButton() {
+  try {
+    const form = document.getElementById('coach-form');
+    const btn = form && form.querySelector('button[type="submit"]');
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = 'Запустить';
+    }
+  } catch { /* форма уже не на странице */ }
 }
 
 function showJob(app, jobId) {
@@ -1118,10 +1240,12 @@ function showJob(app, jobId) {
       }
       if (j.status === 'done') {
         clearInterval(state.jobPollTimer);
+        unlockCoachButton();
         document.getElementById('job-summary').innerHTML = `<div class="alert alert-success" style="margin-top:12px">${esc(j.summary)}</div>`;
         setTimeout(() => navigate('coach'), 1500);
       } else if (j.status === 'error') {
         clearInterval(state.jobPollTimer);
+        unlockCoachButton();
       }
     } catch { clearInterval(state.jobPollTimer); }
   }, 1000);

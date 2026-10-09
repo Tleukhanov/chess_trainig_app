@@ -1378,6 +1378,31 @@ def create_api(
         ).start()
         return {"cached": False, "job_id": job.id, "status": "started"}
 
+    @app.get("/api/task/legal")
+    def api_task_legal(request: Request):
+        user = _current_user(app.state.db_path)
+        if not user:
+            raise HTTPException(404, "No current user")
+
+        def _legal(db: Database) -> dict[str, Any]:
+            payload = _task_payload(db, user["nick"])
+            board = chess.Board(payload["fen"])
+            moves = [
+                {
+                    "from": chess.square_name(m.from_square),
+                    "to": chess.square_name(m.to_square),
+                    "san": board.san(m),
+                }
+                for m in board.legal_moves
+            ]
+            return {
+                "task_key": payload["task_key"],
+                "fen": payload["fen"],
+                "moves": moves,
+            }
+
+        return _call_data(_legal, app.state.db_path)
+
     # --- Мини-трекер времени ---
     @app.post("/api/track/ping")
     def api_track_ping(request: Request):
