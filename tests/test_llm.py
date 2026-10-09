@@ -7,7 +7,13 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from app.llm import ChatMessage, LLMClient, build_completion_url
+from app.llm import (
+    ChatMessage,
+    LLMClient,
+    build_completion_url,
+    clean_llm_text,
+    looks_like_thinking,
+)
 
 _OK_BODY = json.dumps({"choices": [{"message": {"content": "OK"}}]}).encode("utf-8")
 
@@ -170,6 +176,51 @@ class LLMClientTests(unittest.TestCase):
             build_completion_url("http://127.0.0.1:8000/v1/chat/completions/"),
             "http://127.0.0.1:8000/v1/chat/completions",
         )
+
+
+class ThinkFilterTests(unittest.TestCase):
+    """clean_llm_text / looks_like_thinking — чистые функции без сети."""
+
+    def test_clean_removes_think_block(self) -> None:
+        self.assertEqual(
+            clean_llm_text("<think>secret reasoning</think>Ответ тренера."),
+            "Ответ тренера.",
+        )
+
+    def test_clean_case_insensitive_multiline(self) -> None:
+        raw = "<THINK>\nline1\nline2\n</THINK>\n  Текст   с   пробелами  "
+        self.assertEqual(clean_llm_text(raw), "Текст с пробелами")
+
+    def test_clean_thinking_and_thought_variants(self) -> None:
+        raw = "До <thinking>мусор</thinking> середина <thought>x</thought> после."
+        self.assertEqual(clean_llm_text(raw), "До середина после.")
+
+    def test_clean_plain_text_keeps_newlines(self) -> None:
+        raw = "Строка один.\nСтрока два."
+        self.assertEqual(clean_llm_text(raw), raw)
+
+    def test_clean_non_string_returns_empty(self) -> None:
+        self.assertEqual(clean_llm_text(None), "")  # type: ignore[arg-type]
+
+    def test_looks_like_thinking_true(self) -> None:
+        garbage = (
+            "Here's a thinking process: 1. Analyze User Input. "
+            "Facts from data. Constraints: blunder. Step 1: My move Rh1."
+        )
+        self.assertTrue(looks_like_thinking(garbage))
+
+    def test_looks_like_thinking_false_for_normal_russian(self) -> None:
+        good = (
+            "Твой ход Bb5 — ошибка: поле c4 осталось без контроля. "
+            "Лучше было Bc4 с давлением на центр. "
+            "В похожих позициях сначала считай ответы соперника."
+        )
+        self.assertFalse(looks_like_thinking(good))
+
+    def test_looks_like_thinking_false_for_few_markers(self) -> None:
+        # Один-два маркера — ещё не разбор (предсказуемый порог >=3).
+        self.assertFalse(looks_like_thinking("Step 1: разбери позицию."))
+        self.assertFalse(looks_like_thinking(""))
 
 
 if __name__ == "__main__":

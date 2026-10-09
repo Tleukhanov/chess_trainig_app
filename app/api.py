@@ -39,7 +39,7 @@ from .fide import (
 )
 from .games import fetch_user_games
 from .humanize import humanize_report
-from .llm import ChatMessage, LLMClient, _is_local_host
+from .llm import ChatMessage, LLMClient, _is_local_host, clean_llm_text, looks_like_thinking
 from .maia import MaiaLitePolicy
 from .mentor import build_mentor_request, format_mentor_reply, run_mentor
 from .metrics import metric
@@ -393,6 +393,11 @@ def _run_review_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None
             moments, summary = run_coach(
                 game, analysis, llm, max_moments=params["moments"]
             )
+            moments = {
+                ply: clean_llm_text(text) for ply, text in moments.items()
+            }
+            if summary:
+                summary = clean_llm_text(summary)
             games.append(_review_entry(game, analysis, idx, moments, summary))
 
         job.result = {"games": games}
@@ -466,7 +471,7 @@ def _run_mentor_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None
                 "user": plan_report.get("user"),
                 "model": llm.model,
                 "notes": params.get("notes") or "",
-                "reply": format_mentor_reply(reply),
+                "reply": format_mentor_reply(clean_llm_text(reply)),
             }
             job.summary = f"План тренера по {plan_report.get('games', 0)} партиям"
         job.status = "done"
@@ -542,7 +547,8 @@ _TASK_ERROR_CLASSES = ("blunder", "mistake")
 
 _TASK_EXPLAIN_SYSTEM = """Ты — шахматный тренер сильного любителя. Говори по-русски, коротко и конкретно.
 Опирайся ТОЛЬКО на переданные факты: сыгранный ход, лучший ход движка, оценки win%,
-классификацию и контекст ходов. НЕ выдумывай варианты, угрозы и оценки, которых нет в данных."""
+классификацию и контекст ходов. НЕ выдумывай варианты, угрозы и оценки, которых нет в данных.
+Отвечай СРАЗУ готовым объяснением, без промежуточного разбора. Только русский язык. 3–5 коротких предложений, живым тоном тренера: 1) что за ошибка, 2) почему сыгранный ход плох, 3) идея лучшего хода, 4) на что смотреть в похожих позициях. Не выдумывай варианты и угрозы вне данных. Никакого английского."""
 
 
 def _today() -> str:
@@ -636,6 +642,11 @@ def _task_payload(db: Database, user: str, date: str | None = None) -> dict[str,
     ply = item["ply"]
     best = str(move.get("best_move_san"))
     explanation = db.get_task_explanation(item["task_key"])
+    if explanation is not None and looks_like_thinking(explanation):
+        # Отравленный кэш (reasoning-разбор вместо ответа): игнорируем,
+        # кнопка «Объяснить» снова доступна, успешный повтор перезапишет
+        # мусор через UPSERT save_task_explanation. Строки из БД не удаляем.
+        explanation = None
     return {
         "date": day,
         "task_key": item["task_key"],
@@ -691,7 +702,8 @@ def _task_explain_messages(payload: dict[str, Any]) -> list[ChatMessage]:
         + (f"; его продолжение: {' '.join(line)}" if line else "")
         + ".",
         "Объясни по-русски в 3-5 предложений: в чём ошибка моего хода, какую идею "
-        "или угрозу я не увидел и о чём думать в похожих позициях. Только факты из данных выше.",
+        "или угрозу я не увидел и о чём думать в похожих позициях. Только факты из данных выше. "
+        "Ответ — только объяснение, без разбора по шагам.",
     ]
     return [
         ChatMessage("system", _TASK_EXPLAIN_SYSTEM),
@@ -700,12 +712,335 @@ def _task_explain_messages(payload: dict[str, Any]) -> list[ChatMessage]:
 
 
 def _task_explain_llm(payload: dict[str, Any]) -> str:
-    """Один вызов LLM для объяснения задачи; возвращает текст без обёртки."""
+    """Один вызов LLM для объяснения задачи (с повтором при thinking-мусоре).
+
+    thinking-блоки вырезаются, служебный разбор вместо ответа — это ошибка
+    (job уйдёт в error, а не сохранит мусор в БД).
+    """
     llm = LLMClient()
-    text = llm.chat(
-        _task_explain_messages(payload), temperature=0.4, max_tokens=700
+    messages = _task_explain_messages(payload)
+    text = clean_llm_text(llm.chat(messages, temperature=0.4, max_tokens=800))
+    if text and not looks_like_thinking(text):
+        return text
+    retry = [
+        messages[0],
+        ChatMessage(
+            "user",
+            messages[1].content + "\nБез разбора. Сразу объяснение по-русски.",
+        ),
+    ]
+    second = clean_llm_text(llm.chat(retry, temperature=0.4, max_tokens=800))
+    if not second or looks_like_thinking(second):
+        raise RuntimeError("LLM вернул служебный разбор вместо объяснения")
+    return second
+
+# --- Цель и недельный план ------------------------------------------------
+
+_PLAN_GOAL_FOCUSES = ("auto", "opening", "middlegame", "endgame")
+_PLAN_FOCUS_RU = {
+    "opening": "дебют",
+    "middlegame": "миттельшпиль",
+    "endgame": "эндшпиль",
+}
+# Фазы в build_plan/build_report: opening | midgame | endgame.
+_INTERNAL_TO_PUBLIC_PHASE = {
+    "opening": "opening",
+    "midgame": "middlegame",
+    "endgame": "endgame",
+}
+_PLAN_GOAL_DEFAULT_MINUTES = 30
+
+
+def _plan_goal_key(nick: str) -> str:
+    """Ключ meta с целью игрока (JSON)."""
+    return f"plan_goal_{nick}"
+
+
+def _load_plan_goal(db: Database, nick: str) -> dict[str, Any]:
+    """Цель из meta: {"goal": str|None, "minutes": int, "focus": str}.
+
+    Битый/частичный JSON чинится дефолтами, исключения не выбрасываются.
+    """
+    result: dict[str, Any] = {
+        "goal": None,
+        "minutes": _PLAN_GOAL_DEFAULT_MINUTES,
+        "focus": "auto",
+    }
+    raw = db.get_meta(_plan_goal_key(nick))
+    if not raw:
+        return result
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return result
+    if not isinstance(data, dict):
+        return result
+    goal = data.get("goal")
+    if isinstance(goal, str) and goal.strip():
+        result["goal"] = goal.strip()[:200]
+    minutes = data.get("minutes")
+    if isinstance(minutes, bool):
+        pass
+    elif isinstance(minutes, (int, float)) and 5 <= int(minutes) <= 480:
+        result["minutes"] = int(minutes)
+    focus = data.get("focus")
+    if isinstance(focus, str) and focus in _PLAN_GOAL_FOCUSES:
+        result["focus"] = focus
+    return result
+
+
+def _week_phases(plan: dict[str, Any] | None) -> list[tuple[str, dict[str, Any]]]:
+    """Фазы ошибок из плана как [(публичная фаза, статистика)].
+
+    Принимает и формат build_plan (список пар), и build_report (словарь).
+    Внутренний 'midgame' отдаётся наружу как 'middlegame'.
+    """
+    if not isinstance(plan, dict):
+        return []
+    raw = (plan.get("patterns") or {}).get("phases")
+    if isinstance(raw, dict):
+        raw = list(raw.items())
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for entry in raw:
+        if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+            continue
+        name, stats = entry
+        public = _INTERNAL_TO_PUBLIC_PHASE.get(name)
+        if public is None or not isinstance(stats, dict):
+            continue
+        out.append((public, stats))
+    return out
+
+
+def _resolve_week_focus(
+    goal: dict[str, Any], plan: dict[str, Any] | None
+) -> tuple[str, str]:
+    """Фаза фокуса недели + человеческое обоснование с цифрами.
+
+    Явный фокус цели побеждает; иначе — слабейшая фаза по avg_drop;
+    без данных — 'middlegame' по умолчанию.
+    """
+    phases = _week_phases(plan)
+    by_phase = {name: stats for name, stats in phases}
+    wanted = goal.get("focus") or "auto"
+    if wanted != "auto":
+        stats = by_phase.get(wanted)
+        if stats:
+            count = int(stats.get("count") or 0)
+            avg = float(stats.get("avg_drop") or 0.0)
+            return wanted, f"твой выбор; {count} ошибок, средняя потеря {avg:.1f}%"
+        return wanted, "выбран тобой в цели"
+    if phases:
+        name, stats = max(
+            phases, key=lambda item: float((item[1] or {}).get("avg_drop") or 0.0)
+        )
+        count = int(stats.get("count") or 0)
+        avg = float(stats.get("avg_drop") or 0.0)
+        return name, f"{count} ошибок, средняя потеря {avg:.1f}%"
+    return "middlegame", "нет данных анализа — взят миттельшпиль по умолчанию"
+
+
+def _week_drills_portion(unnatural: int) -> int:
+    """Дневная порция дрелей: min(20, max(5, ceil(unnatural/7)))."""
+    portion = (max(0, int(unnatural)) + 6) // 7
+    return min(20, max(5, portion))
+
+
+def _build_week_tasks(
+    minutes: int,
+    unnatural: int,
+    weak_opening: dict[str, Any] | None,
+    focus_phase: str,
+    focus_reason: str,
+) -> list[dict[str, str]]:
+    """Детерминированный список задач на неделю (ключи key/text/detail)."""
+    portion = _week_drills_portion(unnatural)
+    phase_ru = _PLAN_FOCUS_RU.get(focus_phase, focus_phase)
+    tasks = [
+        {
+            "key": "daily-task",
+            "text": "Решай задачу дня каждый день (7 из 7)",
+            "detail": "задача дня ×7: ни дня без тактики",
+        },
+        {
+            "key": "drills",
+            "text": f"Реши {portion} дрелей в день",
+            "detail": f"{unnatural} неестественных ошибок за неделю — по {portion} в день",
+        },
+    ]
+    if weak_opening:
+        name = str(weak_opening.get("opening") or "—")
+        epg = weak_opening.get("errors_per_game")
+        epg_txt = f"{float(epg):.2f}" if isinstance(epg, (int, float)) else "—"
+        tasks.append(
+            {
+                "key": "opening",
+                "text": f"Разобрать 2 партии в дебюте «{name}»",
+                "detail": f"худший дебют: {epg_txt} ошибок на партию",
+            }
+        )
+    else:
+        tasks.append(
+            {
+                "key": "opening",
+                "text": "Разобрать 2 партии в слабейшем дебюте",
+                "detail": "нет данных по дебютам — возьми любые 2 проигранные",
+            }
+        )
+    tasks.append(
+        {
+            "key": "phase",
+            "text": f"Разобрать 3 партии с ошибками в {phase_ru}",
+            "detail": f"фокус недели: {phase_ru} ({focus_reason})",
+        }
     )
-    return text.strip()
+    tasks.append(
+        {
+            "key": "time",
+            "text": f"Занимайся {minutes} мин в день ({minutes * 7} мин за неделю)",
+            "detail": "время из твоей цели: минута в день лучше часа раз в неделю",
+        }
+    )
+    return tasks
+
+
+def _build_human_summary(
+    focus_phase: str,
+    phases: list[tuple[str, dict[str, Any]]],
+    weak_opening: dict[str, Any] | None,
+    humanity: dict[str, Any] | None,
+    drills_today: int,
+) -> str:
+    """Человеческий итог недели шаблонами, без LLM (3–5 предложений)."""
+    phase_ru = _PLAN_FOCUS_RU.get(focus_phase, focus_phase)
+    parts: list[str] = []
+    stats = dict(phases).get(focus_phase) if phases else None
+    if stats:
+        count = int(stats.get("count") or 0)
+        avg = float(stats.get("avg_drop") or 0.0)
+        parts.append(
+            f"Главная дыра — {phase_ru}: {count} ошибок, средняя потеря {avg:.1f}%."
+        )
+    else:
+        parts.append(f"На неделе качаем {phase_ru}: данных пока мало, собираем базу.")
+    if weak_opening:
+        name = str(weak_opening.get("opening") or "—")
+        epg = weak_opening.get("errors_per_game")
+        epg_txt = f"{float(epg):.2f}" if isinstance(epg, (int, float)) else "—"
+        parts.append(f"Худший дебют — {name}: {epg_txt} ошибок на партию.")
+    total = 0
+    unnatural = 0
+    if isinstance(humanity, dict):
+        total = int(humanity.get("total") or 0)
+        unnatural = int(humanity.get("unnatural") or 0)
+    share = round(unnatural / total * 100, 1) if total else 0.0
+    if share >= 40.0:
+        parts.append(
+            f"Много случайных ходов — {share}% неестественных из {total}: "
+            "играй медленнее, считай до конца."
+        )
+    else:
+        parts.append(
+            f"Ошибки в основном естественные ({share}% неестественных из {total}) — "
+            "работаем над счётом."
+        )
+    parts.append(
+        f"Вывод на неделю: качаем {phase_ru} — {drills_today} дрелей в день "
+        "плюс разбор партий из списка выше."
+    )
+    return " ".join(parts)
+
+
+def _plan_week_payload(db: Database, nick: str, data_dir: Any) -> dict[str, Any]:
+    """JSON для /api/plan/week: цель + детерминированный план из живых данных.
+
+    Каждый источник обёрнут в try/except и деградирует в null/дефолт,
+    а не в 404 — неделя строится из того, что есть.
+    """
+    goal = _load_plan_goal(db, nick)
+    minutes = int(goal["minutes"])
+
+    plan: dict[str, Any] | None = None
+    try:
+        plan = shared_data.plan(db, nick, root=data_dir)
+    except RuntimeError:
+        plan = None
+    report: dict[str, Any] | None = None
+    try:
+        report = shared_data.report(db, nick)
+    except RuntimeError:
+        report = None
+    _ = report  # тот же билдер, что /api/report: держим вызов ради живых данных
+
+    phases = _week_phases(plan)
+    focus_phase, focus_reason = _resolve_week_focus(goal, plan)
+
+    weak_openings = []
+    if isinstance(plan, dict):
+        weak_openings = (plan.get("repertoire") or {}).get("weak_openings") or []
+    weak_opening = weak_openings[0] if weak_openings else None
+
+    drills_total = 0
+    unnatural = 0
+    humanity = None
+    if isinstance(plan, dict):
+        drills = plan.get("drills") or {}
+        try:
+            drills_total = int(drills.get("total") or 0)
+        except (TypeError, ValueError):
+            drills_total = 0
+        try:
+            unnatural = int(drills.get("unnatural") or 0)
+        except (TypeError, ValueError):
+            unnatural = 0
+        humanity = plan.get("humanity")
+    drills_today = _week_drills_portion(unnatural)
+
+    try:
+        task = _task_payload(db, nick)
+        task_done: bool | None = bool(task.get("done"))
+    except RuntimeError:
+        task_done = None
+
+    day = _today()
+    now = _now()
+    try:
+        track_state = _track_state(db, _track_key(day, nick))
+        manual_sec = _manual_seconds(db, _lichess_manual_key(day, nick))
+        games = db.get_games(nick, limit=100_000)
+        site_sec = 0.0
+        if track_state is not None:
+            site_sec = track_state["total"] + max(
+                0.0, min(now - track_state["last"], 60.0)
+            )
+        lichess_sec = 0.0
+        for game in games:
+            if time.strftime("%Y-%m-%d", time.localtime(game.created_at / 1000)) != day:
+                continue
+            lichess_sec += _clock_seconds(game.clocks)
+        time_sec = int(site_sec + lichess_sec + manual_sec)
+    except (ValueError, TypeError, OSError):
+        time_sec = 0
+
+    return {
+        "goal": goal["goal"],
+        "minutes_per_day": minutes,
+        "focus": {"phase": focus_phase, "reason": focus_reason},
+        "week_tasks": _build_week_tasks(
+            minutes, unnatural, weak_opening, focus_phase, focus_reason
+        ),
+        "today": {
+            "task_done": task_done,
+            "time_sec": time_sec,
+            "drills_today": drills_today,
+            "drills_total": drills_total,
+        },
+        "human_summary": _build_human_summary(
+            focus_phase, phases, weak_opening, humanity, drills_today
+        ),
+    }
 
 # --- Мини-трекер времени ---------------------------------------------------
 
@@ -955,6 +1290,54 @@ def create_api(
         if not rep:
             raise HTTPException(404, "No report")
         return rep
+
+    @app.get("/api/plan/goal")
+    def api_plan_goal_get(request: Request):
+        user = _current_user(app.state.db_path)
+        if not user:
+            raise HTTPException(404, "No current user")
+        with Database(app.state.db_path) as db:
+            return _load_plan_goal(db, user["nick"])
+
+    @app.post("/api/plan/goal")
+    def api_plan_goal_set(
+        request: Request,
+        goal: str = Form(""),
+        minutes: str = Form(""),
+        focus: str = Form(""),
+    ):
+        user = _current_user(app.state.db_path)
+        if not user:
+            raise HTTPException(404, "No current user")
+        text = goal.strip()
+        if not 1 <= len(text) <= 200:
+            raise HTTPException(400, "Цель: от 1 до 200 символов")
+        try:
+            mins = int(str(minutes).strip())
+        except (TypeError, ValueError):
+            raise HTTPException(400, "Минуты: целое число от 5 до 480") from None
+        if not 5 <= mins <= 480:
+            raise HTTPException(400, "Минуты: целое число от 5 до 480")
+        focus_clean = focus.strip()
+        if focus_clean not in _PLAN_GOAL_FOCUSES:
+            raise HTTPException(
+                400, f"Фокус: один из {', '.join(_PLAN_GOAL_FOCUSES)}"
+            )
+        saved = {"goal": text, "minutes": mins, "focus": focus_clean}
+        with Database(app.state.db_path) as db:
+            db.set_meta(
+                _plan_goal_key(user["nick"]),
+                json.dumps(saved, ensure_ascii=False),
+            )
+        return {"ok": True, **saved}
+
+    @app.get("/api/plan/week")
+    def api_plan_week(request: Request):
+        user = _current_user(app.state.db_path)
+        if not user:
+            raise HTTPException(404, "No current user")
+        with Database(app.state.db_path) as db:
+            return _plan_week_payload(db, user["nick"], app.state.data_dir)
 
     # --- Coach / Analysis jobs ---
     @app.post("/api/coach/run")
@@ -1363,8 +1746,9 @@ def create_api(
         payload = _call_data(
             lambda db: _task_payload(db, user["nick"]), app.state.db_path
         )
-        if payload.get("explanation"):
-            return {"cached": True, "explanation": payload["explanation"]}
+        cached = payload.get("explanation")
+        if cached and not looks_like_thinking(cached):
+            return {"cached": True, "explanation": cached}
         job = CoachJob(
             id=uuid.uuid4().hex,
             user=user["nick"],

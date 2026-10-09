@@ -345,11 +345,62 @@ async function viewPlan(app) {
     return;
   }
   const plan = await api('/api/plan');
-  const [taskToday, track, report] = await Promise.all([
+  const [taskToday, track, report, goalData, weekData] = await Promise.all([
     api('/api/task/today').catch(() => null),
     api('/api/track/today').catch(() => null),
     api('/api/report').catch(() => null),
+    api('/api/plan/goal').catch(() => null),
+    api('/api/plan/week').catch(() => null),
   ]);
+
+  const focusRu = { auto: 'авто', opening: 'дебют', middlegame: 'миттельшпиль', endgame: 'эндшпиль' };
+  const goalFormHtml = (goal, minutes, focus) => `
+    <form id="plan-goal-form" class="form-row" style="gap:12px;align-items:flex-end">
+      <div class="form-group" style="flex:2;min-width:180px;margin-bottom:0">
+        <label for="plan-goal-text">Твоя цель</label>
+        <input type="text" id="plan-goal-text" name="goal" maxlength="200" placeholder="например, 2000 на Lichess к лету"
+               value="${esc(goal || '')}" autocomplete="off" required>
+      </div>
+      <div class="form-group" style="flex:0;min-width:110px;margin-bottom:0">
+        <label for="plan-goal-minutes">Минут в день</label>
+        <input type="number" id="plan-goal-minutes" name="minutes" min="5" max="480" step="1" value="${minutes || 30}" required>
+      </div>
+      <div class="form-group" style="flex:0;min-width:140px;margin-bottom:0">
+        <label for="plan-goal-focus">Фокус</label>
+        <select id="plan-goal-focus" name="focus">
+          ${Object.entries(focusRu).map(([v, label]) => `<option value="${v}"${(focus || 'auto') === v ? ' selected' : ''}>${label}</option>`).join('')}
+        </select>
+      </div>
+      <button class="btn btn-primary" style="height:38px">Сохранить</button>
+    </form>
+    <div class="alert alert-error" id="plan-goal-err" style="display:none;margin-top:8px"></div>`;
+
+  let goalHtml = '';
+  if (goalData) {
+    if (goalData.goal) {
+      goalHtml = `<div class="card"><div class="card-header"><span class="card-title">Твоя цель</span></div>
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <span class="badge badge-good">цель</span>
+          <span style="flex:1;min-width:180px">«${esc(goalData.goal)}» · ${goalData.minutes} мин/день · фокус: ${esc(focusRu[goalData.focus] || goalData.focus)}</span>
+          <a href="#" class="btn btn-link" id="plan-goal-edit">изменить</a>
+        </div>
+        <div id="plan-goal-slot" style="margin-top:8px"></div></div>`;
+    } else {
+      goalHtml = `<div class="card"><div class="card-header"><span class="card-title">Твоя цель</span></div>
+        <p style="color:var(--c-text-muted);font-size:13px;margin-top:0">Скажи, к чему идём, — и неделя посчитается под твою цель.</p>
+        ${goalFormHtml('', 30, 'auto')}</div>`;
+    }
+  }
+
+  let weekHtml = '';
+  if (weekData && weekData.focus && Array.isArray(weekData.week_tasks)) {
+    const wPhase = esc(focusRu[weekData.focus.phase] || weekData.focus.phase);
+    weekHtml = `<div class="card"><div class="card-header"><span class="card-title">План на неделю</span>
+        <span class="badge badge-blue">фокус: ${wPhase}</span></div>
+      <div style="color:var(--c-text-muted);font-size:13px;margin-bottom:8px">${esc(weekData.focus.reason || '')}</div>
+      ${weekData.week_tasks.map(t => `<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:6px 0"><span class="badge badge-neutral">${esc(t.key)}</span><span style="flex:1;min-width:180px"><strong>${esc(t.text)}</strong><br><span style="color:var(--c-text-muted);font-size:12px">${esc(t.detail || '')}</span></span></div>`).join('')}
+      ${weekData.human_summary ? `<div class="mentor-reply" style="margin-top:8px">${esc(weekData.human_summary)}</div>` : ''}</div>`;
+  }
 
   let todayHtml = '';
   if (taskToday || track || report) {
@@ -381,6 +432,8 @@ async function viewPlan(app) {
 
   app.innerHTML = `
     <div class="card-header"><h1>План тренировки</h1><span class="badge badge-blue">${esc(state.user.nick)}</span></div>
+    ${goalHtml}
+    ${weekHtml}
     ${todayHtml}
     <div class="grid grid-4">
       <div class="card stat"><div class="stat-value">${plan.games}</div><div class="stat-label">Партий</div></div>
@@ -430,6 +483,40 @@ async function viewPlan(app) {
       }
     });
   });
+
+  const bindGoalForm = () => {
+    const form = document.getElementById('plan-goal-form');
+    if (!form) return;
+    form.addEventListener('submit', async e => {
+      e.preventDefault();
+      const err = document.getElementById('plan-goal-err');
+      const fd = new FormData(form);
+      try {
+        await apiPost('/api/plan/goal', fd);
+        await viewPlan(app);
+      } catch (apiErr) {
+        if (err) {
+          err.textContent = apiErr.message;
+          err.style.display = 'block';
+        }
+      }
+    });
+  };
+  bindGoalForm();
+  const goalEdit = document.getElementById('plan-goal-edit');
+  if (goalEdit) {
+    goalEdit.addEventListener('click', e => {
+      e.preventDefault();
+      const slot = document.getElementById('plan-goal-slot');
+      if (!slot) return;
+      if (slot.innerHTML) {
+        slot.innerHTML = '';
+        return;
+      }
+      slot.innerHTML = goalFormHtml(goalData.goal, goalData.minutes, goalData.focus);
+      bindGoalForm();
+    });
+  }
 }
 
 async function viewProgress(app) {
@@ -963,7 +1050,7 @@ function drawTask(app) {
           <span class="badge badge-neutral">ты: ${colorLabel}</span>
           ${clsBadge}
         </div>
-        ${answered ? '' : '<div style="color:var(--c-text-muted);font-size:13px;margin-top:8px">кликни фигуру, затем клетку — или введи ход текстом</div>'}
+        ${answered ? '' : '<div id="task-board-hint" style="color:var(--c-text-muted);font-size:13px;margin-top:8px">кликни фигуру, затем клетку — или введи ход текстом</div>'}
       </div>
       <div class="game-side">
         ${state.taskError ? `<div class="alert alert-error">${esc(state.taskError)}</div>` : ''}
@@ -1032,7 +1119,10 @@ function drawTask(app) {
           clearHl();
         });
       });
-    }).catch(() => {});
+    }).catch(() => {
+      const hint = document.getElementById('task-board-hint');
+      if (hint) hint.textContent = 'введи ход текстом (доска-интерактив недоступен)';
+    });
   }
 }
 

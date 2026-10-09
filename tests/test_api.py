@@ -1082,6 +1082,37 @@ class TaskApiTests(ApiTestBase):
         self.assertEqual(job["status"], "error")
         self.assertIn("LLM_API_KEY", job["error"])
 
+    def test_explain_poison_cache_ignored_and_overwritten(self):
+        """thinking-мусор в БД: today врёт explained=false, повтор лечит."""
+        self._seed_tasks()
+        today = self.client.get("/api/task/today").json()
+        garbage = (
+            "Here's a thinking process: 1. Analyze User Input. "
+            "Position (FEN): rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR. "
+            "Facts from data. Constraints: blunder. Step 1: My move Rh1."
+        )
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.save_task_explanation(
+                today["task_key"], "tester", today["game_id"], today["ply"], garbage
+            )
+        poisoned = self.client.get("/api/task/today").json()
+        self.assertFalse(poisoned["explained"])
+        self.assertIsNone(poisoned["explanation"])
+
+        with patch.dict(os.environ, {"LLM_API_KEY": "test-key"}), \
+                patch("app.api._task_explain_llm",
+                      return_value="Хорошее объяснение по-русски.") as llm:
+            resp = self.client.post("/api/task/explain")
+            self.assertEqual(resp.status_code, 200)
+            self.assertFalse(resp.json()["cached"])
+            job = self._wait_job(resp.json()["job_id"])
+            llm.assert_called_once()
+        self.assertEqual(job["status"], "done", job.get("error"))
+        fixed = self.client.get("/api/task/today").json()
+        self.assertTrue(fixed["explained"])
+        self.assertEqual(fixed["explanation"], "Хорошее объяснение по-русски.")
+
     # --- пустой пул / нет пользователя ---
 
     def test_today_no_errors_404(self):
@@ -1294,6 +1325,200 @@ class TrackApiTests(ApiTestBase):
         self.assertEqual(data["total_sec"], before + 10 * 60)
 
 
+class PlanGoalTests(ApiTestBase):
+    """GET/POST /api/plan/goal: цель, минуты, фокус."""
+
+    def _add_user(self) -> None:
+        resp = self.client.post("/api/user/add", data={"nick": "tester"})
+        self.assertEqual(resp.status_code, 200)
+
+    def test_goal_defaults(self):
+        self._add_user()
+        resp = self.client.get("/api/plan/goal")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json(), {"goal": None, "minutes": 30, "focus": "auto"})
+
+    def test_goal_set_and_get(self):
+        self._add_user()
+        resp = self.client.post(
+            "/api/plan/goal",
+            data={"goal": "Стать 2000", "minutes": "45", "focus": "middlegame"},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            resp.json(),
+            {"ok": True, "goal": "Стать 2000", "minutes": 45, "focus": "middlegame"},
+        )
+        self.assertEqual(
+            self.client.get("/api/plan/goal").json(),
+            {"goal": "Стать 2000", "minutes": 45, "focus": "middlegame"},
+        )
+
+    def test_goal_validation(self):
+        self._add_user()
+        bad = [
+            {"goal": "x", "minutes": "0", "focus": "auto"},
+            {"goal": "x", "minutes": "1000", "focus": "auto"},
+            {"goal": "x", "minutes": "30", "focus": "мусор"},
+            {"goal": "", "minutes": "30", "focus": "auto"},
+            {"goal": "y" * 201, "minutes": "30", "focus": "auto"},
+        ]
+        for data in bad:
+            with self.subTest(data=data):
+                self.assertEqual(
+                    self.client.post("/api/plan/goal", data=data).status_code, 400
+                )
+
+    def test_goal_no_user_404(self):
+        self.assertEqual(self.client.get("/api/plan/goal").status_code, 404)
+        resp = self.client.post(
+            "/api/plan/goal",
+            data={"goal": "x", "minutes": "30", "focus": "auto"},
+        )
+        self.assertEqual(resp.status_code, 404)
+
+
+class PlanWeekTests(ApiTestBase):
+    """GET /api/plan/week: детерминированный план из живых данных."""
+
+    @staticmethod
+    def _move(
+        san: str,
+        classification: str,
+        drop: float,
+        win_before: float,
+        win_after: float,
+        best: str,
+    ) -> dict:
+        return {
+            "san": san,
+            "before": {"cp": 20.0, "mate": None},
+            "after": {"cp": 5.0, "mate": None},
+            "win_before": win_before,
+            "win_after": win_after,
+            "drop": drop,
+            "classification": classification,
+            "best_move_san": best,
+            "best_eval": {"cp": 20.0, "mate": None},
+            "best_win": win_before,
+            "clock_used": None,
+            "time_pressure": None,
+            "best_line": [],
+            "played_line": [],
+        }
+
+    def _seed_week(self) -> None:
+        """Испанка: ошибка в дебюте (ply 4, −10) и грубая в миттельшпиле (ply 12, −30)."""
+        sans = [
+            "e4", "e5", "Nf3", "Nc6", "Bb5", "a6", "Ba4", "Nf6",
+            "O-O", "Be7", "Re1", "b5", "Bb3", "d6",
+        ]
+        entries = []
+        for i, san in enumerate(sans):
+            if i == 4:
+                entries.append(self._move(san, "mistake", 10.0, 55.0, 45.0, "Bc4"))
+            elif i == 12:
+                entries.append(self._move(san, "blunder", 30.0, 60.0, 30.0, "Bc2"))
+            else:
+                entries.append(self._move(san, "best", 0.0, 55.0, 55.0, san))
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.save_games(
+                [
+                    mkgame_moves(
+                        "wk1",
+                        sans,
+                        user_color="white",
+                        result_for_user="loss",
+                        opponent="Rival",
+                        opening="Ruy Lopez",
+                        eco="C70",
+                        created_at=100,
+                    ),
+                ],
+                "tester",
+            )
+            db.save_analysis(
+                "wk1",
+                {
+                    "game_id": "wk1",
+                    "user_color": "white",
+                    "result_for_user": "loss",
+                    "opponent": "Rival",
+                    "avg_win_loss": 20.0,
+                    "avg_win_before": 55.0,
+                    "blunders": [12],
+                    "mistakes": [4],
+                    "inaccuracies": [],
+                    "missed_wins": [],
+                    "time_pressure_blunders": [],
+                    "moves": entries,
+                },
+                depth=8,
+            )
+            db.set_current_user("tester")
+
+    def _get_week(self) -> dict:
+        self._seed_week()
+        resp = self.client.get("/api/plan/week")
+        self.assertEqual(resp.status_code, 200)
+        return resp.json()
+
+    def test_week_structure(self):
+        data = self._get_week()
+        for key in (
+            "goal", "minutes_per_day", "focus", "week_tasks", "today",
+            "human_summary",
+        ):
+            self.assertIn(key, data)
+        self.assertEqual(set(data["focus"]), {"phase", "reason"})
+        self.assertIsInstance(data["week_tasks"], list)
+        self.assertTrue(data["week_tasks"])
+        for task in data["week_tasks"]:
+            self.assertEqual(set(task), {"key", "text", "detail"})
+        self.assertEqual(
+            set(data["today"]),
+            {"task_done", "time_sec", "drills_today", "drills_total"},
+        )
+        self.assertIsInstance(data["human_summary"], str)
+        self.assertTrue(data["human_summary"])
+
+    def test_week_focus_auto_picks_weakest_phase(self):
+        data = self._get_week()
+        # миттельшпиль −30 против дебюта −10: слабейшая фаза по avg_drop.
+        self.assertEqual(data["focus"]["phase"], "middlegame")
+
+    def test_week_human_summary_russian_and_digits(self):
+        data = self._get_week()
+        self.assertIn("миттельшпиль", data["human_summary"])
+        self.assertRegex(data["human_summary"], r"\d")
+
+    def test_week_drills_bound(self):
+        data = self._get_week()
+        self.assertLessEqual(data["today"]["drills_today"], 20)
+        self.assertEqual(data["today"]["drills_total"], 0)
+        self.assertEqual(data["today"]["drills_today"], 5)
+
+    def test_week_explicit_focus_wins(self):
+        self._seed_week()
+        resp = self.client.post(
+            "/api/plan/goal",
+            data={"goal": "Эндшпиль!", "minutes": "45", "focus": "endgame"},
+        )
+        self.assertEqual(resp.status_code, 200)
+        data = self.client.get("/api/plan/week").json()
+        self.assertEqual(data["focus"]["phase"], "endgame")
+        self.assertEqual(data["minutes_per_day"], 45)
+        self.assertEqual(data["goal"], "Эндшпиль!")
+
+    def test_week_no_user_404(self):
+        self._seed_week()
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.clear_current_user()
+        self.assertEqual(self.client.get("/api/plan/week").status_code, 404)
+
+
 class FrontendTests(ApiTestBase):
     """Тесты статического фронтенда."""
 
@@ -1311,6 +1536,15 @@ class FrontendTests(ApiTestBase):
         resp = self.client.get("/app.js")
         self.assertEqual(resp.status_code, 200)
         self.assertIn("javascript", resp.headers.get("content-type", ""))
+
+    def test_index_refs_versioned_assets(self):
+        """Cache-busting: index.html ссылается на app.js/style.css с ?v=."""
+        resp = self.client.get("/")
+        self.assertEqual(resp.status_code, 200)
+        html = resp.text
+        self.assertIn("app.js?v=", html)
+        self.assertIn("style.css?v=", html)
+        self.assertIn("v0.4.1", html)
 
 
 if __name__ == "__main__":

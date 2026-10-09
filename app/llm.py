@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -18,6 +19,47 @@ from .config import settings
 USER_AGENT = "chess-trainer/0.1"
 _VALID_ROLES = frozenset({"system", "user", "assistant"})
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "0.0.0.0", "::1"})
+
+_THINK_BLOCK_RE = re.compile(
+    r"<(?:think|thinking|thought)\b[^>]*>.*?</(?:think|thinking|thought)>",
+    re.IGNORECASE | re.DOTALL,
+)
+_HSPACE_RE = re.compile(r"[ \t\u00a0]+")
+
+# Маркеры служебного reasoning-разбора (эвристика для looks_like_thinking).
+_THINKING_MARKERS = (
+    "thinking",
+    "analyze",
+    "constraints",
+    "step ",
+    "facts from data",
+)
+
+
+def clean_llm_text(text: str) -> str:
+    """Убирает reasoning-блоки (<think>…</think> и аналоги) и жмёт пробелы.
+
+    Переводы строк сохраняются (многострочные ответы тренера не ломаются),
+    схлопываются только горизонтальные пробелы; в конце — strip.
+    """
+    if not isinstance(text, str):
+        return ""
+    cleaned = _THINK_BLOCK_RE.sub(" ", text)
+    cleaned = "\n".join(_HSPACE_RE.sub(" ", line).strip() for line in cleaned.split("\n"))
+    return cleaned.strip()
+
+
+def looks_like_thinking(text: str) -> bool:
+    """True, если текст похож на служебный thinking-разбор, а не на ответ.
+
+    Эвристика: >=3 маркеров из списка ["thinking", "analyze", "constraints",
+    "step ", "facts from data"] (регистр не важен). Просто и предсказуемо.
+    """
+    if not isinstance(text, str) or not text:
+        return False
+    lowered = text.lower()
+    hits = sum(1 for marker in _THINKING_MARKERS if marker in lowered)
+    return hits >= 3
 
 
 @dataclass(frozen=True, slots=True)
