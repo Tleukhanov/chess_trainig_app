@@ -1547,5 +1547,200 @@ class FrontendTests(ApiTestBase):
         self.assertIn("v0.4.1", html)
 
 
+class AuthApiTests(ApiTestBase):
+    """Тесты регистрации/входа: /api/auth/*, сессии, задел под доступ."""
+
+    def _fresh_client(self) -> TestClient:
+        """Клиент без cookie (чистая сессия)."""
+        return TestClient(self.app)
+
+    def _wait_job(self, job_id: str, timeout: float = 15.0) -> dict:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            resp = self.client.get(f"/api/jobs/{job_id}")
+            self.assertEqual(resp.status_code, 200)
+            data = resp.json()
+            if data["status"] != "running":
+                return data
+            time.sleep(0.05)
+        self.fail(f"job {job_id} не завершился за {timeout}с")
+
+    def test_register_new_and_status(self):
+        resp = self.client.post(
+            "/api/auth/register",
+            data={"login": "neo", "password": "abcd", "lichess": "NeoChess"},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json(), {"ok": True, "nick": "neo"})
+        status = self.client.get("/api/auth/status").json()
+        self.assertEqual(status, {"logged_in": True, "nick": "neo"})
+        with Database(self.db_path) as db:
+            db.init_db()
+            rec = db.get_user_record("neo")
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec["lichess"], "NeoChess")
+        self.assertTrue(rec["password_hash"])
+        self.assertEqual(rec["role"], "user")
+        self.assertEqual(int(rec["is_active"]), 1)
+
+    def test_register_validation(self):
+        bad = [
+            {"login": "", "password": "abcd", "lichess": "X"},
+            {"login": "x" * 65, "password": "abcd", "lichess": "X"},
+            {"login": "neo", "password": "abc", "lichess": "X"},
+            {"login": "neo", "password": "abcd", "lichess": ""},
+        ]
+        for data in bad:
+            with self.subTest(data=data):
+                self.assertEqual(
+                    self.client.post("/api/auth/register", data=data).status_code,
+                    400,
+                )
+
+    def test_register_duplicate_409(self):
+        data = {"login": "neo", "password": "abcd", "lichess": "NeoChess"}
+        self.assertEqual(self.client.post("/api/auth/register", data=data).status_code, 200)
+        resp = self.client.post("/api/auth/register", data=data)
+        self.assertEqual(resp.status_code, 409)
+
+    def test_register_claim_preserves_games(self):
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.upsert_user("OldNick")
+            db.save_games([mkgame("c1")], "OldNick")
+            db.save_analysis("c1", {"summary": []}, depth=8)
+        resp = self.client.post(
+            "/api/auth/register",
+            data={"login": "OldNick", "password": "abcd", "lichess": "OldLichess"},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json(), {"ok": True, "nick": "OldNick"})
+        with Database(self.db_path) as db:
+            db.init_db()
+            rec = db.get_user_record("oldnick")
+            self.assertTrue(rec["password_hash"])
+            self.assertEqual(rec["lichess"], "OldLichess")
+            self.assertEqual(len(db.get_games("OldNick")), 1)
+            self.assertTrue(db.has_analysis("c1"))
+
+    def test_login_wrong_and_unknown_401(self):
+        self.client.post(
+            "/api/auth/register",
+            data={"login": "neo", "password": "abcd", "lichess": "NeoChess"},
+        )
+        fresh = self._fresh_client()
+        resp = fresh.post(
+            "/api/auth/login", data={"login": "neo", "password": "wrong"}
+        )
+        self.assertEqual(resp.status_code, 401)
+        resp = fresh.post(
+            "/api/auth/login", data={"login": "ghost", "password": "abcd"}
+        )
+        self.assertEqual(resp.status_code, 401)
+
+    def test_login_ok_and_logout(self):
+        self.client.post(
+            "/api/auth/register",
+            data={"login": "neo", "password": "abcd", "lichess": "NeoChess"},
+        )
+        fresh = self._fresh_client()
+        resp = fresh.post(
+            "/api/auth/login", data={"login": "neo", "password": "abcd"}
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(fresh.get("/api/auth/status").json()["logged_in"], True)
+        resp = fresh.post("/api/auth/logout")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            fresh.get("/api/auth/status").json(),
+            {"logged_in": False, "nick": None},
+        )
+
+    def test_inactive_blocks(self):
+        self.client.post(
+            "/api/auth/register",
+            data={"login": "neo", "password": "abcd", "lichess": "NeoChess"},
+        )
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.set_active("neo", False)
+        fresh = self._fresh_client()
+        resp = fresh.post(
+            "/api/auth/login", data={"login": "neo", "password": "abcd"}
+        )
+        self.assertEqual(resp.status_code, 403)
+        # старая сессия тоже гаснет
+        self.assertEqual(
+            self.client.get("/api/auth/status").json()["logged_in"], False
+        )
+        # данные через сессию — 404
+        self.assertEqual(self.client.get("/api/track/today").status_code, 404)
+        self.assertEqual(self.client.get("/api/plan/goal").status_code, 404)
+
+    def test_password_change(self):
+        self.client.post(
+            "/api/auth/register",
+            data={"login": "neo", "password": "oldpw", "lichess": "NeoChess"},
+        )
+        resp = self.client.post(
+            "/api/auth/password", data={"old": "wrong", "new": "newpw"}
+        )
+        self.assertEqual(resp.status_code, 401)
+        resp = self.client.post(
+            "/api/auth/password", data={"old": "oldpw", "new": "newpw"}
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json(), {"ok": True})
+        fresh = self._fresh_client()
+        self.assertEqual(
+            fresh.post(
+                "/api/auth/login", data={"login": "neo", "password": "oldpw"}
+            ).status_code,
+            401,
+        )
+        self.assertEqual(
+            fresh.post(
+                "/api/auth/login", data={"login": "neo", "password": "newpw"}
+            ).status_code,
+            200,
+        )
+
+    def test_password_requires_session(self):
+        self.assertEqual(
+            self._fresh_client().post(
+                "/api/auth/password", data={"old": "a", "new": "bbbb"}
+            ).status_code,
+            401,
+        )
+
+    def test_lichess_change(self):
+        self.client.post(
+            "/api/auth/register",
+            data={"login": "neo", "password": "abcd", "lichess": "NeoChess"},
+        )
+        resp = self.client.post("/api/auth/lichess", data={"lichess": "NewNick"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json(), {"ok": True, "lichess": "NewNick"})
+        with Database(self.db_path) as db:
+            db.init_db()
+            self.assertEqual(db.get_user_record("neo")["lichess"], "NewNick")
+
+    def test_coach_fetch_uses_lichess(self):
+        self.client.post(
+            "/api/auth/register",
+            data={"login": "coachuser", "password": "abcd", "lichess": "ForeignNick"},
+        )
+        with patch("app.api.fetch_user_games", return_value=[]) as fetch:
+            resp = self.client.post(
+                "/api/coach/run",
+                data={"max": "10", "perf": "rapid", "depth": "8", "multipv": "1"},
+            )
+            self.assertEqual(resp.status_code, 200)
+            job = self._wait_job(resp.json()["job_id"])
+            fetch.assert_called_once()
+        self.assertEqual(job["status"], "done", job.get("error"))
+        self.assertEqual(fetch.call_args[0][0], "ForeignNick")
+
+
 if __name__ == "__main__":
     unittest.main()

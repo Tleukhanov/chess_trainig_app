@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import threading
 import time
 import urllib.parse
@@ -28,7 +29,7 @@ from . import data as shared_data
 from .analyzer import Engine
 from .coach import build_request, run_coach
 from .config import settings
-from .db import Database
+from .db import Database, hash_password, verify_password
 from .drills import drills_to_json, drills_to_pgn
 from .fide import (
     TournamentGame,
@@ -106,8 +107,9 @@ def _run_coach_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None:
             if params["cached_only"]:
                 games = db.get_games(job.user, params["max"])
             else:
+                lichess_nick = _lichess_of(db, job.user)
                 games = fetch_user_games(
-                    job.user,
+                    lichess_nick,
                     since_ts=params["since"],
                     max_games=params["max"],
                     perf=params["perf"],
@@ -511,10 +513,82 @@ def _run_task_explain_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -
 
 # --- helpers ---------------------------------------------------------------
 
-def _current_user(db_path: Path) -> dict | None:
+_SESSION_COOKIE = "ct_session"
+_SESSION_DAYS = 30
+_SESSION_MAX_AGE = _SESSION_DAYS * 24 * 3600
+
+
+def _is_active_record(rec: dict | None) -> bool:
+    """Запись пользователя активна (is_active != 0; NULL/мусор → активна)."""
+    if rec is None:
+        return False
+    try:
+        return int(rec.get("is_active") if rec.get("is_active") is not None else 1) != 0
+    except (TypeError, ValueError):
+        return True
+
+
+def _session_nick(request: Request | None, db: Database) -> str | None:
+    """Ник по сессии из cookie (только активные записи), иначе None."""
+    token = request.cookies.get(_SESSION_COOKIE) if request is not None else None
+    if not token:
+        return None
+    nick = db.get_session_nick(token)
+    if not nick:
+        return None
+    rec = db.get_user_record(nick)
+    if not rec or not _is_active_record(rec):
+        return None
+    return rec["nick"]
+
+
+def _current_user(db_path: Path, request: Request | None = None) -> dict | None:
+    """Текущий пользователь: сначала сессия из cookie, иначе meta current_user.
+
+    Fallback на meta нужен CLI и старым клиентам без cookie. Неактивный
+    пользователь (is_active=0) — везде None (HTTP 404).
+    """
     with Database(db_path) as db:
         db.init_db()
-        return db.get_current_user()
+        if request is not None:
+            token = request.cookies.get(_SESSION_COOKIE)
+            if token:
+                nick = db.get_session_nick(token)
+                if nick:
+                    rec = db.get_user_record(nick)
+                    if rec is not None:
+                        if not _is_active_record(rec):
+                            return None
+                        return rec
+        user = db.get_current_user()
+        if user is not None and not _is_active_record(user):
+            return None
+        return user
+
+
+def _lichess_of(db: Database, nick: str) -> str:
+    """Lichess-ник пользователя для забора партий; fallback — ник сайта."""
+    try:
+        rec = db.get_user_record(nick)
+    except (ValueError, TypeError):
+        rec = None
+    if rec:
+        lich = (rec.get("lichess") or "").strip()
+        if lich:
+            return lich
+    return nick
+
+
+def _set_session_cookie(response: Response, token: str) -> None:
+    """Выставляет cookie сессии (httponly, samesite=lax, 30 дней)."""
+    response.set_cookie(
+        _SESSION_COOKIE,
+        token,
+        max_age=_SESSION_MAX_AGE,
+        httponly=True,
+        samesite="lax",
+        path="/",
+    )
 
 
 def _call_data(fn, db_path: Path):
@@ -1175,7 +1249,7 @@ def create_api(
     # --- Data endpoints ---
     @app.get("/api/overview")
     def api_overview(request: Request):
-        user = _current_user(app.state.db_path)
+        user = _current_user(app.state.db_path, request)
         if not user:
             raise HTTPException(404, "No current user")
         return _call_data(
@@ -1185,7 +1259,7 @@ def create_api(
 
     @app.get("/api/plan")
     def api_plan(request: Request, max_depth: int = 16):
-        user = _current_user(app.state.db_path)
+        user = _current_user(app.state.db_path, request)
         if not user:
             raise HTTPException(404, "No current user")
         return _call_data(
@@ -1197,7 +1271,7 @@ def create_api(
 
     @app.get("/api/progress")
     def api_progress(request: Request, windows: int = 5):
-        user = _current_user(app.state.db_path)
+        user = _current_user(app.state.db_path, request)
         if not user:
             raise HTTPException(404, "No current user")
         return _call_data(
@@ -1236,7 +1310,7 @@ def create_api(
         verdict: str = "",
         limit: int = 0,
     ):
-        user = _current_user(app.state.db_path)
+        user = _current_user(app.state.db_path, request)
         if not user:
             raise HTTPException(404, "No current user")
         dr = _drills_payload(user, min_drop, min_win, verdict, limit)
@@ -1251,7 +1325,7 @@ def create_api(
         verdict: str = "",
         limit: int = 0,
     ):
-        user = _current_user(app.state.db_path)
+        user = _current_user(app.state.db_path, request)
         if not user:
             raise HTTPException(404, "No current user")
         dr = _drills_payload(user, min_drop, min_win, verdict, limit)
@@ -1270,7 +1344,7 @@ def create_api(
         verdict: str = "",
         limit: int = 0,
     ):
-        user = _current_user(app.state.db_path)
+        user = _current_user(app.state.db_path, request)
         if not user:
             raise HTTPException(404, "No current user")
         dr = _drills_payload(user, min_drop, min_win, verdict, limit)
@@ -1282,7 +1356,7 @@ def create_api(
 
     @app.get("/api/report")
     def api_report(request: Request):
-        user = _current_user(app.state.db_path)
+        user = _current_user(app.state.db_path, request)
         if not user:
             raise HTTPException(404, "No current user")
         with Database(app.state.db_path) as db:
@@ -1293,7 +1367,7 @@ def create_api(
 
     @app.get("/api/plan/goal")
     def api_plan_goal_get(request: Request):
-        user = _current_user(app.state.db_path)
+        user = _current_user(app.state.db_path, request)
         if not user:
             raise HTTPException(404, "No current user")
         with Database(app.state.db_path) as db:
@@ -1306,7 +1380,7 @@ def create_api(
         minutes: str = Form(""),
         focus: str = Form(""),
     ):
-        user = _current_user(app.state.db_path)
+        user = _current_user(app.state.db_path, request)
         if not user:
             raise HTTPException(404, "No current user")
         text = goal.strip()
@@ -1333,7 +1407,7 @@ def create_api(
 
     @app.get("/api/plan/week")
     def api_plan_week(request: Request):
-        user = _current_user(app.state.db_path)
+        user = _current_user(app.state.db_path, request)
         if not user:
             raise HTTPException(404, "No current user")
         with Database(app.state.db_path) as db:
@@ -1351,7 +1425,7 @@ def create_api(
         refresh: str | None = Form(None),
         since: int | None = Form(None),
     ):
-        user = _current_user(app.state.db_path)
+        user = _current_user(app.state.db_path, request)
         if not user:
             raise HTTPException(404, "No current user")
 
@@ -1450,7 +1524,7 @@ def create_api(
 
     @app.get("/api/games")
     def api_games(request: Request, limit: int = 100):
-        user = _current_user(app.state.db_path)
+        user = _current_user(app.state.db_path, request)
         if not user:
             raise HTTPException(404, "No current user")
         return _call_data(
@@ -1460,7 +1534,7 @@ def create_api(
 
     @app.get("/api/games/{game_id}")
     def api_game_detail(game_id: str, request: Request):
-        user = _current_user(app.state.db_path)
+        user = _current_user(app.state.db_path, request)
         if not user:
             raise HTTPException(404, "No current user")
         return _call_data(
@@ -1496,7 +1570,7 @@ def create_api(
             raise HTTPException(400, "color должен быть white, black или both")
         if not 1 <= max_depth <= 64:
             raise HTTPException(400, "max_depth должен быть от 1 до 64")
-        user = _current_user(app.state.db_path)
+        user = _current_user(app.state.db_path, request)
         if not user:
             raise HTTPException(404, "No current user")
         return _call_data(
@@ -1511,7 +1585,7 @@ def create_api(
         max: int = Form(30),
         perf: str = Form("rapid"),
     ):
-        user = _current_user(app.state.db_path)
+        user = _current_user(app.state.db_path, request)
         if not user:
             raise HTTPException(404, "No current user")
         opp = opponent.strip()
@@ -1531,7 +1605,7 @@ def create_api(
 
     @app.get("/api/humanize")
     def api_humanize(request: Request, refresh: str = ""):
-        user = _current_user(app.state.db_path)
+        user = _current_user(app.state.db_path, request)
         if not user:
             raise HTTPException(404, "No current user")
         if refresh in ("1", "true", "on", "yes"):
@@ -1607,7 +1681,7 @@ def create_api(
             raise HTTPException(400, "Укажи FIDE ID")
         if not 1 <= windows <= 52:
             raise HTTPException(400, "windows должен быть от 1 до 52")
-        user = _current_user(app.state.db_path)
+        user = _current_user(app.state.db_path, request)
         job = CoachJob(
             id=uuid.uuid4().hex,
             user=user["nick"] if user else "",
@@ -1626,7 +1700,7 @@ def create_api(
         moments: int = Form(6),
         dry_run: str | None = Form(None),
     ):
-        user = _current_user(app.state.db_path)
+        user = _current_user(app.state.db_path, request)
         if not user:
             raise HTTPException(404, "No current user")
         if not 1 <= max <= 50:
@@ -1667,7 +1741,7 @@ def create_api(
         dry_run: str | None = Form(None),
         no_progress: str | None = Form(None),
     ):
-        user = _current_user(app.state.db_path)
+        user = _current_user(app.state.db_path, request)
         if not user:
             raise HTTPException(404, "No current user")
         if not 1 <= max_depth <= 64:
@@ -1701,7 +1775,7 @@ def create_api(
     # --- Задача дня ---
     @app.get("/api/task/today")
     def api_task_today(request: Request):
-        user = _current_user(app.state.db_path)
+        user = _current_user(app.state.db_path, request)
         if not user:
             raise HTTPException(404, "No current user")
         return _call_data(
@@ -1710,7 +1784,7 @@ def create_api(
 
     @app.post("/api/task/answer")
     def api_task_answer(request: Request, answer: str = Form(...)):
-        user = _current_user(app.state.db_path)
+        user = _current_user(app.state.db_path, request)
         if not user:
             raise HTTPException(404, "No current user")
 
@@ -1740,7 +1814,7 @@ def create_api(
 
     @app.post("/api/task/explain")
     def api_task_explain(request: Request):
-        user = _current_user(app.state.db_path)
+        user = _current_user(app.state.db_path, request)
         if not user:
             raise HTTPException(404, "No current user")
         payload = _call_data(
@@ -1764,7 +1838,7 @@ def create_api(
 
     @app.get("/api/task/legal")
     def api_task_legal(request: Request):
-        user = _current_user(app.state.db_path)
+        user = _current_user(app.state.db_path, request)
         if not user:
             raise HTTPException(404, "No current user")
 
@@ -1790,7 +1864,7 @@ def create_api(
     # --- Мини-трекер времени ---
     @app.post("/api/track/ping")
     def api_track_ping(request: Request):
-        user = _current_user(app.state.db_path)
+        user = _current_user(app.state.db_path, request)
         if not user:
             raise HTTPException(404, "No current user")
         now = _now()
@@ -1807,7 +1881,7 @@ def create_api(
 
     @app.post("/api/track/lichess_manual")
     def api_track_lichess_manual(request: Request, minutes: str = Form("")):
-        user = _current_user(app.state.db_path)
+        user = _current_user(app.state.db_path, request)
         if not user:
             raise HTTPException(404, "No current user")
         value = _parse_minutes(minutes)
@@ -1820,7 +1894,7 @@ def create_api(
 
     @app.get("/api/track/today")
     def api_track_today(request: Request):
-        user = _current_user(app.state.db_path)
+        user = _current_user(app.state.db_path, request)
         if not user:
             raise HTTPException(404, "No current user")
         day = _today()
@@ -1847,6 +1921,140 @@ def create_api(
             "total_sec": int(site_sec + lichess_sec + manual_sec),
             "games_today": games_today,
         }
+
+    # --- Auth: регистрация и вход (логин+пароль+lichess) ---
+    @app.post("/api/auth/register")
+    def api_auth_register(
+        response: Response,
+        login: str = Form(""),
+        password: str = Form(""),
+        lichess: str = Form(""),
+        fide: str = Form(""),
+    ):
+        clean = (login or "").strip()
+        if not 1 <= len(clean) <= 64:
+            raise HTTPException(400, "Логин: от 1 до 64 символов")
+        if len(password or "") < 4:
+            raise HTTPException(400, "Пароль: минимум 4 символа")
+        lich = (lichess or "").strip()
+        if not 1 <= len(lich) <= 64:
+            raise HTTPException(400, "Укажи Lichess-ник")
+        fide_clean = (fide or "").strip() or None
+        db = Database(app.state.db_path)
+        db.init_db()
+        rec = db.get_user_record(clean)
+        if rec and rec.get("password_hash"):
+            raise HTTPException(409, "Логин занят")
+        if rec:
+            # CLAIM: ник уже есть без пароля (старые данные) — дописываем
+            # пароль+lichess(+fide), партии и аналитика сохраняются.
+            db.set_password_hash(rec["nick"], hash_password(password))
+            db.set_lichess(rec["nick"], lich)
+            if fide_clean:
+                db.set_user_fide(rec["nick"], fide_clean)
+            nick = rec["nick"]
+        else:
+            now = int(time.time())
+            with db._connection() as conn:
+                conn.execute(
+                    "INSERT INTO users(nick_lower, nick, fide_id, bound_at, "
+                    "last_seen_at, password_hash, lichess, role, is_active, "
+                    "created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        clean.lower(),
+                        clean,
+                        fide_clean,
+                        now,
+                        now,
+                        hash_password(password),
+                        lich,
+                        "user",
+                        1,
+                        now,
+                    ),
+                )
+            nick = clean
+        token = secrets.token_hex(32)
+        db.create_session(nick, token, days=_SESSION_DAYS)
+        _set_session_cookie(response, token)
+        return {"ok": True, "nick": nick}
+
+    @app.post("/api/auth/login")
+    def api_auth_login(
+        response: Response,
+        login: str = Form(""),
+        password: str = Form(""),
+    ):
+        clean = (login or "").strip()
+        db = Database(app.state.db_path)
+        db.init_db()
+        rec = db.get_user_record(clean)
+        if not rec or not rec.get("password_hash"):
+            raise HTTPException(401, "Неверный логин или пароль")
+        if not verify_password(password or "", rec["password_hash"]):
+            raise HTTPException(401, "Неверный логин или пароль")
+        if not _is_active_record(rec):
+            raise HTTPException(403, "Доступ ограничен")
+        token = secrets.token_hex(32)
+        db.create_session(rec["nick"], token, days=_SESSION_DAYS)
+        _set_session_cookie(response, token)
+        return {"ok": True, "nick": rec["nick"]}
+
+    @app.post("/api/auth/logout")
+    def api_auth_logout(request: Request, response: Response):
+        token = request.cookies.get(_SESSION_COOKIE)
+        if token:
+            db = Database(app.state.db_path)
+            db.init_db()
+            db.delete_session(token)
+        response.delete_cookie(_SESSION_COOKIE, path="/")
+        return {"ok": True}
+
+    @app.get("/api/auth/status")
+    def api_auth_status(request: Request):
+        # Гейт фронта: только сессия, meta сюда не подмешивается.
+        db = Database(app.state.db_path)
+        db.init_db()
+        nick = _session_nick(request, db)
+        if nick:
+            return {"logged_in": True, "nick": nick}
+        return {"logged_in": False, "nick": None}
+
+    @app.post("/api/auth/password")
+    def api_auth_password(
+        request: Request,
+        old: str = Form(""),
+        new: str = Form(""),
+    ):
+        db = Database(app.state.db_path)
+        db.init_db()
+        nick = _session_nick(request, db)
+        if not nick:
+            raise HTTPException(401, "Нужен вход")
+        rec = db.get_user_record(nick)
+        if (
+            not rec
+            or not rec.get("password_hash")
+            or not verify_password(old or "", rec["password_hash"])
+        ):
+            raise HTTPException(401, "Неверный старый пароль")
+        if len(new or "") < 4:
+            raise HTTPException(400, "Новый пароль: минимум 4 символа")
+        db.set_password_hash(nick, hash_password(new))
+        return {"ok": True}
+
+    @app.post("/api/auth/lichess")
+    def api_auth_lichess(request: Request, lichess: str = Form("")):
+        lich = (lichess or "").strip()
+        if not 1 <= len(lich) <= 64:
+            raise HTTPException(400, "Lichess-ник: от 1 до 64 символов")
+        db = Database(app.state.db_path)
+        db.init_db()
+        nick = _session_nick(request, db)
+        if not nick:
+            raise HTTPException(401, "Нужен вход")
+        db.set_lichess(nick, lich)
+        return {"ok": True, "lichess": lich}
 
     # Frontend static files — mounted LAST so /api/* routes take precedence.
     frontend_dir = Path(__file__).resolve().parent.parent / "frontend"

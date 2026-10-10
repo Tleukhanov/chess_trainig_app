@@ -10,7 +10,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import os
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -108,9 +111,49 @@ _SCHEMA = f"""
 {_USERS_DDL.format(table="users")};
 {_META_DDL.format(table="meta")};
 {_TASK_EXPLANATIONS_DDL.format(table="task_explanations")};
+CREATE TABLE IF NOT EXISTS sessions(
+    token TEXT PRIMARY KEY,
+    nick TEXT,
+    created_at INTEGER,
+    expires_at INTEGER
+);
 CREATE INDEX IF NOT EXISTS idx_games_user ON games(user);
 CREATE INDEX IF NOT EXISTS idx_task_explanations_user ON task_explanations(user);
+CREATE INDEX IF NOT EXISTS idx_sessions_nick ON sessions(nick);
 """
+
+# Новые колонки users (миграция без потери данных — см. init_db).
+_USERS_AUTH_COLUMNS = (
+    "password_hash TEXT",
+    "lichess TEXT",
+    "role TEXT DEFAULT 'user'",
+    "is_active INTEGER DEFAULT 1",
+    "created_at INTEGER",
+)
+
+
+def hash_password(pw: str) -> str:
+    """PBKDF2-HMAC-SHA256 хеш пароля, формат pbkdf2$iter$salt_hex$hash_hex."""
+    salt = os.urandom(16)
+    dk = hashlib.pbkdf2_hmac("sha256", (pw or "").encode("utf-8"), salt, 200_000)
+    return f"pbkdf2$200000${salt.hex()}${dk.hex()}"
+
+
+def verify_password(pw: str, stored: str | None) -> bool:
+    """Проверяет пароль против хеша; мусорный stored → False."""
+    try:
+        parts = (stored or "").split("$")
+        if len(parts) != 4 or parts[0] != "pbkdf2":
+            return False
+        iters = int(parts[1])
+        salt = bytes.fromhex(parts[2])
+        expected = bytes.fromhex(parts[3])
+        if iters <= 0 or not salt or not expected:
+            return False
+        dk = hashlib.pbkdf2_hmac("sha256", (pw or "").encode("utf-8"), salt, iters)
+        return hmac.compare_digest(dk, expected)
+    except (ValueError, TypeError):
+        return False
 
 
 def _j(obj: Any) -> str:
@@ -294,6 +337,17 @@ class Database:
         _migrate_v3(self.path)
         with self._connection() as conn:
             conn.executescript(_SCHEMA)
+            # Миграция users без потери данных: CREATE IF NOT EXISTS колонки
+            # не добавит, поэтому ALTER TABLE для каждой отсутствующей.
+            existing = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(users)").fetchall()
+            }
+            for coldef in _USERS_AUTH_COLUMNS:
+                if coldef.split()[0] not in existing:
+                    conn.execute(f"ALTER TABLE users ADD COLUMN {coldef}")
+            conn.execute("UPDATE users SET role = 'user' WHERE role IS NULL")
+            conn.execute("UPDATE users SET is_active = 1 WHERE is_active IS NULL")
 
     def save_games(self, games: list[Game], user: str) -> int:
         """Сохраняет партии, возвращая число вставленных (новых) партий.
@@ -476,6 +530,91 @@ class Database:
                 "SELECT * FROM users WHERE nick_lower = ?", (key,)
             ).fetchone()
         return dict(row) if row else None
+
+    def get_user_record(self, nick: str | None) -> dict[str, Any] | None:
+        """Вся строка users по нику (регистронезависимо) или None."""
+        key = (nick or "").strip().lower()
+        if not key:
+            return None
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM users WHERE nick_lower = ?", (key,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def set_password_hash(self, nick: str, password_hash: str) -> None:
+        """Записывает хеш пароля в профиль (создаёт профиль при необходимости)."""
+        clean = (nick or "").strip()
+        if not clean:
+            return
+        self.upsert_user(clean)
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE users SET password_hash = ? WHERE nick_lower = ?",
+                (password_hash, clean.lower()),
+            )
+
+    def set_lichess(self, nick: str, lichess: str | None) -> None:
+        """Записывает Lichess-ник в профиль; None — очищает поле."""
+        clean = (nick or "").strip()
+        if not clean:
+            return
+        self.upsert_user(clean)
+        value = (lichess or "").strip() or None
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE users SET lichess = ? WHERE nick_lower = ?",
+                (value, clean.lower()),
+            )
+
+    def set_active(self, nick: str, active: bool) -> None:
+        """Включает/выключает доступ пользователя (is_active)."""
+        key = (nick or "").strip().lower()
+        if not key:
+            return
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE users SET is_active = ? WHERE nick_lower = ?",
+                (1 if active else 0, key),
+            )
+
+    def create_session(self, nick: str, token: str, days: int = 30) -> None:
+        """Создаёт сессию входа (token PRIMARY KEY)."""
+        now = int(time.time())
+        with self._connection() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO sessions(token, nick, created_at, expires_at) "
+                "VALUES (?,?,?,?)",
+                (token, (nick or "").strip(), now, now + int(days) * 86400),
+            )
+
+    def get_session_nick(self, token: str | None) -> str | None:
+        """Ник по токену сессии; протухшие — невалидны (удаляются)."""
+        if not token:
+            return None
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT nick, expires_at FROM sessions WHERE token = ?", (token,)
+            ).fetchone()
+            if row is None:
+                return None
+            try:
+                expired = row["expires_at"] is not None and int(
+                    row["expires_at"]
+                ) <= int(time.time())
+            except (TypeError, ValueError):
+                expired = True
+            if expired:
+                conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+                return None
+            return str(row["nick"]) if row["nick"] else None
+
+    def delete_session(self, token: str | None) -> None:
+        """Удаляет сессию (идемпотентно)."""
+        if not token:
+            return
+        with self._connection() as conn:
+            conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
 
     def list_users(self) -> list[dict[str, Any]]:
         """Все профили с числом партий и анализов для команды ``user list``."""

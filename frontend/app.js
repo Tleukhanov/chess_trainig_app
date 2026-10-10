@@ -19,6 +19,8 @@ const state = {
   taskExplaining: false,
   taskJobId: null,
   taskError: null,
+  authMode: 'login',
+  trackStarted: false,
 };
 
 // --- API helpers ---
@@ -98,21 +100,113 @@ function setupNav() {
   });
 }
 
+// --- Auth gate ---
+
+async function authStatus() {
+  try {
+    return await api('/api/auth/status');
+  } catch {
+    return { logged_in: false, nick: null };
+  }
+}
+
+function hideNav() {
+  const nav = document.getElementById('nav');
+  if (nav) nav.style.display = 'none';
+}
+
+function showNav() {
+  const nav = document.getElementById('nav');
+  if (nav) nav.style.display = '';
+}
+
+function viewAuth(app) {
+  const mode = state.authMode === 'register' ? 'register' : 'login';
+  const loginForm = `
+    <form id="auth-login-form">
+      <div class="form-group"><label>Логин <input type="text" name="login" required autocomplete="username"></label></div>
+      <div class="form-group"><label>Пароль <input type="password" name="password" required autocomplete="current-password"></label></div>
+      <button class="btn btn-primary" style="width:100%">Войти</button>
+    </form>`;
+  const regForm = `
+    <form id="auth-register-form">
+      <div class="form-group"><label>Логин <input type="text" name="login" required autocomplete="username"></label></div>
+      <div class="form-group"><label>Пароль (мин. 4 символа) <input type="password" name="password" required autocomplete="new-password"></label></div>
+      <div class="form-group"><label>Ник на Lichess (обяз.) <input type="text" name="lichess" required placeholder="GarryKasparov" autocomplete="username"></label></div>
+      <div class="form-group"><label>FIDE ID (необяз.) <input type="text" name="fide" placeholder="4130005"></label></div>
+      <button class="btn btn-primary" style="width:100%">Зарегистрироваться</button>
+    </form>
+    <p style="color:var(--c-text-muted);font-size:12px;margin-top:8px">Если твой ник уже есть в базе без пароля (старые данные и партии), регистрация закрепит его за тобой — партии сохранятся.</p>`;
+  app.innerHTML = `
+    <div class="card" style="max-width:420px;margin:40px auto">
+      <div class="card-header"><span class="card-title">Вход / Регистрация</span></div>
+      <div class="games-filter" style="margin-bottom:16px">
+        <button class="btn btn-secondary ${mode === 'login' ? 'btn-active' : ''}" data-authmode="login">Вход</button>
+        <button class="btn btn-secondary ${mode === 'register' ? 'btn-active' : ''}" data-authmode="register">Регистрация</button>
+      </div>
+      <div class="alert alert-error" id="auth-err" style="display:none"></div>
+      ${mode === 'login' ? loginForm : regForm}
+    </div>`;
+  app.querySelectorAll('[data-authmode]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      state.authMode = btn.dataset.authmode;
+      viewAuth(app);
+    });
+  });
+  const fail = msg => {
+    const box = document.getElementById('auth-err');
+    if (box) {
+      box.textContent = msg;
+      box.style.display = 'block';
+    }
+  };
+  const loginF = document.getElementById('auth-login-form');
+  if (loginF) loginF.addEventListener('submit', async e => {
+    e.preventDefault();
+    try {
+      await apiPost('/api/auth/login', new FormData(loginF));
+      showNav();
+      await loadUser();
+      navigate('dashboard');
+    } catch (err) {
+      fail(err.message);
+    }
+  });
+  const regF = document.getElementById('auth-register-form');
+  if (regF) regF.addEventListener('submit', async e => {
+    e.preventDefault();
+    try {
+      await apiPost('/api/auth/register', new FormData(regF));
+      showNav();
+      await loadUser();
+      navigate('dashboard');
+    } catch (err) {
+      fail(err.message);
+    }
+  });
+}
+
 // --- User box ---
 
 function renderUserbox() {
   const box = document.getElementById('userbox');
+  if (!box) return;
   if (state.user) {
-    box.innerHTML = `<span class="user-nick">${esc(state.user.nick)}</span><a href="#" class="user-switch" data-view="users">сменить</a>`;
-  } else {
-    box.innerHTML = `<a href="#" data-view="users">войти в профиль</a>`;
-  }
-  box.querySelectorAll('a').forEach(a => {
-    a.addEventListener('click', e => {
+    box.innerHTML = `<span class="user-nick">${esc(state.user.nick)}</span><a href="#" id="logout-link">выйти</a>`;
+    document.getElementById('logout-link').addEventListener('click', async e => {
       e.preventDefault();
-      navigate(a.dataset.view);
+      try {
+        await apiPost('/api/auth/logout', new FormData());
+      } catch { /* всё равно выходим */ }
+      state.user = null;
+      state.authMode = 'login';
+      hideNav();
+      renderUserbox();
+      render(state.currentView);
     });
-  });
+  } else {
+    box.innerHTML = '';
+  }
 }
 
 // --- Views ---
@@ -124,6 +218,15 @@ async function render(view) {
     clearInterval(state.jobPollTimer);
     state.jobPollTimer = null;
   }
+  const auth = await authStatus();
+  if (!auth.logged_in) {
+    state.user = null;
+    hideNav();
+    renderUserbox();
+    viewAuth(app);
+    return;
+  }
+  showNav();
   app.innerHTML = '<div class="card"><p>Загрузка...</p></div>';
 
   try {
@@ -1862,9 +1965,19 @@ function openLichessManual() {
 }
 
 async function viewUsers(app) {
+  const status = await authStatus();
+  if (!status.logged_in) {
+    viewAuth(app);
+    return;
+  }
   const users = await api('/api/users');
-  const list = users.users;
-  const currentNick = state.user ? state.user.nick : '';
+  const list = users.users || [];
+  const want = String(status.nick || '').toLowerCase();
+  const me = list.find(u => String(u.nick || '').toLowerCase() === want) || { nick: status.nick };
+  if (me.nick) {
+    state.user = me;
+    renderUserbox();
+  }
   const track = state.user ? await api('/api/track/today').catch(() => null) : null;
   const trackHtml = track
     ? `<div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--c-border);font-size:13px;color:var(--c-text-muted)">
@@ -1874,32 +1987,41 @@ async function viewUsers(app) {
     : '';
 
   app.innerHTML = `
-    <div class="card-header"><h1>Профили</h1></div>
-    ${state.user ? `<div class="card" style="margin-bottom:16px"><div class="card-header"><span class="card-title">Текущий профиль</span></div><div class="grid grid-3"><div class="stat"><div class="stat-value">${esc(state.user.nick)}</div><div class="stat-label">Ник</div></div><div class="stat"><div class="stat-value">${state.user.fide_id || '—'}</div><div class="stat-label">FIDE ID</div></div><div class="stat"><div class="stat-value">${state.user.games || 0}</div><div class="stat-label">Партий</div></div></div>${trackHtml}</div>` : '<div class="alert alert-info">Профиль не выбран. Добавь профиль или выбери из списка.</div>'}
-    <div class="card">
-      <div class="card-header"><span class="card-title">Добавить профиль</span></div>
-      <form id="add-user-form" class="form-row" style="gap:16px;align-items:flex-end">
-        <div class="form-group" style="flex:1;min-width:200px"><label>Ник <input type="text" name="nick" required placeholder="Tleukhanov"></label></div>
-        <div class="form-group"><label>FIDE ID (опц.) <input type="text" name="fide" placeholder="4130005"></label></div>
-        <button class="btn btn-primary" style="height:38px">Добавить и закрепить</button>
-      </form>
+    <div class="card-header"><h1>Аккаунт</h1></div>
+    <div class="card" style="margin-bottom:16px">
+      <div class="card-header"><span class="card-title">Мой аккаунт</span></div>
+      <div class="grid grid-3">
+        <div class="stat"><div class="stat-value">${esc(me.nick || '—')}</div><div class="stat-label">Логин</div></div>
+        <div class="stat"><div class="stat-value">${esc(me.lichess || '—')}</div><div class="stat-label">Lichess · <a href="#" class="btn btn-link" id="lichess-edit" style="font-size:11px">изменить</a></div></div>
+        <div class="stat"><div class="stat-value">${esc(me.fide_id || '—')}</div><div class="stat-label">FIDE ID · <a href="#" class="btn btn-link" id="fide-edit" style="font-size:11px">изменить</a></div></div>
+      </div>
+      <div id="lichess-slot"></div>
+      <div id="fide-slot"></div>
+      ${trackHtml}
+      <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--c-border)">
+        <form id="pw-form" class="form-row" style="gap:8px;align-items:flex-end">
+          <div class="form-group" style="flex:1;min-width:140px;margin-bottom:0"><label>Старый пароль <input type="password" name="old" required autocomplete="current-password"></label></div>
+          <div class="form-group" style="flex:1;min-width:140px;margin-bottom:0"><label>Новый пароль <input type="password" name="new" required autocomplete="new-password"></label></div>
+          <button class="btn btn-secondary" style="height:38px">Сменить пароль</button>
+        </form>
+        <div class="alert alert-error" id="pw-err" style="display:none;margin-top:8px"></div>
+        <div class="alert alert-success" id="pw-ok" style="display:none;margin-top:8px">Пароль сменён</div>
+        <div style="margin-top:8px"><button class="btn btn-secondary" id="logout-btn">Выйти</button></div>
+      </div>
     </div>
-    <div class="card" style="margin-top:16px">
-      <div class="card-header"><span class="card-title">Все профили (${list.length})</span></div>
-      ${list.length ? `<table class="table-wrap"><thead><tr><th>Ник</th><th>FIDE</th><th>Партий</th><th>Анализов</th><th>Последний вход</th><th>Действия</th></tr></thead><tbody>${list.map(u => {
-        const isCurrent = u.nick === currentNick;
+    <div class="card">
+      <div class="card-header"><span class="card-title">Все пользователи (${list.length})</span></div>
+      ${list.length ? `<table class="table-wrap"><thead><tr><th>Ник</th><th>Lichess</th><th>FIDE</th><th>Партий</th><th>Анализов</th><th>Последний вход</th></tr></thead><tbody>${list.map(u => {
+        const isCurrent = String(u.nick || '').toLowerCase() === want;
         return `<tr>
-          <td${isCurrent ? ' style="font-weight:600"' : ''}>${esc(u.nick)}${isCurrent ? ' <span class="badge badge-blue">текущий</span>' : ''}</td>
-          <td class="fide-cell" data-nick="${esc(u.nick)}"><span class="fide-value">${esc(u.fide_id || '—')}</span><a href="#" class="fide-edit">изменить</a></td>
+          <td${isCurrent ? ' style="font-weight:600"' : ''}>${esc(u.nick)}${isCurrent ? ' <span class="badge badge-blue">это ты</span>' : ''}</td>
+          <td>${esc(u.lichess || '—')}</td>
+          <td>${esc(u.fide_id || '—')}</td>
           <td class="num">${u.games}</td>
           <td class="num">${u.analyses}</td>
           <td>${u.last_seen_at ? new Date(u.last_seen_at * 1000).toLocaleDateString('ru-RU') : '—'}</td>
-          <td class="row-actions">
-            <form method="post" action="/api/user/switch"><input type="hidden" name="nick" value="${esc(u.nick)}"><button class="btn ${isCurrent ? 'btn-secondary' : 'btn-primary'}" style="font-size:12px;padding:4px 10px" ${isCurrent ? 'disabled' : ''}>${isCurrent ? 'Закреплён' : 'Закрепить'}</button></form>
-            <button type="button" class="btn btn-link user-delete" data-nick="${esc(u.nick)}">удалить</button>
-          </td>
         </tr>`;
-      }).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted);padding:16px">Профилей нет. Добавь первый выше.</p>'}
+      }).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted);padding:16px">Пользователей нет.</p>'}
     </div>`;
 
   const rerender = async () => {
@@ -1907,34 +2029,81 @@ async function viewUsers(app) {
     navigate('users');
   };
 
-  document.getElementById('add-user-form').addEventListener('submit', async e => {
+  const lichEdit = document.getElementById('lichess-edit');
+  if (lichEdit) lichEdit.addEventListener('click', e => {
     e.preventDefault();
-    const fd = new FormData(e.target);
-    try {
-      await apiPost('/api/user/add', fd);
-      await rerender();
-    } catch (err) {
-      alert(err.message);
-    }
-  });
-
-  app.querySelectorAll('form[action="/api/user/switch"]').forEach(form => {
-    form.addEventListener('submit', async e => {
-      e.preventDefault();
+    const slot = document.getElementById('lichess-slot');
+    if (!slot || slot.innerHTML) return;
+    slot.innerHTML = `<form id="lichess-form" class="form-row" style="gap:8px;align-items:flex-end;margin-top:8px">
+        <div class="form-group" style="flex:1;min-width:160px;margin-bottom:0"><label>Ник на Lichess <input type="text" name="lichess" value="${esc(me.lichess || '')}" required></label></div>
+        <button class="btn btn-primary" style="height:38px">Сохранить</button>
+      </form><div class="alert alert-error" id="lichess-err" style="display:none;margin-top:8px"></div>`;
+    document.getElementById('lichess-form').addEventListener('submit', async ev => {
+      ev.preventDefault();
       try {
-        await apiPost('/api/user/switch', new FormData(form));
+        await apiPost('/api/auth/lichess', new FormData(ev.target));
         await rerender();
       } catch (err) {
-        alert(err.message);
+        const box = document.getElementById('lichess-err');
+        if (box) {
+          box.textContent = err.message;
+          box.style.display = 'block';
+        }
       }
     });
   });
 
-  app.querySelectorAll('.fide-edit').forEach(link => {
-    link.addEventListener('click', e => {
-      e.preventDefault();
-      openFideEdit(link, rerender);
+  const fideEdit = document.getElementById('fide-edit');
+  if (fideEdit) fideEdit.addEventListener('click', e => {
+    e.preventDefault();
+    const slot = document.getElementById('fide-slot');
+    if (!slot || slot.innerHTML) return;
+    slot.innerHTML = `<form id="account-fide-form" class="form-row" style="gap:8px;align-items:flex-end;margin-top:8px">
+        <div class="form-group" style="flex:1;min-width:160px;margin-bottom:0"><label>FIDE ID <input type="text" name="fide_id" value="${esc(me.fide_id || '')}" placeholder="4130005"></label></div>
+        <button class="btn btn-primary" style="height:38px">Сохранить</button>
+      </form><div class="alert alert-error" id="account-fide-err" style="display:none;margin-top:8px"></div>`;
+    document.getElementById('account-fide-form').addEventListener('submit', async ev => {
+      ev.preventDefault();
+      const fd = new FormData(ev.target);
+      fd.set('nick', me.nick);
+      try {
+        await apiPost('/api/user/fide', fd);
+        await rerender();
+      } catch (err) {
+        const box = document.getElementById('account-fide-err');
+        if (box) {
+          box.textContent = err.message;
+          box.style.display = 'block';
+        }
+      }
     });
+  });
+
+  document.getElementById('pw-form').addEventListener('submit', async e => {
+    e.preventDefault();
+    const errBox = document.getElementById('pw-err');
+    const okBox = document.getElementById('pw-ok');
+    errBox.style.display = 'none';
+    okBox.style.display = 'none';
+    try {
+      await apiPost('/api/auth/password', new FormData(e.target));
+      e.target.reset();
+      okBox.style.display = 'block';
+    } catch (err) {
+      errBox.textContent = err.message;
+      errBox.style.display = 'block';
+    }
+  });
+
+  document.getElementById('logout-btn').addEventListener('click', async () => {
+    try {
+      await apiPost('/api/auth/logout', new FormData());
+    } catch { /* всё равно выходим */ }
+    state.user = null;
+    state.authMode = 'login';
+    hideNav();
+    renderUserbox();
+    render(state.currentView);
   });
 
   const manualLink = app.querySelector('.track-manual-add');
@@ -1944,24 +2113,6 @@ async function viewUsers(app) {
       openLichessManual();
     });
   }
-
-  app.querySelectorAll('.user-delete').forEach(btn => {
-    btn.addEventListener('click', async () => {
-      const nick = btn.dataset.nick;
-      const ok = confirm(
-        `Удалить профиль ${nick}? Партии и анализы уйдут из БД, файлы в data/ не трогаются.`
-      );
-      if (!ok) return;
-      const fd = new FormData();
-      fd.set('nick', nick);
-      try {
-        await apiPost('/api/user/delete', fd);
-        await rerender();
-      } catch (err) {
-        alert(err.message);
-      }
-    });
-  });
 }
 
 function openFideEdit(link, rerender) {
@@ -2012,16 +2163,33 @@ function bindLinks(root) {
 // --- Init ---
 
 async function loadUser() {
+  let status = null;
   try {
-    const resp = await api('/api/user/current');
-    state.user = resp.user;
+    status = await api('/api/auth/status');
   } catch {
+    status = { logged_in: false, nick: null };
+  }
+  if (!status || !status.logged_in) {
     state.user = null;
+    renderUserbox();
+    return;
+  }
+  try {
+    const data = await api('/api/users');
+    const want = String(status.nick || '').toLowerCase();
+    const found = (data.users || []).find(
+      u => String(u.nick || '').toLowerCase() === want
+    );
+    state.user = found || { nick: status.nick };
+  } catch {
+    state.user = { nick: status.nick };
   }
   renderUserbox();
 }
 
 function startTrackPing() {
+  if (state.trackStarted) return;
+  state.trackStarted = true;
   const ping = () => {
     if (state.user) fetch('/api/track/ping', { method: 'POST' }).catch(() => {});
   };
