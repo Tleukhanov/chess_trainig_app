@@ -13,7 +13,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -1336,7 +1336,18 @@ class PlanGoalTests(ApiTestBase):
         self._add_user()
         resp = self.client.get("/api/plan/goal")
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.json(), {"goal": None, "minutes": 30, "focus": "auto"})
+        self.assertEqual(
+            resp.json(),
+            {
+                "goal": None,
+                "minutes": 30,
+                "focus": "auto",
+                "goal_type": "fix_weak",
+                "tournament_date": None,
+                "target_rating": None,
+                "weeks_left": None,
+            },
+        )
 
     def test_goal_set_and_get(self):
         self._add_user()
@@ -1347,11 +1358,27 @@ class PlanGoalTests(ApiTestBase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(
             resp.json(),
-            {"ok": True, "goal": "Стать 2000", "minutes": 45, "focus": "middlegame"},
+            {
+                "ok": True,
+                "goal": "Стать 2000",
+                "minutes": 45,
+                "focus": "middlegame",
+                "goal_type": "fix_weak",
+                "tournament_date": None,
+                "target_rating": None,
+            },
         )
         self.assertEqual(
             self.client.get("/api/plan/goal").json(),
-            {"goal": "Стать 2000", "minutes": 45, "focus": "middlegame"},
+            {
+                "goal": "Стать 2000",
+                "minutes": 45,
+                "focus": "middlegame",
+                "goal_type": "fix_weak",
+                "tournament_date": None,
+                "target_rating": None,
+                "weeks_left": None,
+            },
         )
 
     def test_goal_validation(self):
@@ -1517,6 +1544,212 @@ class PlanWeekTests(ApiTestBase):
             db.init_db()
             db.clear_current_user()
         self.assertEqual(self.client.get("/api/plan/week").status_code, 404)
+
+
+class PlanLlmTests(ApiTestBase):
+    """Опросник цели + POST /api/plan/generate и GET /api/plan/llm.
+
+    LLM мокается patch'ем app.api.LLMClient (как run_coach/run_mentor
+    в LlmToolApiTests). Сети и движка нет.
+    """
+
+    PLAN_TEXT = (
+        "Неделя 1: упор на эндшпили + твоё самое слабое место\n"
+        "Режим: обычный\n"
+        "Норма дня (30 мин):\n"
+        "- Задачи — 10 мин (20 качественных)\n"
+        "- Эндшпиль — 10 мин (ладейные окончания)\n"
+        "- Партии — 10 мин (1 партия в день)\n"
+        "Итог недели: держим темп, считаем до конца."
+    )
+
+    def _add_user(self) -> None:
+        resp = self.client.post("/api/user/add", data={"nick": "tester"})
+        self.assertEqual(resp.status_code, 200)
+
+    def _wait_job(self, job_id: str, timeout: float = 15.0) -> dict:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            resp = self.client.get(f"/api/jobs/{job_id}")
+            self.assertEqual(resp.status_code, 200)
+            data = resp.json()
+            if data["status"] != "running":
+                return data
+            time.sleep(0.05)
+        self.fail(f"job {job_id} не завершился за {timeout}с")
+
+    def _mock_llm(self, text: str) -> MagicMock:
+        fake = MagicMock()
+        fake.chat.return_value = text
+        fake.model = "test-model"
+        return fake
+
+    def test_questionnaire_save_load(self):
+        self._add_user()
+        resp = self.client.post(
+            "/api/plan/goal",
+            data={
+                "goal": "Турнир летом",
+                "minutes": "60",
+                "focus": "endgame",
+                "goal_type": "tournament",
+                "tournament_date": "2030-06-01",
+            },
+        )
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["goal_type"], "tournament")
+        self.assertEqual(body["tournament_date"], "2030-06-01")
+        self.assertIsNone(body["target_rating"])
+        got = self.client.get("/api/plan/goal").json()
+        self.assertEqual(got["goal_type"], "tournament")
+        self.assertEqual(got["tournament_date"], "2030-06-01")
+        self.assertIsInstance(got["weeks_left"], int)
+        self.assertGreater(got["weeks_left"], 0)
+
+    def test_questionnaire_validation(self):
+        self._add_user()
+        base = {
+            "goal": "x",
+            "minutes": "30",
+            "focus": "auto",
+            "goal_type": "fix_weak",
+        }
+        bad_dates = [{**base, "tournament_date": "мусор"},
+                     {**base, "tournament_date": "01.02.2030"},
+                     {**base, "tournament_date": "2030-13-01"}]
+        for data in bad_dates:
+            with self.subTest(data=data):
+                self.assertEqual(
+                    self.client.post("/api/plan/goal", data=data).status_code, 400
+                )
+        bad_ratings = [{**base, "target_rating": "5000"},
+                       {**base, "target_rating": "799"},
+                       {**base, "target_rating": "abc"}]
+        for data in bad_ratings:
+            with self.subTest(data=data):
+                self.assertEqual(
+                    self.client.post("/api/plan/goal", data=data).status_code, 400
+                )
+        self.assertEqual(
+            self.client.post(
+                "/api/plan/goal", data={**base, "goal_type": "мусор"}
+            ).status_code,
+            400,
+        )
+        # Пустые новые поля — валидны (опциональны).
+        ok = self.client.post(
+            "/api/plan/goal",
+            data={**base, "tournament_date": "", "target_rating": ""},
+        )
+        self.assertEqual(ok.status_code, 200)
+
+    def test_generate_saves_and_get(self):
+        self._add_user()
+        self.client.post(
+            "/api/plan/goal",
+            data={
+                "goal": "Поднять рейтинг",
+                "minutes": "30",
+                "focus": "auto",
+                "goal_type": "rating",
+                "target_rating": "2100",
+            },
+        )
+        self.assertEqual(
+            self.client.get("/api/plan/llm").json(), {"text": None}
+        )
+        with patch.dict(os.environ, {"LLM_API_KEY": "test-key"}), \
+                patch("app.api.LLMClient",
+                      return_value=self._mock_llm(self.PLAN_TEXT)):
+            resp = self.client.post("/api/plan/generate", data={})
+            self.assertEqual(resp.status_code, 200)
+            self.assertFalse(resp.json()["cached"])
+            job = self._wait_job(resp.json()["job_id"])
+        self.assertEqual(job["status"], "done", job.get("error"))
+        plan = job["result"]["plan"]
+        self.assertIn("Неделя 1", plan["text"])
+        got = self.client.get("/api/plan/llm").json()
+        self.assertEqual(got["text"], plan["text"])
+        self.assertIn("created_at", got)
+        self.assertIn("weeks_left", got)
+
+    def test_generate_cached_without_changes(self):
+        self._add_user()
+        with patch.dict(os.environ, {"LLM_API_KEY": "test-key"}), \
+                patch("app.api.LLMClient",
+                      return_value=self._mock_llm(self.PLAN_TEXT)):
+            first = self.client.post("/api/plan/generate", data={})
+            self._wait_job(first.json()["job_id"])
+        second = self.client.post("/api/plan/generate", data={})
+        self.assertEqual(second.status_code, 200)
+        body = second.json()
+        self.assertTrue(body["cached"])
+        self.assertNotIn("job_id", body)
+        self.assertIn("Неделя 1", body["plan"]["text"])
+
+    def test_generate_new_job_after_minutes_change(self):
+        self._add_user()
+        with patch.dict(os.environ, {"LLM_API_KEY": "test-key"}), \
+                patch("app.api.LLMClient",
+                      return_value=self._mock_llm(self.PLAN_TEXT)):
+            first = self.client.post("/api/plan/generate", data={})
+            self._wait_job(first.json()["job_id"])
+        resp = self.client.post(
+            "/api/plan/goal",
+            data={"goal": "Качать тактику", "minutes": "60", "focus": "auto"},
+        )
+        self.assertEqual(resp.status_code, 200)
+        again = self.client.post("/api/plan/generate", data={})
+        self.assertEqual(again.status_code, 200)
+        self.assertFalse(again.json()["cached"])
+        self.assertIn("job_id", again.json())
+
+    def test_generate_dry_run_no_key(self):
+        self._add_user()
+        with patch.dict(os.environ, {"LLM_API_KEY": ""}):
+            resp = self.client.post(
+                "/api/plan/generate", data={"dry_run": "on"}
+            )
+            self.assertEqual(resp.status_code, 200)
+            self.assertFalse(resp.json()["cached"])
+            job = self._wait_job(resp.json()["job_id"])
+        self.assertEqual(job["status"], "done", job.get("error"))
+        result = job["result"]
+        self.assertTrue(result["dry_run"])
+        self.assertTrue(result["prompts"])
+        system = result["prompts"][0]
+        self.assertEqual(system["role"], "system")
+        self.assertIn("Неделя", system["content"])
+        # dry_run ничего не сохраняет.
+        self.assertEqual(
+            self.client.get("/api/plan/llm").json(), {"text": None}
+        )
+
+    def test_generate_thinking_goes_error(self):
+        self._add_user()
+        thinking = (
+            "THINKING ANALYZE CONSTRAINTS STEP 1 FACTS FROM DATA "
+            "thinking analyze constraints step 2 facts from data"
+        )
+        with patch.dict(os.environ, {"LLM_API_KEY": "test-key"}), \
+                patch("app.api.LLMClient",
+                      return_value=self._mock_llm(thinking)):
+            resp = self.client.post("/api/plan/generate", data={})
+            self.assertEqual(resp.status_code, 200)
+            job = self._wait_job(resp.json()["job_id"])
+        self.assertEqual(job["status"], "error")
+        self.assertIn("разбор", job["error"])
+
+    def test_plan_llm_no_user_404(self):
+        self._add_user()
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.clear_current_user()
+        self.assertEqual(self.client.get("/api/plan/llm").status_code, 404)
+        self.assertEqual(
+            self.client.post("/api/plan/generate", data={}).status_code, 404
+        )
 
 
 class FrontendTests(ApiTestBase):

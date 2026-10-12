@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
 import os
@@ -811,6 +812,13 @@ def _task_explain_llm(payload: dict[str, Any]) -> str:
 # --- Цель и недельный план ------------------------------------------------
 
 _PLAN_GOAL_FOCUSES = ("auto", "opening", "middlegame", "endgame")
+_PLAN_GOAL_TYPES = ("rating", "tournament", "fix_weak")
+_PLAN_GOAL_TYPE_RU = {
+    "rating": "поднять рейтинг",
+    "tournament": "подготовка к турниру",
+    "fix_weak": "исправить слабые места",
+}
+_PLAN_GOAL_DEFAULT_TYPE = "fix_weak"
 _PLAN_FOCUS_RU = {
     "opening": "дебют",
     "middlegame": "миттельшпиль",
@@ -830,15 +838,63 @@ def _plan_goal_key(nick: str) -> str:
     return f"plan_goal_{nick}"
 
 
+def _parse_plan_date(raw: Any) -> datetime.date | None:
+    """Строгий разбор YYYY-MM-DD; мусор (включая не-строки) → None.
+
+    datetime.date.fromisoformat в новых Python lenient (ест и "20260101"),
+    поэтому формат проверяем вручную: ровно 10 символов и дефисы на местах.
+    """
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    if (
+        len(text) != 10
+        or text[4] != "-"
+        or text[7] != "-"
+        or not (text[:4] + text[5:7] + text[8:]).isdigit()
+    ):
+        return None
+    try:
+        return datetime.date.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _plan_weeks_left(
+    tournament_date: str | None, today: str | None = None
+) -> int | None:
+    """Недель до турнира от _today(): ceil((date-today)/7), минимум 0.
+
+    Без даты или с битой датой → None. Прошедшая дата → 0.
+    """
+    if not tournament_date:
+        return None
+    day = _parse_plan_date(tournament_date)
+    if day is None:
+        return None
+    try:
+        now = datetime.date.fromisoformat((today or _today()).strip())
+    except (ValueError, AttributeError):
+        return None
+    diff = (day - now).days
+    if diff <= 0:
+        return 0
+    return (diff + 6) // 7
+
+
 def _load_plan_goal(db: Database, nick: str) -> dict[str, Any]:
-    """Цель из meta: {"goal": str|None, "minutes": int, "focus": str}.
+    """Цель из meta: goal/minutes/focus + goal_type/tournament_date/target_rating.
 
     Битый/частичный JSON чинится дефолтами, исключения не выбрасываются.
+    Старые записи без новых ключей читаются с дефолтами (dict.get).
     """
     result: dict[str, Any] = {
         "goal": None,
         "minutes": _PLAN_GOAL_DEFAULT_MINUTES,
         "focus": "auto",
+        "goal_type": _PLAN_GOAL_DEFAULT_TYPE,
+        "tournament_date": None,
+        "target_rating": None,
     }
     raw = db.get_meta(_plan_goal_key(nick))
     if not raw:
@@ -860,6 +916,23 @@ def _load_plan_goal(db: Database, nick: str) -> dict[str, Any]:
     focus = data.get("focus")
     if isinstance(focus, str) and focus in _PLAN_GOAL_FOCUSES:
         result["focus"] = focus
+    goal_type = data.get("goal_type")
+    if isinstance(goal_type, str) and goal_type.strip() in _PLAN_GOAL_TYPES:
+        result["goal_type"] = goal_type.strip()
+    tournament_date = data.get("tournament_date")
+    if isinstance(tournament_date, str) and _parse_plan_date(tournament_date) is not None:
+        result["tournament_date"] = tournament_date.strip()
+    target_rating = data.get("target_rating")
+    if isinstance(target_rating, bool):
+        pass
+    elif isinstance(target_rating, (int, float)) and 800 <= int(target_rating) <= 3200:
+        result["target_rating"] = int(target_rating)
+    elif (
+        isinstance(target_rating, str)
+        and target_rating.strip().isdigit()
+        and 800 <= int(target_rating.strip()) <= 3200
+    ):
+        result["target_rating"] = int(target_rating.strip())
     return result
 
 
@@ -1114,6 +1187,234 @@ def _plan_week_payload(db: Database, nick: str, data_dir: Any) -> dict[str, Any]
         "human_summary": _build_human_summary(
             focus_phase, phases, weak_opening, humanity, drills_today
         ),
+    }
+
+# --- Индивидуальный LLM-план недели ---------------------------------------
+
+_PLAN_LLM_SYSTEM = """Ты — шахматный тренер сильного любителя. Отвечай СРАЗУ готовым планом, без разбора шагов. Только русский язык.
+Структура ответа строго такая:
+"Неделя {n}: {заголовок}"
+"Режим: обычный|предтурнирный"
+"Норма дня ({M} мин):" — далее 3-5 строк формата "- {Блок} — {X} мин ({конкретика: N качественных задач / какие дебюты / сколько партий})" — сумма минут всех строк равна {M}.
+"Итог недели: ..." (1-2 предложения).
+Опирайся ТОЛЬКО на переданные данные: называй ИХ фазу и ИХ дебюты. Если до турнира 14 дней или меньше — предтурнирный режим: решаем задачи и повторяем дебюты, без нового материала. Никакого английского, никаких общих фраз вида "учи эндшпили"."""
+
+
+def _plan_llm_key(nick: str) -> str:
+    """Ключ meta с индивидуальным планом недели (JSON)."""
+    return f"plan_llm_{nick}"
+
+
+def _plan_unnatural_verdict(humanity: dict[str, Any] | None) -> str:
+    """Вердикт человечности одной фразой (для входа LLM-плана)."""
+    if not isinstance(humanity, dict):
+        return "нет данных человечности"
+    try:
+        total = int(humanity.get("total") or 0)
+        unnatural = int(humanity.get("unnatural") or 0)
+    except (TypeError, ValueError):
+        return "нет данных человечности"
+    if total <= 0:
+        return "нет данных человечности"
+    share = round(unnatural / total * 100, 1)
+    if share >= 40.0:
+        return f"{share}% неестественных из {total} — много случайных ходов"
+    return f"{share}% неестественных из {total} — ошибки в основном естественные"
+
+
+def _plan_llm_input(db: Database, nick: str, data_dir: Any) -> dict[str, Any]:
+    """Компактный вход LLM-плана: анкета + цифры из тех же источников,
+    что /api/plan/week (слабая фаза, топ-3 дебюта, вердикт, дрели, счёт)."""
+    goal = _load_plan_goal(db, nick)
+    minutes = int(goal["minutes"])
+    try:
+        plan = shared_data.plan(db, nick, root=data_dir)
+    except RuntimeError:
+        plan = None
+    if not isinstance(plan, dict):
+        plan = None
+
+    focus_phase, focus_reason = _resolve_week_focus(goal, plan)
+    weak_openings: list[dict[str, Any]] = []
+    drills_total = 0
+    drills_unnatural = 0
+    humanity = None
+    score_pct = None
+    avg_win_loss = None
+    if plan is not None:
+        raw_weak = (plan.get("repertoire") or {}).get("weak_openings") or []
+        for item in raw_weak[:3]:
+            if not isinstance(item, dict):
+                continue
+            epg = item.get("errors_per_game")
+            weak_openings.append(
+                {
+                    "opening": str(item.get("opening") or "—"),
+                    "errors_per_game": round(float(epg), 2)
+                    if isinstance(epg, (int, float))
+                    else None,
+                }
+            )
+        drills = plan.get("drills") or {}
+        try:
+            drills_total = int(drills.get("total") or 0)
+        except (TypeError, ValueError):
+            drills_total = 0
+        try:
+            drills_unnatural = int(drills.get("unnatural") or 0)
+        except (TypeError, ValueError):
+            drills_unnatural = 0
+        humanity = plan.get("humanity")
+        if isinstance(plan.get("score_pct"), (int, float)):
+            score_pct = round(float(plan["score_pct"]), 1)
+        if isinstance(plan.get("avg_win_loss"), (int, float)):
+            avg_win_loss = round(float(plan["avg_win_loss"]), 2)
+
+    return {
+        "goal_type": goal.get("goal_type") or _PLAN_GOAL_DEFAULT_TYPE,
+        "goal": goal.get("goal"),
+        "weeks_left": _plan_weeks_left(goal.get("tournament_date")),
+        "target_rating": goal.get("target_rating"),
+        "minutes": minutes,
+        "focus": goal.get("focus") or "auto",
+        "focus_phase": focus_phase,
+        "focus_reason": focus_reason,
+        "weak_openings": weak_openings,
+        "unnatural_verdict": _plan_unnatural_verdict(humanity),
+        "drills_total": drills_total,
+        "drills_unnatural": drills_unnatural,
+        "score_pct": score_pct,
+        "avg_win_loss": avg_win_loss,
+    }
+
+
+def _plan_llm_messages(entry: dict[str, Any]) -> list[ChatMessage]:
+    """User-промпт плана: факты построчно + требование только плана."""
+    type_ru = _PLAN_GOAL_TYPE_RU.get(
+        str(entry.get("goal_type")), str(entry.get("goal_type"))
+    )
+    weeks = entry.get("weeks_left")
+    weeks_txt = f"{weeks} нед." if isinstance(weeks, int) else "без даты турнира"
+    rating = entry.get("target_rating")
+    rating_txt = str(rating) if isinstance(rating, int) else "—"
+    weak = entry.get("weak_openings") or []
+    if weak:
+        weak_txt = "; ".join(
+            f"{w.get('opening')} ({w.get('errors_per_game') if w.get('errors_per_game') is not None else '—'} ошибок/партию)"
+            for w in weak
+            if isinstance(w, dict)
+        )
+    else:
+        weak_txt = "нет данных по дебютам"
+    score = entry.get("score_pct")
+    loss = entry.get("avg_win_loss")
+    lines = [
+        f"Тип цели: {type_ru}.",
+        f"Цель своими словами: {entry.get('goal') or '—'}.",
+        f"До турнира: {weeks_txt}; целевой рейтинг: {rating_txt}.",
+        f"Минут в день: {entry.get('minutes')}.",
+        f"Слабая фаза: {entry.get('focus_phase')} ({entry.get('focus_reason')}).",
+        f"Топ слабых дебютов: {weak_txt}.",
+        f"Человечность: {entry.get('unnatural_verdict')}.",
+        f"Дрели: всего {entry.get('drills_total')}, неестественных {entry.get('drills_unnatural')}.",
+        f"Счёт: {score if score is not None else '—'}%; средняя потеря: {loss if loss is not None else '—'}%.",
+        "Ответ — только план по структуре выше.",
+    ]
+    return [
+        ChatMessage("system", _PLAN_LLM_SYSTEM),
+        ChatMessage("user", "\n".join(lines)),
+    ]
+
+
+def _plan_llm_chat(messages: list[ChatMessage]) -> str:
+    """Один вызов LLM для плана (с повтором при thinking-мусоре).
+
+    thinking-блоки вырезаются, служебный разбор вместо плана — это ошибка
+    (job уйдёт в error, мусор в meta не пишется).
+    """
+    llm = LLMClient()
+    text = clean_llm_text(llm.chat(messages, temperature=0.4, max_tokens=1200))
+    if text and not looks_like_thinking(text):
+        return text
+    retry = [
+        messages[0],
+        ChatMessage(
+            "user",
+            messages[1].content + "\nБез разбора. Сразу готовый план по-русски.",
+        ),
+    ]
+    second = clean_llm_text(llm.chat(retry, temperature=0.4, max_tokens=1200))
+    if not second or looks_like_thinking(second):
+        raise RuntimeError("LLM вернул служебный разбор вместо плана")
+    return second
+
+
+def _run_plan_llm_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None:
+    """Фоновый поток: индивидуальный LLM-план недели → meta plan_llm_*."""
+    try:
+        messages = _plan_llm_messages(params["input"])
+        if params["dry_run"]:
+            job.result = {
+                "dry_run": True,
+                "input_hash": params["input_hash"],
+                "prompts": [
+                    {"role": m.role, "content": m.content} for m in messages
+                ],
+            }
+            job.summary = "План недели: собраны промпты без вызова LLM"
+        else:
+            job.phase = "План недели"
+            _ensure_llm_key()
+            text = _plan_llm_chat(messages)
+            if not text:
+                raise RuntimeError("LLM вернул пустой план")
+            created = _today()
+            record = {
+                "text": text,
+                "created_at": created,
+                "input_hash": params["input_hash"],
+                "weeks_left": params["input"].get("weeks_left"),
+            }
+            with Database(app.state.db_path) as db:
+                db.init_db()
+                db.set_meta(
+                    _plan_llm_key(job.user),
+                    json.dumps(record, ensure_ascii=False),
+                )
+            job.result = {
+                "plan": {
+                    "text": text,
+                    "created_at": created,
+                    "weeks_left": record["weeks_left"],
+                }
+            }
+            job.summary = "Индивидуальный план недели готов"
+        job.status = "done"
+    except Exception as exc:
+        job.status = "error"
+        job.error = str(exc)
+    finally:
+        job.finished = time.time()
+
+
+def _load_plan_llm(db: Database, nick: str) -> dict[str, Any] | None:
+    """Сохранённый LLM-план из meta; нет/битый/пустой текст → None."""
+    raw = db.get_meta(_plan_llm_key(nick))
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    text = data.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return None
+    return {
+        "text": text,
+        "created_at": data.get("created_at"),
+        "weeks_left": data.get("weeks_left"),
     }
 
 # --- Мини-трекер времени ---------------------------------------------------
@@ -1371,7 +1672,8 @@ def create_api(
         if not user:
             raise HTTPException(404, "No current user")
         with Database(app.state.db_path) as db:
-            return _load_plan_goal(db, user["nick"])
+            goal = _load_plan_goal(db, user["nick"])
+        return {**goal, "weeks_left": _plan_weeks_left(goal.get("tournament_date"))}
 
     @app.post("/api/plan/goal")
     def api_plan_goal_set(
@@ -1379,6 +1681,9 @@ def create_api(
         goal: str = Form(""),
         minutes: str = Form(""),
         focus: str = Form(""),
+        goal_type: str = Form(""),
+        tournament_date: str = Form(""),
+        target_rating: str = Form(""),
     ):
         user = _current_user(app.state.db_path, request)
         if not user:
@@ -1397,7 +1702,35 @@ def create_api(
             raise HTTPException(
                 400, f"Фокус: один из {', '.join(_PLAN_GOAL_FOCUSES)}"
             )
-        saved = {"goal": text, "minutes": mins, "focus": focus_clean}
+        type_clean = goal_type.strip() or _PLAN_GOAL_DEFAULT_TYPE
+        if type_clean not in _PLAN_GOAL_TYPES:
+            raise HTTPException(
+                400, f"Тип цели: один из {', '.join(_PLAN_GOAL_TYPES)}"
+            )
+        date_clean = tournament_date.strip()
+        if date_clean and _parse_plan_date(date_clean) is None:
+            raise HTTPException(400, "Дата турнира: формат YYYY-MM-DD")
+        rating_clean = target_rating.strip()
+        rating_value: int | None = None
+        if rating_clean:
+            try:
+                rating_value = int(rating_clean)
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    400, "Целевой рейтинг: целое число от 800 до 3200"
+                ) from None
+            if not 800 <= rating_value <= 3200:
+                raise HTTPException(
+                    400, "Целевой рейтинг: целое число от 800 до 3200"
+                )
+        saved = {
+            "goal": text,
+            "minutes": mins,
+            "focus": focus_clean,
+            "goal_type": type_clean,
+            "tournament_date": date_clean or None,
+            "target_rating": rating_value,
+        }
         with Database(app.state.db_path) as db:
             db.set_meta(
                 _plan_goal_key(user["nick"]),
@@ -1412,6 +1745,72 @@ def create_api(
             raise HTTPException(404, "No current user")
         with Database(app.state.db_path) as db:
             return _plan_week_payload(db, user["nick"], app.state.data_dir)
+
+    @app.get("/api/plan/llm")
+    def api_plan_llm_get(request: Request):
+        user = _current_user(app.state.db_path, request)
+        if not user:
+            raise HTTPException(404, "No current user")
+        with Database(app.state.db_path) as db:
+            saved = _load_plan_llm(db, user["nick"])
+        if saved is None:
+            return {"text": None}
+        return saved
+
+    @app.post("/api/plan/generate")
+    def api_plan_generate(
+        request: Request,
+        dry_run: str | None = Form(None),
+        regenerate: str | None = Form(None),
+    ):
+        user = _current_user(app.state.db_path, request)
+        if not user:
+            raise HTTPException(404, "No current user")
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            entry = _plan_llm_input(db, user["nick"], app.state.data_dir)
+            raw = db.get_meta(_plan_llm_key(user["nick"]))
+        digest = hashlib.sha256(
+            json.dumps(entry, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        saved = None
+        if raw:
+            try:
+                data = json.loads(raw)
+                if isinstance(data, dict):
+                    saved = data
+            except (TypeError, ValueError):
+                saved = None
+        if (
+            saved
+            and saved.get("input_hash") == digest
+            and regenerate != "on"
+            and isinstance(saved.get("text"), str)
+            and saved["text"].strip()
+        ):
+            return {
+                "cached": True,
+                "plan": {
+                    "text": saved["text"],
+                    "created_at": saved.get("created_at"),
+                    "weeks_left": saved.get("weeks_left"),
+                },
+            }
+        job = CoachJob(
+            id=uuid.uuid4().hex,
+            user=user["nick"],
+            phase="План недели",
+        )
+        _register_job(job)
+        params = {
+            "input": entry,
+            "input_hash": digest,
+            "dry_run": dry_run == "on",
+        }
+        threading.Thread(
+            target=_run_plan_llm_job, args=(app, job, params), daemon=True
+        ).start()
+        return {"cached": False, "job_id": job.id, "status": "started"}
 
     # --- Coach / Analysis jobs ---
     @app.post("/api/coach/run")

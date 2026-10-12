@@ -19,6 +19,9 @@ const state = {
   taskExplaining: false,
   taskJobId: null,
   taskError: null,
+  planLlmGenerating: false,
+  planLlmJobId: null,
+  planLlmError: null,
   authMode: 'login',
   trackStarted: false,
 };
@@ -448,21 +451,39 @@ async function viewPlan(app) {
     return;
   }
   const plan = await api('/api/plan');
-  const [taskToday, track, report, goalData, weekData] = await Promise.all([
+  const [taskToday, track, report, goalData, weekData, llmData] = await Promise.all([
     api('/api/task/today').catch(() => null),
     api('/api/track/today').catch(() => null),
     api('/api/report').catch(() => null),
     api('/api/plan/goal').catch(() => null),
     api('/api/plan/week').catch(() => null),
+    api('/api/plan/llm').catch(() => null),
   ]);
 
   const focusRu = { auto: 'авто', opening: 'дебют', middlegame: 'миттельшпиль', endgame: 'эндшпиль' };
-  const goalFormHtml = (goal, minutes, focus) => `
-    <form id="plan-goal-form" class="form-row" style="gap:12px;align-items:flex-end">
+  const goalTypeRu = { rating: 'Поднять рейтинг', tournament: 'Подготовка к турниру', fix_weak: 'Исправить слабые места' };
+  const goalFormHtml = (goal, minutes, focus, goalType, tournamentDate, targetRating) => {
+    const gt = goalTypeRu[goalType] ? goalType : 'fix_weak';
+    return `
+    <form id="plan-goal-form" class="form-row" style="gap:12px;align-items:flex-end;flex-wrap:wrap">
       <div class="form-group" style="flex:2;min-width:180px;margin-bottom:0">
         <label for="plan-goal-text">Твоя цель</label>
         <input type="text" id="plan-goal-text" name="goal" maxlength="200" placeholder="например, 2000 на Lichess к лету"
                value="${esc(goal || '')}" autocomplete="off" required>
+      </div>
+      <div class="form-group" style="flex:0;min-width:180px;margin-bottom:0">
+        <label for="plan-goal-type">Тип цели</label>
+        <select id="plan-goal-type" name="goal_type">
+          ${Object.entries(goalTypeRu).map(([v, label]) => `<option value="${v}"${gt === v ? ' selected' : ''}>${label}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-group" id="plan-goal-date-wrap" style="flex:0;min-width:150px;margin-bottom:0;${gt === 'tournament' ? '' : 'display:none'}">
+        <label for="plan-goal-date">Дата турнира</label>
+        <input type="date" id="plan-goal-date" name="tournament_date" value="${esc(tournamentDate || '')}">
+      </div>
+      <div class="form-group" id="plan-goal-rating-wrap" style="flex:0;min-width:130px;margin-bottom:0;${gt === 'rating' ? '' : 'display:none'}">
+        <label for="plan-goal-rating">Целевой рейтинг</label>
+        <input type="number" id="plan-goal-rating" name="target_rating" min="800" max="3200" step="1" value="${esc(targetRating || '')}" placeholder="2000">
       </div>
       <div class="form-group" style="flex:0;min-width:110px;margin-bottom:0">
         <label for="plan-goal-minutes">Минут в день</label>
@@ -477,22 +498,44 @@ async function viewPlan(app) {
       <button class="btn btn-primary" style="height:38px">Сохранить</button>
     </form>
     <div class="alert alert-error" id="plan-goal-err" style="display:none;margin-top:8px"></div>`;
+  };
 
   let goalHtml = '';
   if (goalData) {
+    const gExtra = goalData.goal_type === 'tournament' && goalData.tournament_date
+      ? ` · турнир ${esc(goalData.tournament_date)}${goalData.weeks_left != null ? ` (осталось ${goalData.weeks_left} нед.)` : ''}`
+      : goalData.goal_type === 'rating' && goalData.target_rating
+        ? ` · цель ${goalData.target_rating}`
+        : '';
     if (goalData.goal) {
       goalHtml = `<div class="card"><div class="card-header"><span class="card-title">Твоя цель</span></div>
         <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
           <span class="badge badge-good">цель</span>
-          <span style="flex:1;min-width:180px">«${esc(goalData.goal)}» · ${goalData.minutes} мин/день · фокус: ${esc(focusRu[goalData.focus] || goalData.focus)}</span>
+          <span style="flex:1;min-width:180px">«${esc(goalData.goal)}» · ${esc(goalTypeRu[goalData.goal_type] || goalData.goal_type || '')}${gExtra} · ${goalData.minutes} мин/день · фокус: ${esc(focusRu[goalData.focus] || goalData.focus)}</span>
           <a href="#" class="btn btn-link" id="plan-goal-edit">изменить</a>
         </div>
         <div id="plan-goal-slot" style="margin-top:8px"></div></div>`;
     } else {
       goalHtml = `<div class="card"><div class="card-header"><span class="card-title">Твоя цель</span></div>
         <p style="color:var(--c-text-muted);font-size:13px;margin-top:0">Скажи, к чему идём, — и неделя посчитается под твою цель.</p>
-        ${goalFormHtml('', 30, 'auto')}</div>`;
+        ${goalFormHtml('', 30, 'auto', 'fix_weak', '', '')}</div>`;
     }
+  }
+
+  let llmHtml = '';
+  if (state.planLlmGenerating) {
+    llmHtml = `<div class="card"><div class="card-header"><span class="card-title">Индивидуальный план</span></div>
+      <p style="color:var(--c-text-muted);font-size:13px;margin:0">генерирую…</p></div>`;
+  } else if (llmData && llmData.text) {
+    llmHtml = `<div class="card"><div class="card-header"><span class="card-title">Индивидуальный план</span>${llmData.created_at ? `<span class="badge badge-neutral">${esc(llmData.created_at)}</span>` : ''}</div>
+      <div class="mentor-reply">${esc(llmData.text)}</div>
+      ${state.planLlmError ? `<div class="alert alert-error" style="margin-top:8px">${esc(state.planLlmError)}</div>` : ''}
+      <div style="margin-top:8px"><button class="btn btn-secondary" id="plan-llm-refresh" style="font-size:12px;padding:4px 10px">Обновить</button></div></div>`;
+  } else {
+    llmHtml = `<div class="card"><div class="card-header"><span class="card-title">Индивидуальный план</span></div>
+      <p style="color:var(--c-text-muted);font-size:13px;margin-top:0">Пройди опросник выше — и тренер соберёт неделю под твою цель, время и слабые места.</p>
+      ${state.planLlmError ? `<div class="alert alert-error" style="margin-bottom:8px">${esc(state.planLlmError)}</div>` : ''}
+      <button class="btn btn-primary" id="plan-llm-create" style="width:fit-content">Создать план на неделю (LLM)</button></div>`;
   }
 
   let weekHtml = '';
@@ -536,6 +579,7 @@ async function viewPlan(app) {
   app.innerHTML = `
     <div class="card-header"><h1>План тренировки</h1><span class="badge badge-blue">${esc(state.user.nick)}</span></div>
     ${goalHtml}
+    ${llmHtml}
     ${weekHtml}
     ${todayHtml}
     <div class="grid grid-4">
@@ -590,6 +634,18 @@ async function viewPlan(app) {
   const bindGoalForm = () => {
     const form = document.getElementById('plan-goal-form');
     if (!form) return;
+    const typeSel = document.getElementById('plan-goal-type');
+    const dateWrap = document.getElementById('plan-goal-date-wrap');
+    const ratingWrap = document.getElementById('plan-goal-rating-wrap');
+    const toggleGoalType = () => {
+      const v = typeSel ? typeSel.value : 'fix_weak';
+      if (dateWrap) dateWrap.style.display = v === 'tournament' ? '' : 'none';
+      if (ratingWrap) ratingWrap.style.display = v === 'rating' ? '' : 'none';
+    };
+    if (typeSel) {
+      typeSel.addEventListener('change', toggleGoalType);
+      toggleGoalType();
+    }
     form.addEventListener('submit', async e => {
       e.preventDefault();
       const err = document.getElementById('plan-goal-err');
@@ -616,10 +672,74 @@ async function viewPlan(app) {
         slot.innerHTML = '';
         return;
       }
-      slot.innerHTML = goalFormHtml(goalData.goal, goalData.minutes, goalData.focus);
+      slot.innerHTML = goalFormHtml(goalData.goal, goalData.minutes, goalData.focus, goalData.goal_type, goalData.tournament_date, goalData.target_rating);
       bindGoalForm();
     });
   }
+  const llmCreate = document.getElementById('plan-llm-create');
+  if (llmCreate) llmCreate.addEventListener('click', () => planLlmGenerate(app, false));
+  const llmRefresh = document.getElementById('plan-llm-refresh');
+  if (llmRefresh) llmRefresh.addEventListener('click', () => planLlmGenerate(app, true));
+  // вернулись на страницу, пока шёл план, — возобновляем поллинг джобы
+  if (state.planLlmGenerating && !state.jobPollTimer && state.planLlmJobId) {
+    planLlmPoll(app, state.planLlmJobId);
+  }
+}
+
+async function planLlmGenerate(app, regenerate) {
+  state.planLlmGenerating = true;
+  state.planLlmError = null;
+  try {
+    const fd = new FormData();
+    if (regenerate) fd.set('regenerate', 'on');
+    const res = await apiPost('/api/plan/generate', fd);
+    if (res.cached) {
+      state.planLlmGenerating = false;
+      state.planLlmJobId = null;
+      await viewPlan(app);
+      return;
+    }
+    state.planLlmJobId = res.job_id;
+    await viewPlan(app);
+    planLlmPoll(app, res.job_id);
+  } catch (err) {
+    state.planLlmGenerating = false;
+    state.planLlmJobId = null;
+    state.planLlmError = err.message;
+    await viewPlan(app);
+  }
+}
+
+function planLlmPoll(app, jobId) {
+  if (state.jobPollTimer) clearInterval(state.jobPollTimer);
+  state.jobPollTimer = setInterval(async () => {
+    let job;
+    try {
+      job = await api('/api/jobs/' + jobId);
+    } catch {
+      clearInterval(state.jobPollTimer);
+      state.jobPollTimer = null;
+      state.planLlmGenerating = false;
+      state.planLlmJobId = null;
+      state.planLlmError = 'Не удалось получить план';
+      viewPlan(app);
+      return;
+    }
+    if (job.status === 'done') {
+      clearInterval(state.jobPollTimer);
+      state.jobPollTimer = null;
+      state.planLlmGenerating = false;
+      state.planLlmJobId = null;
+      viewPlan(app);
+    } else if (job.status === 'error') {
+      clearInterval(state.jobPollTimer);
+      state.jobPollTimer = null;
+      state.planLlmGenerating = false;
+      state.planLlmJobId = null;
+      state.planLlmError = job.error || 'Не удалось получить план';
+      viewPlan(app);
+    }
+  }, 700);
 }
 
 async function viewProgress(app) {
