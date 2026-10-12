@@ -992,7 +992,7 @@ function gameMetricsHtml(analysis) {
 }
 
 const PIECE_GLYPHS = {
-  K: '♔', Q: '♕', R: '♖', B: '♗', N: '♘', P: '♙',
+  K: '♚', Q: '♛', R: '♜', B: '♝', N: '♞', P: '♟',
   k: '♚', q: '♛', r: '♜', b: '♝', n: '♞', p: '♟',
 };
 const FILES = 'abcdefgh';
@@ -1056,7 +1056,7 @@ function boardHtml(fen, hlSquares, flip = false) {
       let coord = '';
       if (ci === 0) coord += `<span class="board-coord board-coord-rank" style="color:${coordColor}">${rank}</span>`;
       if (ri === 7) coord += `<span class="board-coord board-coord-file" style="color:${coordColor}">${FILES[f]}</span>`;
-      html += `<div class="${cls.join(' ')}" data-square="${square}">${coord}${piece ? `<span class="piece">${PIECE_GLYPHS[piece]}</span>` : ''}</div>`;
+      html += `<div class="${cls.join(' ')}" data-square="${square}">${coord}${piece ? `<span class="piece ${piece === piece.toUpperCase() ? 'pw' : 'pb'}">${PIECE_GLYPHS[piece]}</span>` : ''}</div>`;
     }
   }
   return `<div class="board">${html}</div>`;

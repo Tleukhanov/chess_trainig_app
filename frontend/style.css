@@ -416,7 +416,9 @@ td.center { text-align: center; }
 .board-coord { position: absolute; font-size: 10px; font-weight: 600; line-height: 1; opacity: .9; pointer-events: none; }
 .board-coord-rank { top: 2px; left: 3px; }
 .board-coord-file { bottom: 2px; right: 3px; }
-.piece { font-size: clamp(20px, 5.5vw, 34px); line-height: 1; color: var(--c-piece); }
+.piece { font-size: clamp(20px, 5.5vw, 34px); line-height: 1; color: var(--c-piece); filter: drop-shadow(0 1px 1px rgba(0,0,0,0.35)); }
+.piece.pb { color: #161512; }
+.piece.pw { color: #f8f6f0; -webkit-text-stroke: 0.045em #2b2620; paint-order: stroke fill; }
 .board-meta { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; align-items: center; }
 .board-controls { display: flex; align-items: center; gap: 6px; margin-top: 12px; }
 .board-controls input[type="range"] { flex: 1; accent-color: var(--c-btn-primary); min-width: 60px; }

@@ -2079,7 +2079,7 @@ class FrontendTests(ApiTestBase):
         html = resp.text
         self.assertIn("app.js?v=", html)
         self.assertIn("style.css?v=", html)
-        self.assertIn("v0.4.1", html)
+        self.assertIn("v0.4.2", html)
 
 
 class AuthApiTests(ApiTestBase):
