@@ -263,7 +263,8 @@ class RunCoachTests(unittest.TestCase):
         self.assertEqual(len(messages), 2)
         self.assertIs(kwargs["json_mode"], True)
         self.assertEqual(kwargs["temperature"], 0.4)
-        self.assertEqual(kwargs["max_tokens"], 1200)
+        # Лимиты — дефолт LLMClient (настройки LLM_MAX_TOKENS/REASONING_BUDGET).
+        self.assertNotIn("max_tokens", kwargs)
 
     def test_no_moments_returns_empty_without_chat(self) -> None:
         fake = _FakeLLM()

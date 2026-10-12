@@ -1049,9 +1049,14 @@ class TaskApiTests(ApiTestBase):
 
     def test_explain_then_cached(self):
         self._seed_tasks()
+        good = (
+            "Твой ход Bb5 — ошибка: поле c4 осталось без контроля. "
+            "Лучше было Bc4 с давлением на центр. "
+            "В похожих позициях сначала считай ответы соперника."
+        )
         with patch.dict(os.environ, {"LLM_API_KEY": "test-key"}), \
                 patch("app.api._task_explain_llm",
-                      return_value="Не увидел связку на c4.") as llm:
+                      return_value=good) as llm:
             resp = self.client.post("/api/task/explain")
             self.assertEqual(resp.status_code, 200)
             data = resp.json()
@@ -1060,17 +1065,17 @@ class TaskApiTests(ApiTestBase):
             llm.assert_called_once()
 
         self.assertEqual(job["status"], "done", job.get("error"))
-        self.assertEqual(job["result"]["explanation"], "Не увидел связку на c4.")
+        self.assertEqual(job["result"]["explanation"], good)
         payload = self.client.get("/api/task/today").json()
         self.assertTrue(payload["explained"])
-        self.assertEqual(payload["explanation"], "Не увидел связку на c4.")
+        self.assertEqual(payload["explanation"], good)
 
         with patch("app.api._task_explain_llm") as llm2:
             resp = self.client.post("/api/task/explain")
             self.assertEqual(resp.status_code, 200)
             data = resp.json()
             self.assertTrue(data["cached"])
-            self.assertEqual(data["explanation"], "Не увидел связку на c4.")
+            self.assertEqual(data["explanation"], good)
             llm2.assert_not_called()
 
     def test_explain_no_llm_key_job_error(self):
@@ -1102,7 +1107,11 @@ class TaskApiTests(ApiTestBase):
 
         with patch.dict(os.environ, {"LLM_API_KEY": "test-key"}), \
                 patch("app.api._task_explain_llm",
-                      return_value="Хорошее объяснение по-русски.") as llm:
+                      return_value=(
+                          "Твой ход Nf3 — неточность: ты отдал центр без борьбы. "
+                          "Сильнее было c4 с давлением на поле d5. "
+                          "В похожих позициях сначала занимай центр пешками."
+                      )) as llm:
             resp = self.client.post("/api/task/explain")
             self.assertEqual(resp.status_code, 200)
             self.assertFalse(resp.json()["cached"])
@@ -1111,7 +1120,21 @@ class TaskApiTests(ApiTestBase):
         self.assertEqual(job["status"], "done", job.get("error"))
         fixed = self.client.get("/api/task/today").json()
         self.assertTrue(fixed["explained"])
-        self.assertEqual(fixed["explanation"], "Хорошее объяснение по-русски.")
+        self.assertEqual(fixed["explanation"], job["result"]["explanation"])
+
+    def test_explain_safety_stub_ignored(self):
+        """safety-заглушка в БД: today отдаёт explained=false (без сети)."""
+        self._seed_tasks()
+        today = self.client.get("/api/task/today").json()
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.save_task_explanation(
+                today["task_key"], "tester", today["game_id"], today["ply"],
+                "User Safety: safe",
+            )
+        poisoned = self.client.get("/api/task/today").json()
+        self.assertFalse(poisoned["explained"])
+        self.assertIsNone(poisoned["explanation"])
 
     # --- пустой пул / нет пользователя ---
 

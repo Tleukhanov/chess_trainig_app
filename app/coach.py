@@ -240,5 +240,5 @@ def run_coach(game: Game, analysis: dict[str, Any], llm: LLMClient, max_moments:
     messages, idx = build_request(game, analysis, max_moments)
     if not messages:
         return {}, None
-    text = llm.chat(messages, temperature=temperature, json_mode=True, max_tokens=1200)
+    text = llm.chat(messages, temperature=temperature, json_mode=True)
     return parse_game_answer(text, idx)

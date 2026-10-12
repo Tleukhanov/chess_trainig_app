@@ -12,6 +12,7 @@ from app.llm import (
     LLMClient,
     build_completion_url,
     clean_llm_text,
+    looks_like_refusal,
     looks_like_thinking,
 )
 
@@ -87,6 +88,8 @@ class LLMClientTests(unittest.TestCase):
         self.assertEqual(self.last_request()["path"], "/v1/chat/completions")
 
     def test_extra_body_fields(self) -> None:
+        from app.config import settings
+
         client = LLMClient(api_key="test-key", base_url=self.base)
         client.chat(
             [ChatMessage("system", "You are helpful"), ChatMessage("user", "hi")],
@@ -99,8 +102,11 @@ class LLMClientTests(unittest.TestCase):
         self.assertEqual(body["messages"][0]["content"], "You are helpful")
         self.assertIs(body["stream"], False)
         self.assertEqual(body["temperature"], 0.7)
-        self.assertNotIn("max_tokens", body)
+        # None → дефолт из настроек (LLM_MAX_TOKENS).
+        self.assertEqual(body["max_tokens"], settings.llm_max_tokens)
         self.assertNotIn("response_format", body)
+        # Локальная база: провайдер-специфичный reasoning не шлём.
+        self.assertNotIn("reasoning", body)
 
     def test_no_key_local_base_url_passes_without_auth(self) -> None:
         client = LLMClient(api_key="", base_url=self.base)
@@ -121,11 +127,13 @@ class LLMClientTests(unittest.TestCase):
         )
 
     def test_json_mode_adds_response_format(self) -> None:
+        from app.config import settings
+
         client = LLMClient(api_key="test-key", base_url=self.base)
         client.chat([ChatMessage("user", "hi")], json_mode=True)
         body = json.loads(self.last_request()["body"])
         self.assertEqual(body["response_format"], {"type": "json_object"})
-        self.assertEqual(body["max_tokens"], 500)
+        self.assertEqual(body["max_tokens"], settings.llm_max_tokens)
 
     def test_http_429_raises_with_status_text(self) -> None:
         with self.server.lock:
@@ -150,6 +158,72 @@ class LLMClientTests(unittest.TestCase):
         client = LLMClient(api_key="test-key", base_url=self.base)
         with self.assertRaisesRegex(RuntimeError, "no choices"):
             client.chat([ChatMessage("user", "hi")])
+
+    def test_null_content_with_length_reports_reasoning(self) -> None:
+        """content=null + finish length + reasoning → диагноз с хинтом."""
+        with self.server.lock:
+            self.server.response_body = json.dumps(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "length",
+                            "message": {
+                                "content": None,
+                                "refusal": None,
+                                "reasoning": "thinking trace...",
+                            },
+                        }
+                    ],
+                    "usage": {
+                        "completion_tokens_details": {"reasoning_tokens": 50}
+                    },
+                }
+            ).encode("utf-8")
+        client = LLMClient(api_key="test-key", base_url=self.base)
+        try:
+            client.chat([ChatMessage("user", "hi")])
+        except RuntimeError as exc:
+            text = str(exc)
+        else:
+            self.fail("ожидался RuntimeError на пустой content")
+        self.assertIn("length", text)
+        self.assertIn("размышление", text)
+
+    def test_reasoning_param_sent_only_for_openrouter(self) -> None:
+        """reasoning={max_tokens, exclude} — только при openrouter-базе."""
+        import urllib.request as urlrequest
+        from unittest.mock import patch
+
+        from app.config import settings
+
+        captured: dict[str, str] = {}
+
+        class _FakeResp:
+            def __enter__(self) -> "_FakeResp":
+                return self
+
+            def __exit__(self, *args: object) -> bool:
+                return False
+
+            def read(self) -> bytes:
+                return _OK_BODY
+
+        def _fake_urlopen(request: object, timeout: object = None) -> _FakeResp:
+            captured["body"] = request.data.decode("utf-8")  # type: ignore[union-attr]
+            return _FakeResp()
+
+        client = LLMClient(
+            api_key="test-key", base_url="https://openrouter.ai/api/v1"
+        )
+        with patch.object(urlrequest, "urlopen", side_effect=_fake_urlopen):
+            result = client.chat([ChatMessage("user", "hi")])
+        self.assertEqual(result, "OK")
+        body = json.loads(captured["body"])
+        self.assertEqual(
+            body["reasoning"],
+            {"max_tokens": settings.llm_reasoning_budget, "exclude": True},
+        )
+        self.assertEqual(body["max_tokens"], settings.llm_max_tokens)
 
     def test_invalid_role_rejected(self) -> None:
         with self.assertRaises(ValueError):
@@ -221,6 +295,27 @@ class ThinkFilterTests(unittest.TestCase):
         # Один-два маркера — ещё не разбор (предсказуемый порог >=3).
         self.assertFalse(looks_like_thinking("Step 1: разбери позицию."))
         self.assertFalse(looks_like_thinking(""))
+
+
+class RefusalTests(unittest.TestCase):
+    """looks_like_refusal / _is_bad_explanation — safety-заглушки без сети."""
+
+    def test_refusal_true_for_safety_stub(self) -> None:
+        self.assertTrue(looks_like_refusal("User Safety: safe"))
+
+    def test_refusal_false_for_normal_russian(self) -> None:
+        good = (
+            "Твой ход Bb5 — ошибка: поле c4 осталось без контроля. "
+            "Лучше было Bc4 с давлением на центр. "
+            "В похожих позициях сначала считай ответы соперника."
+        )
+        self.assertFalse(looks_like_refusal(good))
+
+    def test_bad_explanation_true_for_short_stub(self) -> None:
+        from app.api import _is_bad_explanation
+
+        self.assertTrue(_is_bad_explanation("Коротко."))
+        self.assertTrue(_is_bad_explanation("User Safety: safe"))
 
 
 if __name__ == "__main__":

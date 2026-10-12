@@ -208,7 +208,7 @@ def run_mentor(llm: LLMClient, messages: list[ChatMessage]) -> str:
         if attempt:
             time.sleep(_BACKOFF[min(attempt - 1, len(_BACKOFF) - 1)])
         try:
-            return llm.chat(messages, temperature=0.5, max_tokens=1600)
+            return llm.chat(messages, temperature=0.5)
         except RuntimeError as exc:
             last = exc
     assert last is not None

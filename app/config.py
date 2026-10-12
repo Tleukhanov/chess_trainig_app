@@ -62,6 +62,8 @@ class Settings:
     llm_api_key: str = _cfg("LLM_API_KEY", "")
     llm_base_url: str = _cfg("LLM_BASE_URL", "https://openrouter.ai/api/v1")
     llm_model: str = _cfg("LLM_MODEL", "openai/gpt-4o-mini")
+    llm_max_tokens: int = int(_cfg("LLM_MAX_TOKENS", "4000"))
+    llm_reasoning_budget: int = int(_cfg("LLM_REASONING_BUDGET", "1024"))
 
 
 settings = Settings()

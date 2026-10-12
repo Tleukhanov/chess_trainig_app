@@ -49,6 +49,34 @@ def clean_llm_text(text: str) -> str:
     return cleaned.strip()
 
 
+# Маркеры safety-отказа модели (эвристика для looks_like_refusal).
+_REFUSAL_MARKERS = (
+    "user safety",
+    "content policy",
+    "content removed",
+    "as an ai",
+    "i'm sorry",
+    "i am sorry",
+    "sorry, i can",
+    "i can't",
+    "i cannot",
+    "не могу ответить",
+    "извините, но",
+    "к сожалению, не могу",
+)
+
+
+def looks_like_refusal(text: str) -> bool:
+    """True, если текст похож на safety-заглушку/отказ модели, а не на ответ.
+
+    Эвристика: наличие любого маркера из списка (регистр не важен).
+    """
+    if not isinstance(text, str) or not text:
+        return False
+    lowered = text.lower()
+    return any(marker in lowered for marker in _REFUSAL_MARKERS)
+
+
 def looks_like_thinking(text: str) -> bool:
     """True, если текст похож на служебный thinking-разбор, а не на ответ.
 
@@ -116,7 +144,8 @@ class LLMClient:
         messages: list[ChatMessage],
         *,
         temperature: float = 0.3,
-        max_tokens: int | None = 500,
+        max_tokens: int | None = None,
+        reasoning_max_tokens: int | None = None,
         json_mode: bool = False,
     ) -> str:
         if not messages:
@@ -124,6 +153,11 @@ class LLMClient:
         for message in messages:
             if not isinstance(message, ChatMessage):
                 raise ValueError("Все элементы messages должны быть ChatMessage")
+
+        if max_tokens is None:
+            max_tokens = settings.llm_max_tokens
+        if reasoning_max_tokens is None:
+            reasoning_max_tokens = settings.llm_reasoning_budget
 
         body: dict[str, Any] = {
             "model": self.model,
@@ -133,6 +167,15 @@ class LLMClient:
         }
         if max_tokens is not None:
             body["max_tokens"] = max_tokens
+        if (
+            reasoning_max_tokens is not None
+            and reasoning_max_tokens > 0
+            and "openrouter" in (self.base_url or "").lower()
+        ):
+            body["reasoning"] = {
+                "max_tokens": reasoning_max_tokens,
+                "exclude": True,
+            }
         if json_mode:
             body["response_format"] = {"type": "json_object"}
 
@@ -178,7 +221,16 @@ class LLMClient:
         choices = data.get("choices") if isinstance(data, dict) else None
         if not choices:
             raise RuntimeError("LLM: пустой ответ (no choices)")
-        content = choices[0].get("message", {}).get("content")
-        if not isinstance(content, str):
-            raise RuntimeError("LLM: пустой ответ (no choices)")
+        first = choices[0] if isinstance(choices[0], dict) else {}
+        msg = first.get("message", {})
+        if not isinstance(msg, dict):
+            msg = {}
+        content = msg.get("content")
+        if not isinstance(content, str) or not content.strip():
+            finish = first.get("finish_reason") or first.get("native_finish_reason")
+            has_reasoning = bool(msg.get("reasoning") or msg.get("reasoning_content"))
+            hint = ""
+            if finish == "length" or has_reasoning:
+                hint = " — модель потратила лимит на размышление, увеличьте лимит токенов"
+            raise RuntimeError(f"LLM: пустой ответ (finish_reason={finish}{hint})")
         return content

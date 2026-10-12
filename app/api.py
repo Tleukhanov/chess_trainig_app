@@ -41,7 +41,7 @@ from .fide import (
 )
 from .games import fetch_user_games
 from .humanize import humanize_report
-from .llm import ChatMessage, LLMClient, _is_local_host, clean_llm_text, looks_like_thinking
+from .llm import ChatMessage, LLMClient, _is_local_host, clean_llm_text, looks_like_refusal, looks_like_thinking
 from .maia import MaiaLitePolicy
 from .mentor import build_mentor_request, format_mentor_reply, run_mentor
 from .metrics import metric
@@ -708,6 +708,19 @@ def _pick_daily_task(db: Database, user: str, date: str) -> dict[str, Any]:
     return chosen
 
 
+def _is_bad_explanation(text: Any) -> bool:
+    """True, если объяснение — мусор: thinking-разбор, safety-отказ или огрызок.
+
+    Объяснение обязано быть 3–5 предложений, поэтому текст короче 80 символов
+    (после strip) тоже считается плохим.
+    """
+    if not isinstance(text, str):
+        return True
+    if looks_like_thinking(text) or looks_like_refusal(text):
+        return True
+    return len(text.strip()) < 80
+
+
 def _task_payload(db: Database, user: str, date: str | None = None) -> dict[str, Any]:
     """JSON для /api/task/today: позиция до хода, решение и объяснение."""
     day = date or _today()
@@ -717,9 +730,9 @@ def _task_payload(db: Database, user: str, date: str | None = None) -> dict[str,
     ply = item["ply"]
     best = str(move.get("best_move_san"))
     explanation = db.get_task_explanation(item["task_key"])
-    if explanation is not None and looks_like_thinking(explanation):
-        # Отравленный кэш (reasoning-разбор вместо ответа): игнорируем,
-        # кнопка «Объяснить» снова доступна, успешный повтор перезапишет
+    if explanation is not None and _is_bad_explanation(explanation):
+        # Отравленный кэш (reasoning-разбор/safety-заглушка/огрызок вместо ответа):
+        # игнорируем, кнопка «Объяснить» снова доступна, успешный повтор перезапишет
         # мусор через UPSERT save_task_explanation. Строки из БД не удаляем.
         explanation = None
     return {
@@ -787,15 +800,15 @@ def _task_explain_messages(payload: dict[str, Any]) -> list[ChatMessage]:
 
 
 def _task_explain_llm(payload: dict[str, Any]) -> str:
-    """Один вызов LLM для объяснения задачи (с повтором при thinking-мусоре).
+    """Один вызов LLM для объяснения задачи (с повтором при плохом ответе).
 
-    thinking-блоки вырезаются, служебный разбор вместо ответа — это ошибка
-    (job уйдёт в error, а не сохранит мусор в БД).
+    thinking-блоки вырезаются, thinking-разбор/safety-заглушка/огрызок
+    вместо ответа — это ошибка (job уйдёт в error, а не сохранит мусор в БД).
     """
     llm = LLMClient()
     messages = _task_explain_messages(payload)
-    text = clean_llm_text(llm.chat(messages, temperature=0.4, max_tokens=800))
-    if text and not looks_like_thinking(text):
+    text = clean_llm_text(llm.chat(messages, temperature=0.4))
+    if text and not _is_bad_explanation(text):
         return text
     retry = [
         messages[0],
@@ -804,9 +817,9 @@ def _task_explain_llm(payload: dict[str, Any]) -> str:
             messages[1].content + "\nБез разбора. Сразу объяснение по-русски.",
         ),
     ]
-    second = clean_llm_text(llm.chat(retry, temperature=0.4, max_tokens=800))
-    if not second or looks_like_thinking(second):
-        raise RuntimeError("LLM вернул служебный разбор вместо объяснения")
+    second = clean_llm_text(llm.chat(retry, temperature=0.4))
+    if not second or _is_bad_explanation(second):
+        raise RuntimeError("Модель не дала объяснение задачи (повтор не помог)")
     return second
 
 # --- Цель и недельный план ------------------------------------------------
@@ -1333,7 +1346,7 @@ def _plan_llm_chat(messages: list[ChatMessage]) -> str:
     (job уйдёт в error, мусор в meta не пишется).
     """
     llm = LLMClient()
-    text = clean_llm_text(llm.chat(messages, temperature=0.4, max_tokens=1200))
+    text = clean_llm_text(llm.chat(messages, temperature=0.4))
     if text and not looks_like_thinking(text):
         return text
     retry = [
@@ -1343,7 +1356,7 @@ def _plan_llm_chat(messages: list[ChatMessage]) -> str:
             messages[1].content + "\nБез разбора. Сразу готовый план по-русски.",
         ),
     ]
-    second = clean_llm_text(llm.chat(retry, temperature=0.4, max_tokens=1200))
+    second = clean_llm_text(llm.chat(retry, temperature=0.4))
     if not second or looks_like_thinking(second):
         raise RuntimeError("LLM вернул служебный разбор вместо плана")
     return second
@@ -2220,7 +2233,7 @@ def create_api(
             lambda db: _task_payload(db, user["nick"]), app.state.db_path
         )
         cached = payload.get("explanation")
-        if cached and not looks_like_thinking(cached):
+        if cached and not _is_bad_explanation(cached):
             return {"cached": True, "explanation": cached}
         job = CoachJob(
             id=uuid.uuid4().hex,

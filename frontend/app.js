@@ -924,7 +924,7 @@ function drawGameDetail(app) {
     <div style="margin-bottom:16px"><a href="#" class="btn btn-secondary" data-view="games">← К списку партий</a></div>
     <div class="grid game-layout">
       <div class="card">
-        ${boardHtml(fens[ply], lastMove)}
+        ${boardHtml(fens[ply], lastMove, game.user_color === 'black')}
         <div class="board-meta">
           <span class="badge badge-neutral">Ходят: ${turnLabel}</span>
           <span class="badge badge-blue">${esc(posLabel)}</span>
@@ -1032,18 +1032,31 @@ function lastMoveSquares(fenBefore, fenAfter) {
   return froms.concat(tos);
 }
 
-function boardHtml(fen, hlSquares) {
+function boardHtml(fen, hlSquares, flip = false) {
   const pieces = fenPieces(fen);
   const hl = hlSquares || [];
+  const flipped = !!flip;
+  const ranks = [];
+  for (let r = 8; r >= 1; r--) ranks.push(r);
+  if (flipped) ranks.reverse();
+  const files = [];
+  for (let f = 0; f < 8; f++) files.push(f);
+  if (flipped) files.reverse();
   let html = '';
-  for (let rank = 8; rank >= 1; rank--) {
-    for (let f = 0; f < 8; f++) {
+  for (let ri = 0; ri < 8; ri++) {
+    const rank = ranks[ri];
+    for (let ci = 0; ci < 8; ci++) {
+      const f = files[ci];
       const square = FILES[f] + rank;
       const light = ((f + (8 - rank)) % 2 === 0);
       const cls = ['sq', light ? 'light' : 'dark'];
       if (hl.includes(square)) cls.push('lm');
       const piece = pieces[square];
-      html += `<div class="${cls.join(' ')}" data-square="${square}">${piece ? `<span class="piece">${PIECE_GLYPHS[piece]}</span>` : ''}</div>`;
+      const coordColor = light ? 'var(--c-sq-dark)' : 'var(--c-sq-light)';
+      let coord = '';
+      if (ci === 0) coord += `<span class="board-coord board-coord-rank" style="color:${coordColor}">${rank}</span>`;
+      if (ri === 7) coord += `<span class="board-coord board-coord-file" style="color:${coordColor}">${FILES[f]}</span>`;
+      html += `<div class="${cls.join(' ')}" data-square="${square}">${coord}${piece ? `<span class="piece">${PIECE_GLYPHS[piece]}</span>` : ''}</div>`;
     }
   }
   return `<div class="board">${html}</div>`;
@@ -1266,7 +1279,7 @@ function drawTask(app) {
     <div class="card-header"><h1>Задача дня</h1><span class="badge badge-blue">${esc(state.user.nick)}</span></div>
     <div class="grid game-layout">
       <div class="card">
-        ${boardHtml(task.fen)}
+        ${boardHtml(task.fen, undefined, task.user_color === 'black')}
         <div class="board-meta">
           <span class="badge badge-blue">${esc(task.date)}</span>
           <span class="badge badge-neutral">${esc(task.opening || '—')}${task.eco ? ` ${esc(task.eco)}` : ''}</span>
