@@ -1210,7 +1210,8 @@ _PLAN_LLM_SYSTEM = """Ты — шахматный тренер сильного 
 "Режим: обычный|предтурнирный"
 "Норма дня ({M} мин):" — далее 3-5 строк формата "- {Блок} — {X} мин ({конкретика: N качественных задач / какие дебюты / сколько партий})" — сумма минут всех строк равна {M}.
 "Итог недели: ..." (1-2 предложения).
-Опирайся ТОЛЬКО на переданные данные: называй ИХ фазу и ИХ дебюты. Если до турнира 14 дней или меньше — предтурнирный режим: решаем задачи и повторяем дебюты, без нового материала. Никакого английского, никаких общих фраз вида "учи эндшпили"."""
+Опирайся ТОЛЬКО на переданные данные: называй ИХ фазу и ИХ дебюты. Если до турнира 14 дней или меньше — предтурнирный режим: решаем задачи и повторяем дебюты, без нового материала. Никакого английского, никаких общих фраз вида "учи эндшпили".
+Калибруй сложность под уровень: при рейтинге ниже 1400 допустима база; 1400–1800 — без детской базы; 1800 и выше — ТОЛЬКО продвинутый уровень: сложные реализации, техника, типовые планы из ЕГО дебютов; ЗАПРЕЩЕНЫ темы одиночного мата, оппозиции, "король+пешка против короля" и любая элементарная база. Примеры позиций и дебютов бери ТОЛЬКО из переданных данных, не выдумывай детские."""
 
 
 def _plan_llm_key(nick: str) -> str:
@@ -1235,9 +1236,45 @@ def _plan_unnatural_verdict(humanity: dict[str, Any] | None) -> str:
     return f"{share}% неестественных из {total} — ошибки в основном естественные"
 
 
+_PLAN_SPEED_RU = {
+    "bullet": "пуля",
+    "blitz": "блиц",
+    "rapid": "рапид",
+    "classical": "классика",
+    "correspondence": "переписка",
+}
+
+
+def _plan_player_level(db: Database, nick: str) -> dict[str, Any]:
+    """Уровень игрока для калибровки плана: рейтинг и контроль времени.
+
+    Берётся из последней по created_at партии пользователя (поля Game
+    user_rating/speed). Партий нет, рейтинг 0/None/мусор или ошибка чтения —
+    рейтинг null (план тогда калибруется по глубине ошибок).
+    """
+    try:
+        games = db.get_games(nick, limit=100_000)
+    except (ValueError, TypeError, OSError):
+        return {"rating": None, "speed": None}
+    if not games:
+        return {"rating": None, "speed": None}
+    last = max(games, key=lambda g: (g.created_at, g.id))
+    rating = last.user_rating
+    if isinstance(rating, bool) or not isinstance(rating, int) or rating <= 0:
+        rating = None
+    speed = last.speed
+    if not isinstance(speed, str) or not speed.strip():
+        speed = None
+    else:
+        speed = speed.strip()
+    return {"rating": rating, "speed": speed}
+
+
 def _plan_llm_input(db: Database, nick: str, data_dir: Any) -> dict[str, Any]:
     """Компактный вход LLM-плана: анкета + цифры из тех же источников,
-    что /api/plan/week (слабая фаза, топ-3 дебюта, вердикт, дрели, счёт)."""
+    что /api/plan/week (слабая фаза, топ-3 дебюта, вердикт, дрели, счёт),
+    плюс уровень игрока (рейтинг/контроль из последней партии — входит в хэш
+    input_hash, чтобы план пересоздавался при смене рейтинга)."""
     goal = _load_plan_goal(db, nick)
     minutes = int(goal["minutes"])
     try:
@@ -1283,11 +1320,15 @@ def _plan_llm_input(db: Database, nick: str, data_dir: Any) -> dict[str, Any]:
         if isinstance(plan.get("avg_win_loss"), (int, float)):
             avg_win_loss = round(float(plan["avg_win_loss"]), 2)
 
+    level = _plan_player_level(db, nick)
+
     return {
         "goal_type": goal.get("goal_type") or _PLAN_GOAL_DEFAULT_TYPE,
         "goal": goal.get("goal"),
         "weeks_left": _plan_weeks_left(goal.get("tournament_date")),
         "target_rating": goal.get("target_rating"),
+        "rating": level["rating"],
+        "speed": level["speed"],
         "minutes": minutes,
         "focus": goal.get("focus") or "auto",
         "focus_phase": focus_phase,
@@ -1321,7 +1362,22 @@ def _plan_llm_messages(entry: dict[str, Any]) -> list[ChatMessage]:
         weak_txt = "нет данных по дебютам"
     score = entry.get("score_pct")
     loss = entry.get("avg_win_loss")
+    rating = entry.get("rating")
+    if isinstance(rating, bool) or not isinstance(rating, int) or rating <= 0:
+        rating = None
+    if rating is not None:
+        speed = entry.get("speed")
+        speed_ru = _PLAN_SPEED_RU.get(speed, speed) if isinstance(speed, str) else None
+        level_txt = f"{speed_ru} {rating}" if speed_ru else str(rating)
+        level_line = f"Уровень: {level_txt}."
+    else:
+        loss_txt = loss if loss is not None else "—"
+        level_line = (
+            "Уровень: неизвестен, калибруй по глубине ошибок: "
+            f"средняя потеря {loss_txt}%."
+        )
     lines = [
+        level_line,
         f"Тип цели: {type_ru}.",
         f"Цель своими словами: {entry.get('goal') or '—'}.",
         f"До турнира: {weeks_txt}; целевой рейтинг: {rating_txt}.",
@@ -1339,7 +1395,40 @@ def _plan_llm_messages(entry: dict[str, Any]) -> list[ChatMessage]:
     ]
 
 
-def _plan_llm_chat(messages: list[ChatMessage]) -> str:
+# Леммы детсадовских тем: для игрока 1800+ их наличие в плане — брак.
+_PLAN_BASIC_LEMMAS = (
+    "оппозиц",
+    "пешка против короля",
+    "пешкой против короля",
+    "пешек против короля",
+    "король против короля",
+    "мат одинок",
+    "одиноким корол",
+    "одинокого короля",
+    "правило квадрата",
+    "как ходят фигуры",
+    "как ходит конь",
+)
+
+
+def _plan_has_basic_stuff(text: str) -> bool:
+    """True, если в тексте плана есть детсадовские темы."""
+    if not isinstance(text, str) or not text:
+        return False
+    lowered = text.lower()
+    return any(lemma in lowered for lemma in _PLAN_BASIC_LEMMAS)
+
+
+def _plan_chat_ok(text: str, advanced: bool) -> bool:
+    """Годен ли текст плана: не пуст, не разбор, без детсада для 1800+."""
+    if not text or looks_like_thinking(text):
+        return False
+    if advanced and _plan_has_basic_stuff(text):
+        return False
+    return True
+
+
+def _plan_llm_chat(messages: list[ChatMessage], advanced: bool = False) -> str:
     """Один вызов LLM для плана (с повтором при thinking-мусоре).
 
     thinking-блоки вырезаются, служебный разбор вместо плана — это ошибка
@@ -1347,7 +1436,7 @@ def _plan_llm_chat(messages: list[ChatMessage]) -> str:
     """
     llm = LLMClient()
     text = clean_llm_text(llm.chat(messages, temperature=0.4))
-    if text and not looks_like_thinking(text):
+    if _plan_chat_ok(text, advanced):
         return text
     retry = [
         messages[0],
@@ -1357,9 +1446,11 @@ def _plan_llm_chat(messages: list[ChatMessage]) -> str:
         ),
     ]
     second = clean_llm_text(llm.chat(retry, temperature=0.4))
-    if not second or looks_like_thinking(second):
-        raise RuntimeError("LLM вернул служебный разбор вместо плана")
-    return second
+    if _plan_chat_ok(second, advanced):
+        return second
+    if advanced and second and _plan_has_basic_stuff(second):
+        raise RuntimeError("LLM вернул базовые темы вместо продвинутого плана")
+    raise RuntimeError("LLM вернул служебный разбор вместо плана")
 
 
 def _run_plan_llm_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None:
@@ -1378,7 +1469,13 @@ def _run_plan_llm_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> No
         else:
             job.phase = "План недели"
             _ensure_llm_key()
-            text = _plan_llm_chat(messages)
+            rating = params["input"].get("rating")
+            advanced = (
+                isinstance(rating, int)
+                and not isinstance(rating, bool)
+                and rating >= 1800
+            )
+            text = _plan_llm_chat(messages, advanced=advanced)
             if not text:
                 raise RuntimeError("LLM вернул пустой план")
             created = _today()

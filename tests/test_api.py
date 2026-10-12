@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 
 import chess
 
-from app.api import create_api, _task_done_key, _today
+from app.api import create_api, _plan_llm_input, _task_done_key, _today
 from app.db import Database
 from app.fide import FidePlayer, FideRatings
 from app.games import Game
@@ -1773,6 +1773,190 @@ class PlanLlmTests(ApiTestBase):
         self.assertEqual(
             self.client.post("/api/plan/generate", data={}).status_code, 404
         )
+
+    def _dry_run_prompts(self) -> list[dict]:
+        """dry_run generate без сети/LLM: возвращает промпты плана."""
+        resp = self.client.post("/api/plan/generate", data={"dry_run": "on"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(resp.json()["cached"])
+        job = self._wait_job(resp.json()["job_id"])
+        self.assertEqual(job["status"], "done", job.get("error"))
+        return job["result"]["prompts"]
+
+    def _prompt_by_role(self, prompts: list[dict], role: str) -> str:
+        for item in prompts:
+            if item["role"] == role:
+                return item["content"]
+        self.fail(f"нет промпта с ролью {role}")
+
+    def test_generate_prompt_contains_rating_and_calibration(self):
+        """Вход содержит rating из последней партии; user-промпт — «2100»,
+        системный — калибровку («1800»/«оппозиц»). Без сети/движка."""
+        self._add_user()
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.save_games(
+                [
+                    mkgame_moves(
+                        "rl1", ["e4"], created_at=100,
+                        user_rating=1500, speed="rapid",
+                    ),
+                    mkgame_moves(
+                        "rl2", ["e4"], created_at=200,
+                        user_rating=2100, speed="rapid",
+                    ),
+                ],
+                "tester",
+            )
+        with Database(self.db_path) as db:
+            db.init_db()
+            entry = _plan_llm_input(db, "tester", self.data_dir)
+        self.assertEqual(entry["rating"], 2100)
+        self.assertEqual(entry["speed"], "rapid")
+        prompts = self._dry_run_prompts()
+        user = self._prompt_by_role(prompts, "user")
+        system = self._prompt_by_role(prompts, "system")
+        self.assertIn("2100", user)
+        self.assertIn("Уровень", user)
+        self.assertIn("1800", system)
+        self.assertIn("оппозиц", system)
+
+    def test_generate_new_job_after_rating_change(self):
+        """Смена только рейтинга меняет hash: второй generate — cached,
+        после более новой партии с другим рейтингом — cached=false."""
+        self._add_user()
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.save_games(
+                [mkgame_moves(
+                    "rt1", ["e4"], created_at=100,
+                    user_rating=2100, speed="rapid",
+                )],
+                "tester",
+            )
+        with patch.dict(os.environ, {"LLM_API_KEY": "test-key"}), \
+                patch("app.api.LLMClient",
+                      return_value=self._mock_llm(self.PLAN_TEXT)):
+            first = self.client.post("/api/plan/generate", data={})
+            self.assertEqual(first.status_code, 200)
+            self.assertFalse(first.json()["cached"])
+            self._wait_job(first.json()["job_id"])
+            second = self.client.post("/api/plan/generate", data={})
+            self.assertTrue(second.json()["cached"])
+            # Только рейтинг другой — партия новее, анализа у неё нет,
+            # остальные цифры входа не меняются.
+            with Database(self.db_path) as db:
+                db.init_db()
+                db.save_games(
+                    [mkgame_moves(
+                        "rt2", ["e4"], created_at=200,
+                        user_rating=1900, speed="rapid",
+                    )],
+                    "tester",
+                )
+            third = self.client.post("/api/plan/generate", data={})
+            self.assertEqual(third.status_code, 200)
+            self.assertFalse(third.json()["cached"])
+            self.assertIn("job_id", third.json())
+            job = self._wait_job(third.json()["job_id"])
+        self.assertEqual(job["status"], "done", job.get("error"))
+
+    def test_generate_no_games_rating_null(self):
+        """Без партий rating null, но generate работает (dry_run)."""
+        self._add_user()
+        with Database(self.db_path) as db:
+            db.init_db()
+            entry = _plan_llm_input(db, "tester", self.data_dir)
+        self.assertIsNone(entry["rating"])
+        prompts = self._dry_run_prompts()
+        user = self._prompt_by_role(prompts, "user")
+        self.assertIn("неизвестен", user)
+        self.assertIn("средняя потеря", user)
+
+    def test_plan_llm_input_zero_rating_is_null(self):
+        """user_rating 0 трактуется как отсутствие рейтинга."""
+        self._add_user()
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.save_games(
+                [mkgame_moves(
+                    "rz1", ["e4"], created_at=100, user_rating=0,
+                )],
+                "tester",
+            )
+            db.init_db()
+            entry = _plan_llm_input(db, "tester", self.data_dir)
+        self.assertIsNone(entry["rating"])
+        prompts = self._dry_run_prompts()
+        user = self._prompt_by_role(prompts, "user")
+        self.assertIn("неизвестен", user)
+
+    BASIC_PLAN_TEXT = (
+        "Неделя 1: базовая техника эндшпиля\n"
+        "Режим: обычный\n"
+        "Норма дня (30 мин):\n"
+        "- Эндшпиль — 30 мин (учим оппозицию и правило квадрата, "
+        "разбираем король и пешка против короля)\n"
+        "Итог недели: освоим оппозицию и перестанем зевать."
+    )
+
+    def _seed_rating(self, rating: int) -> None:
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.save_games(
+                [mkgame_moves(
+                    f"rl{rating}", ["e4"], created_at=100,
+                    user_rating=rating, speed="rapid",
+                )],
+                "tester",
+            )
+
+    def test_generate_basic_topics_rejected_for_advanced(self):
+        """Рейтинг 2100 + детсад в плане → job error «базовые темы», в meta пусто."""
+        self._add_user()
+        self._seed_rating(2100)
+        with patch.dict(os.environ, {"LLM_API_KEY": "test-key"}), \
+                patch("app.api.LLMClient",
+                      return_value=self._mock_llm(self.BASIC_PLAN_TEXT)):
+            resp = self.client.post("/api/plan/generate", data={})
+            self.assertEqual(resp.status_code, 200)
+            job = self._wait_job(resp.json()["job_id"])
+        self.assertEqual(job["status"], "error")
+        self.assertIn("базовые темы", job.get("error") or "")
+        self.assertEqual(
+            self.client.get("/api/plan/llm").json(), {"text": None}
+        )
+
+    def test_generate_basic_topics_allowed_below_1800(self):
+        """Рейтинг 1500: тот же текст — годный план, сохраняется."""
+        self._add_user()
+        self._seed_rating(1500)
+        with patch.dict(os.environ, {"LLM_API_KEY": "test-key"}), \
+                patch("app.api.LLMClient",
+                      return_value=self._mock_llm(self.BASIC_PLAN_TEXT)):
+            resp = self.client.post("/api/plan/generate", data={})
+            self.assertEqual(resp.status_code, 200)
+            job = self._wait_job(resp.json()["job_id"])
+        self.assertEqual(job["status"], "done", job.get("error"))
+        self.assertEqual(
+            self.client.get("/api/plan/llm").json()["text"],
+            self.BASIC_PLAN_TEXT,
+        )
+
+    def test_generate_basic_retry_then_good(self):
+        """Рейтинг 2100: первая попытка с детсадом, повтор хороший → done."""
+        self._add_user()
+        self._seed_rating(2100)
+        fake = MagicMock()
+        fake.chat.side_effect = [self.BASIC_PLAN_TEXT, self.PLAN_TEXT]
+        fake.model = "test-model"
+        with patch.dict(os.environ, {"LLM_API_KEY": "test-key"}), \
+                patch("app.api.LLMClient", return_value=fake):
+            resp = self.client.post("/api/plan/generate", data={})
+            self.assertEqual(resp.status_code, 200)
+            job = self._wait_job(resp.json()["job_id"])
+        self.assertEqual(job["status"], "done", job.get("error"))
+        self.assertEqual(job["result"]["plan"]["text"], self.PLAN_TEXT)
 
 
 class FrontendTests(ApiTestBase):
