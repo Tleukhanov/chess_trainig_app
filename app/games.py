@@ -305,6 +305,66 @@ def fetch_user_games(
     return games
 
 
+_LICHESS_RATING_PERFS = ("bullet", "blitz", "rapid", "classical")
+
+
+def fetch_lichess_rating(lichess_nick: str) -> dict[str, Any] | None:
+    """Текущий рейтинг Lichess по самому играемому контролю.
+
+    GET {base}/api/user/{nick} (публичный, без токена) → из perfs выбирает
+    контроль с макс. числом партий среди bullet/blitz/rapid/classical
+    (поле games) → {"rating": int, "speed": key}. Нет perfs, все нули,
+    не-200, сетевые/JSON-ошибки, мусор → None (молча, это fallback-путь).
+    """
+    nick = (lichess_nick or "").strip()
+    if not nick:
+        return None
+    url = f"{settings.lichess_base_url}/api/user/{urllib.parse.quote(nick)}"
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": USER_AGENT,
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            if getattr(response, "status", 200) != 200:
+                return None
+            payload = response.read().decode("utf-8")
+        data = json.loads(payload)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    perfs = data.get("perfs")
+    if not isinstance(perfs, dict):
+        return None
+    best_key: str | None = None
+    best_games = 0
+    best_rating: int | None = None
+    for key in _LICHESS_RATING_PERFS:
+        perf = perfs.get(key)
+        if not isinstance(perf, dict):
+            continue
+        try:
+            games = int(perf.get("games") or 0)
+        except (TypeError, ValueError):
+            continue
+        rating = perf.get("rating")
+        if isinstance(rating, bool) or not isinstance(rating, int) or rating <= 0:
+            continue
+        if games <= 0:
+            continue
+        if games > best_games:
+            best_games = games
+            best_key = key
+            best_rating = rating
+    if best_key is None or best_rating is None:
+        return None
+    return {"rating": best_rating, "speed": best_key}
+
+
 def load_pgn_file(path: str | Path, username: str) -> list[Game]:
     """Читает PGN-файл через python-chess и возвращает список Game."""
     games: list[Game] = []
@@ -319,4 +379,4 @@ def load_pgn_file(path: str | Path, username: str) -> list[Game]:
     return games
 
 
-__all__ = ["Game", "fetch_user_games", "load_pgn_file"]
+__all__ = ["Game", "fetch_lichess_rating", "fetch_user_games", "load_pgn_file"]

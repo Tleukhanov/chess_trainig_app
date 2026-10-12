@@ -39,7 +39,7 @@ from .fide import (
     fetch_fide_player,
     fetch_fide_ratings,
 )
-from .games import fetch_user_games
+from .games import fetch_lichess_rating, fetch_user_games
 from .humanize import humanize_report
 from .llm import ChatMessage, LLMClient, _is_local_host, clean_llm_text, looks_like_refusal, looks_like_thinking
 from .maia import MaiaLitePolicy
@@ -1248,10 +1248,28 @@ _PLAN_SPEED_RU = {
 def _plan_player_level(db: Database, nick: str) -> dict[str, Any]:
     """Уровень игрока для калибровки плана: рейтинг и контроль времени.
 
-    Берётся из последней по created_at партии пользователя (поля Game
-    user_rating/speed). Партий нет, рейтинг 0/None/мусор или ошибка чтения —
-    рейтинг null (план тогда калибруется по глубине ошибок).
+    Приоритет источников: живой рейтинг Lichess (fetch_lichess_rating по
+    личесс-нику пользователя) → последняя по created_at партия в БД (поля Game
+    user_rating/speed) → рейтинг null (план тогда калибруется по глубине
+    ошибок). Сетевые исключения наружу не выпускаются: любой сбой live-пути
+    молча откатывается на БД. Партий нет, рейтинг 0/None/мусор или ошибка
+    чтения — рейтинг null.
     """
+    try:
+        live = fetch_lichess_rating(_lichess_of(db, nick))
+    except Exception:
+        live = None
+    if isinstance(live, dict):
+        rating = live.get("rating")
+        speed = live.get("speed")
+        if (
+            isinstance(rating, int)
+            and not isinstance(rating, bool)
+            and rating > 0
+            and isinstance(speed, str)
+            and speed.strip()
+        ):
+            return {"rating": rating, "speed": speed.strip()}
     try:
         games = db.get_games(nick, limit=100_000)
     except (ValueError, TypeError, OSError):
@@ -1273,8 +1291,8 @@ def _plan_player_level(db: Database, nick: str) -> dict[str, Any]:
 def _plan_llm_input(db: Database, nick: str, data_dir: Any) -> dict[str, Any]:
     """Компактный вход LLM-плана: анкета + цифры из тех же источников,
     что /api/plan/week (слабая фаза, топ-3 дебюта, вердикт, дрели, счёт),
-    плюс уровень игрока (рейтинг/контроль из последней партии — входит в хэш
-    input_hash, чтобы план пересоздавался при смене рейтинга)."""
+    плюс уровень игрока (живой рейтинг Lichess, fallback — последняя партия;
+    входит в хэш input_hash, чтобы план пересоздавался при смене рейтинга)."""
     goal = _load_plan_goal(db, nick)
     minutes = int(goal["minutes"])
     try:

@@ -1607,6 +1607,101 @@ class PlanLlmTests(ApiTestBase):
         fake.model = "test-model"
         return fake
 
+    def setUp(self) -> None:
+        super().setUp()
+        # Герметичность: live-рейтинг Lichess по умолчанию выключен
+        # (fallback на БД), иначе тесты ходили бы в реальную сеть.
+        # Live-тесты ниже переопределяют мок своим patch.
+        _live = patch("app.api.fetch_lichess_rating", return_value=None)
+        _live.start()
+        self.addCleanup(_live.stop)
+
+    def test_live_rating_beats_db(self):
+        """Live 1900 побеждает DB 2100: entry берёт rating/speed из live."""
+        self._add_user()
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.save_games(
+                [mkgame_moves(
+                    "lv1", ["e4"], created_at=100,
+                    user_rating=2100, speed="rapid",
+                )],
+                "tester",
+            )
+        live = {"rating": 1900, "speed": "blitz"}
+        with patch("app.api.fetch_lichess_rating", return_value=live):
+            with Database(self.db_path) as db:
+                db.init_db()
+                entry = _plan_llm_input(db, "tester", self.data_dir)
+            self.assertEqual(entry["rating"], 1900)
+            self.assertEqual(entry["speed"], "blitz")
+            prompts = self._dry_run_prompts()
+        user = self._prompt_by_role(prompts, "user")
+        self.assertIn("1900", user)
+        self.assertIn("блиц", user)
+        self.assertNotIn("2100", user)
+
+    def test_live_none_falls_back_to_db(self):
+        """Live None (сеть упала) → fallback на DB-рейтинг."""
+        self._add_user()
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.save_games(
+                [mkgame_moves(
+                    "lv2", ["e4"], created_at=100,
+                    user_rating=2100, speed="rapid",
+                )],
+                "tester",
+            )
+        with patch("app.api.fetch_lichess_rating", return_value=None):
+            with Database(self.db_path) as db:
+                db.init_db()
+                entry = _plan_llm_input(db, "tester", self.data_dir)
+        self.assertEqual(entry["rating"], 2100)
+        self.assertEqual(entry["speed"], "rapid")
+
+    def test_live_none_no_games_rating_null(self):
+        """Live None + партий нет → rating null, generate dry_run ок."""
+        self._add_user()
+        with patch("app.api.fetch_lichess_rating", return_value=None):
+            with Database(self.db_path) as db:
+                db.init_db()
+                entry = _plan_llm_input(db, "tester", self.data_dir)
+            self.assertIsNone(entry["rating"])
+            prompts = self._dry_run_prompts()
+        user = self._prompt_by_role(prompts, "user")
+        self.assertIn("неизвестен", user)
+
+    def test_live_garbage_falls_back_to_db(self):
+        """Мусор из live-пути (perfs нет / games нули → fetch дал None,
+        либо битый dict) → fallback на DB-рейтинг."""
+        self._add_user()
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.save_games(
+                [mkgame_moves(
+                    "lv3", ["e4"], created_at=100,
+                    user_rating=2100, speed="rapid",
+                )],
+                "tester",
+            )
+        garbage_cases = (
+            None,
+            {"rating": None, "speed": None},
+            {"rating": "мусор", "speed": "blitz"},
+            {"rating": 0, "speed": "blitz"},
+            {"rating": True, "speed": "blitz"},
+            {"foo": 1},
+        )
+        for garbage in garbage_cases:
+            with self.subTest(garbage=garbage):
+                with patch("app.api.fetch_lichess_rating", return_value=garbage):
+                    with Database(self.db_path) as db:
+                        db.init_db()
+                        entry = _plan_llm_input(db, "tester", self.data_dir)
+                self.assertEqual(entry["rating"], 2100)
+                self.assertEqual(entry["speed"], "rapid")
+
     def test_questionnaire_save_load(self):
         self._add_user()
         resp = self.client.post(
