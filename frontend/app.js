@@ -374,7 +374,7 @@ async function viewDashboard(app) {
     </div>
     <div class="grid grid-2">
       <div class="card">
-        <div class="card-header"><span class="card-title">Дрели</span></div>
+        <div class="card-header"><span class="card-title">Ошибки</span></div>
         <div class="grid grid-2">
           <div class="stat"><div class="stat-value">${plan.drills.total}</div><div class="stat-label">Всего</div></div>
           <div class="stat"><div class="stat-value">${plan.drills.unnatural}</div><div class="stat-label">Неестественные</div></div>
@@ -423,7 +423,7 @@ async function viewOverview(app) {
       <div class="card stat"><div class="stat-value">${ov.games}</div><div class="stat-label">Партий</div></div>
       <div class="card stat"><div class="stat-value">${whiteBranches.length + blackBranches.length}</div><div class="stat-label">Ветвей репертуара</div></div>
       <div class="card stat"><div class="stat-value">${ov.openings.length}</div><div class="stat-label">Дебютов</div></div>
-      <div class="card stat"><div class="stat-value">${ov.drills_total}</div><div class="stat-label">Дрелей</div></div>
+      <div class="card stat"><div class="stat-value">${ov.drills_total}</div><div class="stat-label">Ошибок</div></div>
     </div>
     <div class="grid grid-2">
       <div class="card">
@@ -562,7 +562,7 @@ async function viewPlan(app) {
       const un = Number(plan.drills.unnatural) || 0;
       const total = Number(plan.drills.total) || 0;
       const clean = un === 0;
-      rows.push(`<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:6px 0"><span class="badge ${clean ? 'badge-good' : 'badge-neutral'}">${clean ? 'чисто' : 'повторить'}</span><span style="flex:1;min-width:180px">${clean ? 'Дрели: неестественных нет' : `Повторить ${un} неестественных из ${total}`}</span><button class="btn btn-secondary" data-plan-act="drills" style="font-size:12px;padding:4px 10px">Дрели</button></div>`);
+      rows.push(`<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:6px 0"><span class="badge ${clean ? 'badge-good' : 'badge-neutral'}">${clean ? 'чисто' : 'повторить'}</span><span style="flex:1;min-width:180px">${clean ? 'Ошибки: неестественных нет' : `Повторить ${un} неестественных из ${total}`}</span><button class="btn btn-secondary" data-plan-act="drills" style="font-size:12px;padding:4px 10px">Ошибки</button></div>`);
     }
     const worst = report && report.worst_games && report.worst_games[0];
     if (worst) {
@@ -586,7 +586,7 @@ async function viewPlan(app) {
       <div class="card stat"><div class="stat-value">${plan.games}</div><div class="stat-label">Партий</div></div>
       <div class="card stat"><div class="stat-value">${scorePct}</div><div class="stat-label">Счёт</div></div>
       <div class="card stat"><div class="stat-value">${avgWinLoss}</div><div class="stat-label">Ср. потеря win%</div></div>
-      <div class="card stat"><div class="stat-value">${plan.drills.total}/${plan.drills.unnatural}</div><div class="stat-label">Дрели всего/неест.</div></div>
+      <div class="card stat"><div class="stat-value">${plan.drills.total}/${plan.drills.unnatural}</div><div class="stat-label">Ошибки всего/неест.</div></div>
     </div>
     <div class="card">
       <div class="card-header"><span class="card-title">Репертуар — частые ветви</span></div>
@@ -946,7 +946,7 @@ function drawGameDetail(app) {
           <div class="card-header"><span class="card-title">Ходы</span></div>
           <div class="moves-list">${moveRowsHtml}</div>
           <div class="game-links">
-            <a class="btn btn-secondary" href="https://lichess.org/${esc(game.id)}" target="_blank" rel="noopener">Открыть на Lichess</a>
+            ${game.link ? '<a class="btn btn-secondary" href="' + esc(game.link) + '" target="_blank" rel="noopener">Открыть партию</a>' : ''}
           </div>
         </div>
         <div class="card">
@@ -1090,7 +1090,7 @@ function clearGameKeyboard() {
 
 async function viewDrills(app) {
   if (!state.user) {
-    app.innerHTML = '<div class="onboarding card"><div class="empty-icon">🎯</div><h1>Нет дрелей</h1><p>Профиль не выбран.</p></div>';
+    app.innerHTML = '<div class="onboarding card"><div class="empty-icon">🎯</div><h1>Нет ошибок</h1><p>Профиль не выбран.</p></div>';
     return;
   }
   const params = new URLSearchParams({ min_drop: 15, min_win: 50 });
@@ -1100,7 +1100,7 @@ async function viewDrills(app) {
   const items = dr.items;
 
   app.innerHTML = `
-    <div class="card-header"><h1>Дрели</h1><span class="badge badge-blue">${esc(state.user.nick)}</span></div>
+    <div class="card-header"><h1>Ваши ошибки</h1><span class="badge badge-blue">${esc(state.user.nick)}</span></div>
     <div class="card">
       <form id="drills-filter" class="form-row" style="gap:16px;align-items:flex-end">
         <div class="form-group"><label>Мин. потеря win% <input type="number" name="min_drop" step="0.1" value="${dr.min_drop}"></label></div>
@@ -1109,10 +1109,10 @@ async function viewDrills(app) {
         <button class="btn btn-secondary" style="height:38px">Применить</button>
       </form>
     </div>
-    ${summary ? `<div class="grid grid-3"><div class="card stat"><div class="stat-value">${summary.found}</div><div class="stat-label">Дрелей найдено</div></div><div class="card stat"><div class="stat-value">${summary.games}</div><div class="stat-label">Партий</div></div><div class="card stat"><div class="stat-value">${summary.avg_drop != null ? summary.avg_drop.toFixed(1) + '%' : '—'}</div><div class="stat-label">Ср. потеря win%</div></div></div>` : ''}
+    ${summary ? `<div class="grid grid-3"><div class="card stat"><div class="stat-value">${summary.found}</div><div class="stat-label">Ошибок найдено</div></div><div class="card stat"><div class="stat-value">${summary.games}</div><div class="stat-label">Партий</div></div><div class="card stat"><div class="stat-value">${summary.avg_drop != null ? summary.avg_drop.toFixed(1) + '%' : '—'}</div><div class="stat-label">Ср. потеря win%</div></div></div>` : ''}
     <div class="card">
-      <div class="card-header"><span class="card-title">Список дрелей (${items.length})</span><div><a href="/api/drills.pgn?${params}" class="btn btn-secondary" style="font-size:12px;padding:4px 10px">PGN</a> <a href="/api/drills.json?${params}" class="btn btn-secondary" style="font-size:12px;padding:4px 10px;margin-left:4px">JSON</a></div></div>
-      ${items.length ? `<table class="table-wrap"><thead><tr><th>#</th><th>Партия</th><th>Ход</th><th>Сыграно</th><th>Лучше</th><th>Класс</th><th>Потеря</th><th>Win% до/после</th><th>Дебют</th><th>Результат</th></tr></thead><tbody>${items.map((d, i) => `<tr class="drill-row"><td class="num">${i + 1}</td><td>${esc(d.game_id.slice(0, 8))}</td><td class="num">${d.ply}</td><td class="drill-san">${esc(d.san_played)}</td><td class="drill-best">${esc(d.best_move_san)}</td><td><span class="badge ${d.classification === 'blunder' ? 'badge-bad' : 'badge-neutral'}">${d.classification}</span></td><td class="num">${d.drop.toFixed(1)}%</td><td class="num">${d.win_before.toFixed(1)}% → ${d.win_after.toFixed(1)}%</td><td>${esc(d.opening)}</td><td class="center"><span class="badge ${d.result_for_user === 'win' ? 'badge-good' : d.result_for_user === 'loss' ? 'badge-bad' : 'badge-neutral'}">${d.result_for_user}</span></td></tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted);padding:16px">Дрелей не найдено.</p>'}
+      <div class="card-header"><span class="card-title">Список ошибок (${items.length})</span><div><a href="/api/drills.pgn?${params}" class="btn btn-secondary" style="font-size:12px;padding:4px 10px">PGN</a> <a href="/api/drills.json?${params}" class="btn btn-secondary" style="font-size:12px;padding:4px 10px;margin-left:4px">JSON</a></div></div>
+      ${items.length ? `<table class="table-wrap"><thead><tr><th>#</th><th>Партия</th><th>Ход</th><th>Сыграно</th><th>Лучше</th><th>Класс</th><th>Потеря</th><th>Win% до/после</th><th>Дебют</th><th>Результат</th></tr></thead><tbody>${items.map((d, i) => `<tr class="drill-row"><td class="num">${i + 1}</td><td>${d.link ? '<a href="' + esc(d.link) + '" target="_blank" rel="noopener" title="Открыть партию">' + esc(d.game_id.slice(0, 8)) + '</a>' : esc(d.game_id.slice(0, 8))}</td><td class="num">${d.ply}</td><td class="drill-san">${esc(d.san_played)}</td><td class="drill-best">${esc(d.best_move_san)}</td><td><span class="badge ${d.classification === 'blunder' ? 'badge-bad' : 'badge-neutral'}">${d.classification}</span></td><td class="num">${d.drop.toFixed(1)}%</td><td class="num">${d.win_before.toFixed(1)}% → ${d.win_after.toFixed(1)}%</td><td>${esc(d.opening)}</td><td class="center"><span class="badge ${d.result_for_user === 'win' ? 'badge-good' : d.result_for_user === 'loss' ? 'badge-bad' : 'badge-neutral'}">${d.result_for_user}</span></td></tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted);padding:16px">Ошибок не найдено.</p>'}
     </div>`;
 
   document.getElementById('drills-filter').addEventListener('submit', e => {
@@ -1132,7 +1132,7 @@ async function viewDrillsWithParams(app, params) {
   const summary = dr.summary;
   const items = dr.items;
   app.innerHTML = `
-    <div class="card-header"><h1>Дрели</h1><span class="badge badge-blue">${esc(state.user.nick)}</span></div>
+    <div class="card-header"><h1>Ваши ошибки</h1><span class="badge badge-blue">${esc(state.user.nick)}</span></div>
     <div class="card">
       <form id="drills-filter" class="form-row" style="gap:16px;align-items:flex-end">
         <div class="form-group"><label>Мин. потеря win% <input type="number" name="min_drop" step="0.1" value="${dr.min_drop}"></label></div>
@@ -1141,10 +1141,10 @@ async function viewDrillsWithParams(app, params) {
         <button class="btn btn-secondary" style="height:38px">Применить</button>
       </form>
     </div>
-    ${summary ? `<div class="grid grid-3"><div class="card stat"><div class="stat-value">${summary.found}</div><div class="stat-label">Дрелей найдено</div></div><div class="card stat"><div class="stat-value">${summary.games}</div><div class="stat-label">Партий</div></div><div class="card stat"><div class="stat-value">${summary.avg_drop != null ? summary.avg_drop.toFixed(1) + '%' : '—'}</div><div class="stat-label">Ср. потеря win%</div></div></div>` : ''}
+    ${summary ? `<div class="grid grid-3"><div class="card stat"><div class="stat-value">${summary.found}</div><div class="stat-label">Ошибок найдено</div></div><div class="card stat"><div class="stat-value">${summary.games}</div><div class="stat-label">Партий</div></div><div class="card stat"><div class="stat-value">${summary.avg_drop != null ? summary.avg_drop.toFixed(1) + '%' : '—'}</div><div class="stat-label">Ср. потеря win%</div></div></div>` : ''}
     <div class="card">
-      <div class="card-header"><span class="card-title">Список дрелей (${items.length})</span><div><a href="/api/drills.pgn?${params}" class="btn btn-secondary" style="font-size:12px;padding:4px 10px">PGN</a> <a href="/api/drills.json?${params}" class="btn btn-secondary" style="font-size:12px;padding:4px 10px;margin-left:4px">JSON</a></div></div>
-      ${items.length ? `<table class="table-wrap"><thead><tr><th>#</th><th>Партия</th><th>Ход</th><th>Сыграно</th><th>Лучше</th><th>Класс</th><th>Потеря</th><th>Win% до/после</th><th>Дебют</th><th>Результат</th></tr></thead><tbody>${items.map((d, i) => `<tr class="drill-row"><td class="num">${i + 1}</td><td>${esc(d.game_id.slice(0, 8))}</td><td class="num">${d.ply}</td><td class="drill-san">${esc(d.san_played)}</td><td class="drill-best">${esc(d.best_move_san)}</td><td><span class="badge ${d.classification === 'blunder' ? 'badge-bad' : 'badge-neutral'}">${d.classification}</span></td><td class="num">${d.drop.toFixed(1)}%</td><td class="num">${d.win_before.toFixed(1)}% → ${d.win_after.toFixed(1)}%</td><td>${esc(d.opening)}</td><td class="center"><span class="badge ${d.result_for_user === 'win' ? 'badge-good' : d.result_for_user === 'loss' ? 'badge-bad' : 'badge-neutral'}">${d.result_for_user}</span></td></tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted);padding:16px">Дрелей не найдено.</p>'}
+      <div class="card-header"><span class="card-title">Список ошибок (${items.length})</span><div><a href="/api/drills.pgn?${params}" class="btn btn-secondary" style="font-size:12px;padding:4px 10px">PGN</a> <a href="/api/drills.json?${params}" class="btn btn-secondary" style="font-size:12px;padding:4px 10px;margin-left:4px">JSON</a></div></div>
+      ${items.length ? `<table class="table-wrap"><thead><tr><th>#</th><th>Партия</th><th>Ход</th><th>Сыграно</th><th>Лучше</th><th>Класс</th><th>Потеря</th><th>Win% до/после</th><th>Дебют</th><th>Результат</th></tr></thead><tbody>${items.map((d, i) => `<tr class="drill-row"><td class="num">${i + 1}</td><td>${d.link ? '<a href="' + esc(d.link) + '" target="_blank" rel="noopener" title="Открыть партию">' + esc(d.game_id.slice(0, 8)) + '</a>' : esc(d.game_id.slice(0, 8))}</td><td class="num">${d.ply}</td><td class="drill-san">${esc(d.san_played)}</td><td class="drill-best">${esc(d.best_move_san)}</td><td><span class="badge ${d.classification === 'blunder' ? 'badge-bad' : 'badge-neutral'}">${d.classification}</span></td><td class="num">${d.drop.toFixed(1)}%</td><td class="num">${d.win_before.toFixed(1)}% → ${d.win_after.toFixed(1)}%</td><td>${esc(d.opening)}</td><td class="center"><span class="badge ${d.result_for_user === 'win' ? 'badge-good' : d.result_for_user === 'loss' ? 'badge-bad' : 'badge-neutral'}">${d.result_for_user}</span></td></tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted);padding:16px">Ошибок не найдено.</p>'}
     </div>`;
   document.getElementById('drills-filter').addEventListener('submit', e => {
     e.preventDefault();

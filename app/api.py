@@ -739,6 +739,7 @@ def _task_payload(db: Database, user: str, date: str | None = None) -> dict[str,
         "date": day,
         "task_key": item["task_key"],
         "game_id": game.id,
+        "link": game.link,
         "ply": ply,
         "fen": item["fen"],
         "san_played": str(move.get("san") or game.moves[ply]),
@@ -1985,6 +1986,7 @@ def create_api(
     def _game_summary(g) -> dict:
         return {
             "id": g.id,
+            "link": g.link,
             "created_at": g.created_at,
             "opponent": g.opponent,
             "user_color": g.user_color,
@@ -2010,6 +2012,7 @@ def create_api(
     def _game_dict(g) -> dict:
         return {
             "id": g.id,
+            "link": g.link,
             "rated": g.rated,
             "speed": g.speed,
             "created_at": g.created_at,

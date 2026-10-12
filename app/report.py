@@ -100,6 +100,7 @@ def build_report(pairs: list[tuple[Game, dict]], user: str) -> dict[str, Any]:
         worst_games.append(
             {
                 "game_id": game.id,
+                "link": game.link,
                 "opponent": game.opponent,
                 "result": game.result_for_user,
                 "avg_win_loss": avg_win_loss,

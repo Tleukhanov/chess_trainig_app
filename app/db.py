@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS {table}(
     user_rating INTEGER,
     user_rating_diff INTEGER,
     result_for_user TEXT,
+    link TEXT,
     moves_json TEXT,
     clocks_json TEXT,
     fetched_at INTEGER,
@@ -98,9 +99,17 @@ CREATE TABLE IF NOT EXISTS {table}(
 _GAME_COLUMNS = (
     "id, user, rated, speed, created_at, status, winner, white, black, "
     "opening, eco, user_color, opponent, user_rating, user_rating_diff, "
+    "result_for_user, link, moves_json, clocks_json, fetched_at"
+)
+# Без link — для пересборки v0.3-таблиц в _migrate_v3, где колонки ещё нет
+# (INSERT ... SELECT по этим колонкам; link тогда остаётся NULL и
+# добивается backfill-миграцией в init_db).
+_GAME_COLUMNS_NO_LINK = (
+    "id, user, rated, speed, created_at, status, winner, white, black, "
+    "opening, eco, user_color, opponent, user_rating, user_rating_diff, "
     "result_for_user, moves_json, clocks_json, fetched_at"
 )
-_GAME_PLACEHOLDERS = ", ".join("?" for _ in range(19))
+_GAME_PLACEHOLDERS = ", ".join("?" for _ in range(20))
 _ANALYSIS_COLUMNS = "game_id, engine, depth, analysis_json, analyzed_at"
 
 _CURRENT_USER_KEY = "current_user"
@@ -179,6 +188,7 @@ def _row_to_game(row: sqlite3.Row) -> Game:
     eco = row["eco"]
     if not opening:
         opening, eco = classify_opening(moves)
+    link = row["link"] if "link" in row.keys() else None
     return Game(
         id=row["id"],
         rated=bool(row["rated"]),
@@ -197,6 +207,7 @@ def _row_to_game(row: sqlite3.Row) -> Game:
         user_rating=row["user_rating"],
         user_rating_diff=row["user_rating_diff"],
         result_for_user=row["result_for_user"] or "draw",
+        link=link or None,
     )
 
 
@@ -289,7 +300,7 @@ def _migrate_v3(path: Path | str) -> None:
             )
         if _table_ddl(conn, "games") and "(id, user)" not in _table_ddl(conn, "games"):
             _rebuild_table(
-                conn, _GAMES_DDL, "games_migrated", "games", _GAME_COLUMNS
+                conn, _GAMES_DDL, "games_migrated", "games", _GAME_COLUMNS_NO_LINK
             )
 
         _backfill_users(conn)
@@ -348,6 +359,23 @@ class Database:
                     conn.execute(f"ALTER TABLE users ADD COLUMN {coldef}")
             conn.execute("UPDATE users SET role = 'user' WHERE role IS NULL")
             conn.execute("UPDATE users SET is_active = 1 WHERE is_active IS NULL")
+            # Миграция games.link без потери данных (образец — users выше):
+            # старые строки без колонки получают её, затем backfill одним
+            # UPDATE ставит lichess-ссылку только тем id, что выглядят как
+            # личессовские (ровно 8 алфанумерик-символов); чужие ID — NULL.
+            games_cols = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(games)").fetchall()
+            }
+            if "link" not in games_cols:
+                conn.execute("ALTER TABLE games ADD COLUMN link TEXT")
+            conn.execute(
+                "UPDATE games SET link = 'https://lichess.org/' || id "
+                "WHERE (link IS NULL OR link = '') "
+                "AND id GLOB "
+                "'[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]"
+                "[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]'"
+            )
 
     def save_games(self, games: list[Game], user: str) -> int:
         """Сохраняет партии, возвращая число вставленных (новых) партий.
@@ -378,6 +406,7 @@ class Database:
                     game.user_rating,
                     game.user_rating_diff,
                     game.result_for_user,
+                    game.link,
                     _j(game.moves),
                     _j(game.clocks),
                     fetched_at,

@@ -52,6 +52,7 @@ class Drill:
     opening: str | None = None
     result_for_user: str = "draw"
     fullmove: int = 1
+    link: str | None = None
 
 
 def collect_drills(
@@ -138,6 +139,7 @@ def collect_drills(
                         opening=game.opening,
                         result_for_user=game.result_for_user or "draw",
                         fullmove=ply // 2 + 1,
+                        link=game.link,
                     )
                 )
 
@@ -247,6 +249,7 @@ def drills_to_json(drills: list[Drill]) -> str:
                 "opponent": drill.opponent,
                 "opening": drill.opening,
                 "result_for_user": drill.result_for_user,
+                "link": drill.link,
             }
         )
     return json.dumps(items, ensure_ascii=False, indent=2)

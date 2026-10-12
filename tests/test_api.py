@@ -2079,7 +2079,7 @@ class FrontendTests(ApiTestBase):
         html = resp.text
         self.assertIn("app.js?v=", html)
         self.assertIn("style.css?v=", html)
-        self.assertIn("v0.4.2", html)
+        self.assertIn("v0.4.3", html)
 
 
 class AuthApiTests(ApiTestBase):
@@ -2275,6 +2275,157 @@ class AuthApiTests(ApiTestBase):
             fetch.assert_called_once()
         self.assertEqual(job["status"], "done", job.get("error"))
         self.assertEqual(fetch.call_args[0][0], "ForeignNick")
+
+
+class GameLinkTests(ApiTestBase):
+    """Сквозной link: БД roundtrip, API-пейлоады, backfill-миграция.
+
+    Где линка нет (None) — API отдаёт null, а не конструирует URL из id.
+    """
+
+    def _seed_two(self) -> None:
+        """Партия со ссылкой + партия без ссылки, обе с ошибками белых."""
+        mv = TaskApiTests._move
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.save_games(
+                [
+                    mkgame_moves(
+                        "lnk1",
+                        ["e4", "e5", "Nf3", "Nc6", "Bb5", "a6"],
+                        user_color="white",
+                        result_for_user="loss",
+                        opponent="Rival1",
+                        created_at=100,
+                        link="https://lichess.org/abcd1234",
+                    ),
+                    mkgame_moves(
+                        "lnk2",
+                        ["d4", "d5", "Nf3"],
+                        user_color="white",
+                        result_for_user="win",
+                        opponent="Rival2",
+                        created_at=200,
+                    ),
+                ],
+                "tester",
+            )
+            db.save_analysis(
+                "lnk1",
+                {
+                    "game_id": "lnk1",
+                    "user_color": "white",
+                    "result_for_user": "loss",
+                    "opponent": "Rival1",
+                    "avg_win_loss": 12.5,
+                    "avg_win_before": 55.0,
+                    "blunders": [4],
+                    "mistakes": [],
+                    "inaccuracies": [],
+                    "missed_wins": [],
+                    "time_pressure_blunders": [],
+                    "moves": [
+                        mv("e4", "best", 0.0, 55.0, 55.0, "e4"),
+                        mv("e5", "good", 0.0, 45.0, 45.0, "e5"),
+                        mv("Nf3", "good", 0.0, 50.0, 50.0, "Nf3"),
+                        mv("Nc6", "good", 0.0, 50.0, 50.0, "Nc6"),
+                        mv("Bb5", "blunder", 25.0, 60.0, 35.0, "Bc4", ["c4", "Nf6"]),
+                        mv("a6", "good", 0.0, 40.0, 40.0, "a6"),
+                    ],
+                },
+                depth=8,
+            )
+            db.save_analysis(
+                "lnk2",
+                {
+                    "game_id": "lnk2",
+                    "user_color": "white",
+                    "result_for_user": "win",
+                    "opponent": "Rival2",
+                    "avg_win_loss": 6.0,
+                    "avg_win_before": 55.0,
+                    "blunders": [2],
+                    "mistakes": [],
+                    "inaccuracies": [],
+                    "missed_wins": [],
+                    "time_pressure_blunders": [],
+                    "moves": [
+                        mv("d4", "best", 0.0, 55.0, 55.0, "d4"),
+                        mv("d5", "good", 0.0, 45.0, 45.0, "d5"),
+                        mv("Nf3", "blunder", 20.0, 65.0, 45.0, "c4"),
+                    ],
+                },
+                depth=8,
+            )
+            db.set_current_user("tester")
+
+    def test_db_roundtrip(self):
+        self._seed_two()
+        with Database(self.db_path) as db:
+            games = {g.id: g for g in db.get_games("tester")}
+        self.assertEqual(games["lnk1"].link, "https://lichess.org/abcd1234")
+        self.assertIsNone(games["lnk2"].link)
+        with Database(self.db_path) as db:
+            self.assertEqual(
+                db.get_game("lnk1", "tester").link, "https://lichess.org/abcd1234"
+            )
+
+    def test_api_summary_has_link(self):
+        self._seed_two()
+        items = {g["id"]: g for g in self.client.get("/api/games").json()["games"]}
+        self.assertEqual(items["lnk1"]["link"], "https://lichess.org/abcd1234")
+        self.assertIsNone(items["lnk2"]["link"])
+
+    def test_api_detail_has_link(self):
+        self._seed_two()
+        data = self.client.get("/api/games/lnk1").json()
+        self.assertEqual(data["game"]["link"], "https://lichess.org/abcd1234")
+        data = self.client.get("/api/games/lnk2").json()
+        self.assertIsNone(data["game"]["link"])
+
+    def test_api_drills_have_link(self):
+        self._seed_two()
+        items = {d["game_id"]: d for d in self.client.get("/api/drills").json()["items"]}
+        self.assertEqual(items["lnk1"]["link"], "https://lichess.org/abcd1234")
+        self.assertIsNone(items["lnk2"]["link"])
+
+    def test_api_task_has_link(self):
+        self._seed_two()
+        payload = self.client.get("/api/task/today").json()
+        expected = (
+            "https://lichess.org/abcd1234" if payload["game_id"] == "lnk1" else None
+        )
+        self.assertIn("link", payload)
+        self.assertEqual(payload["link"], expected)
+
+    def test_api_report_worst_have_link(self):
+        self._seed_two()
+        worst = {
+            w["game_id"]: w for w in self.client.get("/api/report").json()["worst_games"]
+        }
+        self.assertEqual(worst["lnk1"]["link"], "https://lichess.org/abcd1234")
+        self.assertIsNone(worst["lnk2"]["link"])
+
+    def test_backfill_fills_only_lichess_ids(self):
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.save_games(
+                [
+                    mkgame_moves("abcd1234", ["e4"], link=None),
+                    mkgame_moves("abcdefg", ["e4"], link=None),
+                    mkgame_moves("my-game!!", ["e4"], link=None),
+                    mkgame_moves(
+                        "qwer1234", ["e4"], link="https://example.com/x"
+                    ),
+                ],
+                "tester",
+            )
+            db.init_db()  # повторный прогон: backfill старых строк
+            games = {g.id: g for g in db.get_games("tester")}
+        self.assertEqual(games["abcd1234"].link, "https://lichess.org/abcd1234")
+        self.assertIsNone(games["abcdefg"].link)
+        self.assertIsNone(games["my-game!!"].link)
+        self.assertEqual(games["qwer1234"].link, "https://example.com/x")
 
 
 if __name__ == "__main__":

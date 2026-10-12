@@ -45,6 +45,7 @@ class Game:
     user_rating: int | None = None
     user_rating_diff: int | None = None
     result_for_user: str = "draw"
+    link: str | None = None
 
     def user_result_points(self) -> float:
         """Очки за партию для пользователя: 1.0 победа, 0.5 ничья, 0.0 поражение."""
@@ -144,8 +145,9 @@ def _game_from_api(item: dict[str, Any], username: str) -> Game:
     if not opening_name:
         opening_name, opening_eco = classify_opening(_parse_moves(item.get("moves")))
 
+    game_id = item.get("id", "") or ""
     return Game(
-        id=item.get("id", ""),
+        id=game_id,
         rated=bool(item.get("rated")),
         speed=item.get("speed", ""),
         created_at=created_at,
@@ -163,6 +165,7 @@ def _game_from_api(item: dict[str, Any], username: str) -> Game:
         user_rating=user_rating,
         user_rating_diff=user_rating_diff,
         result_for_user=_result_for_user(user_color, winner),
+        link=f"https://lichess.org/{game_id}" if game_id else None,
     )
 
 
@@ -194,8 +197,16 @@ def _game_from_pgn(game: chess.pgn.Game, username: str) -> Game:
     termination = headers.get("Termination")
     status = termination_map.get(termination, termination.lower() if termination else "unknown")
 
-    site = headers.get("Site", "").rstrip("/")
+    site = (headers.get("Site") or "").strip().rstrip("/")
     game_id = site.split("/")[-1] if site else ""
+
+    raw_link = (headers.get("Link") or "").strip()
+    if raw_link.startswith("http://") or raw_link.startswith("https://"):
+        link: str | None = raw_link
+    elif site.startswith("http://") or site.startswith("https://"):
+        link = site
+    else:
+        link = None
 
     moves: list[str] = []
     clocks: list[float] = []
@@ -232,6 +243,7 @@ def _game_from_pgn(game: chess.pgn.Game, username: str) -> Game:
         user_rating=user_rating,
         user_rating_diff=user_rating_diff,
         result_for_user=_result_for_user(user_color, winner),
+        link=link,
     )
 
 
