@@ -1,0 +1,54 @@
+{
+  "name": "Chess Trainer",
+  "description": "Personal chess trainer: Lichess games, Stockfish analysis, LLM coaching, drills and repertoire.",
+  "stack": "heroku-24",
+  "buildpacks": [
+    {
+      "url": "heroku-community/apt"
+    },
+    {
+      "url": "heroku/python"
+    }
+  ],
+  "addons": [
+    {
+      "plan": "heroku-postgresql"
+    }
+  ],
+  "env": {
+    "STOCKFISH_PATH": {
+      "description": "Path to the Stockfish binary from the Aptfile package.",
+      "value": "/usr/games/stockfish"
+    },
+    "STOCKFISH_HASH_MB": {
+      "description": "Stockfish hash size in MB (free dyno has 512MB RAM).",
+      "value": "128"
+    },
+    "STOCKFISH_THREADS": {
+      "description": "Stockfish threads (free dyno is CPU-limited).",
+      "value": "2"
+    },
+    "STOCKFISH_TIME_MS": {
+      "description": "Stockfish time limit per position in ms.",
+      "value": "1500"
+    },
+    "LLM_API_KEY": {
+      "description": "LLM API key (OpenRouter or any OpenAI-compatible provider). Fill in after deploy.",
+      "value": ""
+    },
+    "LLM_BASE_URL": {
+      "description": "LLM base URL. Fill in after deploy.",
+      "value": ""
+    },
+    "LLM_MODEL": {
+      "description": "LLM model name. Fill in after deploy.",
+      "value": ""
+    }
+  },
+  "formation": {
+    "web": {
+      "quantity": 1,
+      "size": "free"
+    }
+  }
+}

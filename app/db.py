@@ -20,6 +20,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from . import pgdb
 from .config import settings
 from .games import Game
 from .openings import classify_opening
@@ -141,6 +142,28 @@ _USERS_AUTH_COLUMNS = (
 )
 
 
+def _pg_dsn() -> str | None:
+    """DSN Postgres из окружения (Heroku) или None (локаль → SQLite).
+
+    Читается в рантайме (не на импорте), чтобы тесты могли переключать
+    бэкенд через ``DATABASE_URL``. Пустая строка = бэкенд не выбран.
+    """
+    url = pgdb.normalize_database_url(os.environ.get("DATABASE_URL", ""))
+    return url or None
+
+
+# Предикат «id похож на личессовский» для backfill колонки games.link.
+# Общая часть — длина ровно 8; различается только оператор сравнения:
+# SQLite GLOB-шаблон vs PG POSIX-regex (GLOB в PG нет).
+_LINK_BACKFILL_COMMON = "length(id) = 8"
+_LINK_BACKFILL_SQLITE = (
+    "id GLOB "
+    "'[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]"
+    "[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]'"
+)
+_LINK_BACKFILL_PG = "id ~ '^[A-Za-z0-9]{8}$'"
+
+
 def hash_password(pw: str) -> str:
     """PBKDF2-HMAC-SHA256 хеш пароля, формат pbkdf2$iter$salt_hex$hash_hex."""
     salt = os.urandom(16)
@@ -177,7 +200,7 @@ def _uj(raw: str | None) -> Any:
     return json.loads(raw)
 
 
-def _row_to_game(row: sqlite3.Row) -> Game:
+def _row_to_game(row: Any) -> Game:
     """Восстанавливает объект Game из строки БД (в порядке полей dataclass).
 
     Дебют — производные данные: если в кеше его нет (старые записи), определяем
@@ -211,8 +234,12 @@ def _row_to_game(row: sqlite3.Row) -> Game:
     )
 
 
-def _table_ddl(conn: sqlite3.Connection, name: str) -> str:
-    """Возвращает текст CREATE TABLE из схемы БД или пустую строку."""
+def _table_ddl(conn: Any, name: str) -> str:
+    """Возвращает текст CREATE TABLE из схемы БД или пустую строку.
+
+    Только SQLite-путь (миграция v0.3→v0.4 локальных баз): в PG свежие базы
+    создаются сразу по актуальному DDL и миграция не нужна.
+    """
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
     ).fetchone()
@@ -220,7 +247,7 @@ def _table_ddl(conn: sqlite3.Connection, name: str) -> str:
 
 
 def _rebuild_table(
-    conn: sqlite3.Connection, ddl: str, tmp: str, table: str, columns: str
+    conn: Any, ddl: str, tmp: str, table: str, columns: str
 ) -> None:
     """Пересоздаёт таблицу по новому DDL, копируя в неё строки.
 
@@ -237,7 +264,7 @@ def _rebuild_table(
     conn.execute(f"ALTER TABLE {tmp} RENAME TO {table}")
 
 
-def _backfill_users(conn: sqlite3.Connection) -> None:
+def _backfill_users(conn: Any) -> None:
     """Регистрирует игроков, которых уже видели в партиях, и закрепляет первого.
 
     Ник на Lichess нечувствителен к регистру, а ключ ``nick_lower`` хранит
@@ -310,18 +337,25 @@ def _migrate_v3(path: Path | str) -> None:
 
 
 class Database:
-    """SQLite-хранилище партий и результатов их анализа.
+    """Хранилище партий и результатов их анализа (SQLite локально, PG на Heroku).
 
-    Соединения не держатся постоянно: каждый метод открывает и закрывает
-    своё соединение через внутренний контекстный менеджер.
+    Бэкенд выбирается в рантайме: задан ``DATABASE_URL`` → PostgreSQL через
+    :mod:`app.pgdb`, иначе SQLite-файл. Соединения не держатся постоянно:
+    каждый метод открывает и закрывает своё соединение через внутренний
+    контекстный менеджер (для PG одно соединение на операцию — норма).
     """
 
     def __init__(self, path: Path | str | None = None) -> None:
         self.path = Path(path) if path is not None else settings.db_path
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.dsn = _pg_dsn()
+        self.backend = "pg" if self.dsn else "sqlite"
 
-    def connect(self) -> sqlite3.Connection:
-        """Открывает соединение с нужными прагмами и row_factory."""
+    def connect(self) -> Any:
+        """Открывает соединение выбранного бэкенда."""
+        if self.backend == "pg":
+            assert self.dsn is not None
+            return pgdb.connect(self.dsn)
         conn = sqlite3.connect(self.path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
@@ -330,11 +364,17 @@ class Database:
         return conn
 
     @contextmanager
-    def _connection(self) -> Iterator[sqlite3.Connection]:
+    def _connection(self) -> Iterator[Any]:
         conn = self.connect()
         try:
             yield conn
             conn.commit()
+        except BaseException:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
         finally:
             conn.close()
 
@@ -344,7 +384,17 @@ class Database:
         Порядок важен: сначала миграция пересобирает старые таблицы (индекс
         на games после этого пропадает), затем штатный DDL докидывает то,
         чего не хватает, — индекс и новые таблицы.
+
+        На PG (Heroku) миграция v0.3 не выполняется — базы там свежие;
+        несовместимое с PG разведено ветками: ``COLLATE NOCASE`` в DDL
+        (в PG такого нет), ``PRAGMA table_info`` → ``information_schema``,
+        backfill ``GLOB`` → POSIX-regex ``~``. Остальное (``ON CONFLICT``,
+        ``excluded.*``, ``LIMIT ?``, ``ALTER TABLE ADD COLUMN``) — общий
+        кросс-бэкендовый SQL, работает в обеих СУБД.
         """
+        if self.backend == "pg":
+            self._init_db_pg()
+            return
         _migrate_v3(self.path)
         with self._connection() as conn:
             conn.executescript(_SCHEMA)
@@ -372,9 +422,39 @@ class Database:
             conn.execute(
                 "UPDATE games SET link = 'https://lichess.org/' || id "
                 "WHERE (link IS NULL OR link = '') "
-                "AND id GLOB "
-                "'[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]"
-                "[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]'"
+                f"AND {_LINK_BACKFILL_COMMON} AND {_LINK_BACKFILL_SQLITE}"
+            )
+
+    def _init_db_pg(self) -> None:
+        """PG-вариант init_db: та же схема и те же backfill'ы, без PRAGMA/GLOB."""
+        schema = _SCHEMA.replace("COLLATE NOCASE", "")
+        with self._connection() as conn:
+            conn.executescript(schema)
+            existing = {
+                row["column_name"]
+                for row in conn.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = 'users'"
+                ).fetchall()
+            }
+            for coldef in _USERS_AUTH_COLUMNS:
+                if coldef.split()[0] not in existing:
+                    conn.execute(f"ALTER TABLE users ADD COLUMN {coldef}")
+            conn.execute("UPDATE users SET role = 'user' WHERE role IS NULL")
+            conn.execute("UPDATE users SET is_active = 1 WHERE is_active IS NULL")
+            games_cols = {
+                row["column_name"]
+                for row in conn.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = 'games'"
+                ).fetchall()
+            }
+            if "link" not in games_cols:
+                conn.execute("ALTER TABLE games ADD COLUMN link TEXT")
+            conn.execute(
+                "UPDATE games SET link = 'https://lichess.org/' || id "
+                "WHERE (link IS NULL OR link = '') "
+                f"AND {_LINK_BACKFILL_COMMON} AND {_LINK_BACKFILL_PG}"
             )
 
     def save_games(self, games: list[Game], user: str) -> int:
@@ -611,11 +691,23 @@ class Database:
         """Создаёт сессию входа (token PRIMARY KEY)."""
         now = int(time.time())
         with self._connection() as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO sessions(token, nick, created_at, expires_at) "
-                "VALUES (?,?,?,?)",
-                (token, (nick or "").strip(), now, now + int(days) * 86400),
-            )
+            if self.backend == "pg":
+                # INSERT OR REPLACE — SQLite-only; в PG тот же смысл через UPSERT.
+                conn.execute(
+                    "INSERT INTO sessions(token, nick, created_at, expires_at) "
+                    "VALUES (?,?,?,?) "
+                    "ON CONFLICT(token) DO UPDATE SET "
+                    "nick = excluded.nick, "
+                    "created_at = excluded.created_at, "
+                    "expires_at = excluded.expires_at",
+                    (token, (nick or "").strip(), now, now + int(days) * 86400),
+                )
+            else:
+                conn.execute(
+                    "INSERT OR REPLACE INTO sessions(token, nick, created_at, expires_at) "
+                    "VALUES (?,?,?,?)",
+                    (token, (nick or "").strip(), now, now + int(days) * 86400),
+                )
 
     def get_session_nick(self, token: str | None) -> str | None:
         """Ник по токену сессии; протухшие — невалидны (удаляются)."""

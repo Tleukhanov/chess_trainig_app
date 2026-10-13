@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,10 +32,29 @@ def _cfg(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
+def _resolve_stockfish_path() -> str:
+    """Путь к бинарю Stockfish: env STOCKFISH_PATH → системный PATH → как есть.
+
+    Явный ``STOCKFISH_PATH`` на существующий файл побеждает всегда. Если env
+    пуст или файла по нему нет — пробуем ``shutil.which("stockfish")``
+    (Linux/Heroku: ``/usr/games/stockfish`` из Aptfile; находится без
+    хардкода пути). Иначе возвращаем значение env как есть (пусть даже
+    пустое): :class:`app.analyzer.Engine` сам кинет понятную ошибку про
+    STOCKFISH_PATH при попытке анализа.
+    """
+    configured = _cfg("STOCKFISH_PATH", "")
+    if configured.strip() and Path(configured).is_file():
+        return configured
+    found = shutil.which("stockfish")
+    if found:
+        return found
+    return configured
+
+
 @dataclass(frozen=True)
 class Settings:
     # --- аналитика ---
-    stockfish_path: str = _cfg("STOCKFISH_PATH", r"C:\Users\huawei\Stockfish\stockfish\stockfish-windows-x86-64-universal.exe")
+    stockfish_path: str = _resolve_stockfish_path()
     stockfish_depth: int = int(_cfg("STOCKFISH_DEPTH", "14"))
     stockfish_multipv: int = int(_cfg("STOCKFISH_MULTIPV", "3"))
     stockfish_threads: int = int(_cfg("STOCKFISH_THREADS", "4"))
