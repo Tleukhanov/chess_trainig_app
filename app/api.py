@@ -593,12 +593,25 @@ def _set_session_cookie(response: Response, token: str) -> None:
 
 
 def _call_data(fn, db_path: Path):
-    """Вызывает слой данных; RuntimeError («нет партий») → HTTP 404."""
+    """Вызывает слой данных; RuntimeError («нет партий») → HTTP 404.
+
+    ValueError тоже → 404: битый JSON в БД (JSONDecodeError — подкласс
+    ValueError) иначе давал 500 вместо честного «не найдено».
+    """
     try:
         with Database(db_path) as db:
             return fn(db)
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError) as exc:
         raise HTTPException(404, str(exc)) from exc
+
+
+def _engine_ready() -> bool:
+    """Есть ли бинарь Stockfish по настроенному пути (pre-flight до job'ы).
+
+    Проверяется синхронно в /api/coach/run: если движка нет, отвечаем 503
+    с понятным текстом, а не создаём job, который упадёт в error внутри потока.
+    """
+    return bool(settings.stockfish_path) and os.path.exists(settings.stockfish_path)
 
 
 def _humanity_payload(raw: dict) -> dict:
@@ -1608,16 +1621,17 @@ def create_api(
     db_path: Path | None = None,
     data_dir: Path | None = None,
 ) -> FastAPI:
-    app = FastAPI(title="Chess Trainer API", version="0.4.0", docs_url="/api/docs", redoc_url=None)
+    app = FastAPI(title="Chess Trainer API", version="0.4.3", docs_url="/api/docs", redoc_url=None)
     app.state.db_path = Path(db_path) if db_path else settings.db_path
     app.state.data_dir = Path(data_dir) if data_dir else settings.data_dir
 
     # --- User / Auth ---
     @app.get("/api/user/current")
     def api_current_user(request: Request):
-        user = _current_user(app.state.db_path)
+        user = _current_user(app.state.db_path, request)
         if user:
-            return {"user": user}
+            # Только публичные поля: хеш пароля и служебные колонки наружу не идут.
+            return {"user": {k: user.get(k) for k in ("nick", "lichess", "fide_id")}}
         raise HTTPException(status_code=404, detail="No current user")
 
     @app.get("/api/users")
@@ -1628,40 +1642,46 @@ def create_api(
         return {"users": users}
 
     @app.post("/api/user/add")
-    def api_user_add(nick: str = Form(...), fide: str = Form("")):
+    def api_user_add(request: Request, nick: str = Form(...), fide: str = Form("")):
         from .identity import validate_nick
         clean = nick.strip()
         if not clean:
             raise HTTPException(400, "Ник не может быть пустым")
         if not validate_nick(clean):
             raise HTTPException(400, f"Невалидный ник: {clean}")
-        with Database(app.state.db_path) as db:
-            db.init_db()
-            db.upsert_user(clean, fide_id=fide.strip() or None)
-            db.set_current_user(clean)
-            db.touch_user(clean)
+        db = Database(app.state.db_path)
+        db.init_db()
+        if not _session_nick(request, db):
+            raise HTTPException(401, "Нужен вход")
+        db.upsert_user(clean, fide_id=fide.strip() or None)
+        db.set_current_user(clean)
+        db.touch_user(clean)
         return {"ok": True, "nick": clean}
 
     @app.post("/api/user/switch")
-    def api_user_switch(nick: str = Form(...)):
+    def api_user_switch(request: Request, nick: str = Form(...)):
         clean = nick.strip()
         if not clean:
             raise HTTPException(400, "Ник не может быть пустым")
-        with Database(app.state.db_path) as db:
-            db.init_db()
-            db.set_current_user(clean)
-            db.touch_user(clean)
+        db = Database(app.state.db_path)
+        db.init_db()
+        if not _session_nick(request, db):
+            raise HTTPException(401, "Нужен вход")
+        db.set_current_user(clean)
+        db.touch_user(clean)
         return {"ok": True, "nick": clean}
 
     @app.post("/api/user/delete")
-    def api_user_delete(nick: str = Form(...)):
+    def api_user_delete(request: Request, nick: str = Form(...)):
         """Удаляет профиль и его партии/анализ из БД (файлы data/<ник>/ остаются)."""
         clean = nick.strip()
         if not clean:
             raise HTTPException(400, "Ник не может быть пустым")
-        with Database(app.state.db_path) as db:
-            db.init_db()
-            db.delete_user(clean)
+        db = Database(app.state.db_path)
+        db.init_db()
+        if not _session_nick(request, db):
+            raise HTTPException(401, "Нужен вход")
+        db.delete_user(clean)
         return {"ok": True, "nick": clean}
 
     @app.post("/api/user/fide")
@@ -1956,6 +1976,18 @@ def create_api(
         user = _current_user(app.state.db_path, request)
         if not user:
             raise HTTPException(404, "No current user")
+        if not 1 <= max <= 200:
+            raise HTTPException(400, "max должен быть от 1 до 200")
+        if not 1 <= depth <= 30:
+            raise HTTPException(400, "depth должен быть от 1 до 30")
+        if not 1 <= multipv <= 10:
+            raise HTTPException(400, "multipv должен быть от 1 до 10")
+        if not _engine_ready():
+            raise HTTPException(
+                503,
+                f"Stockfish не найден по пути {settings.stockfish_path!r}. "
+                "Задай STOCKFISH_PATH (например, в .env или переменной окружения).",
+            )
 
         job = CoachJob(id=uuid.uuid4().hex, user=user["nick"])
         _register_job(job)
@@ -1976,9 +2008,14 @@ def create_api(
         return {"job_id": job.id, "status": "started"}
 
     @app.get("/api/jobs/{job_id}")
-    def api_job_status(job_id: str):
+    def api_job_status(job_id: str, request: Request):
         job = _get_job(job_id)
         if not job:
+            raise HTTPException(404, "Job not found")
+        # Чужую задачу (результаты LLM, данные соперника) не отдаём:
+        # с сессией — только свои job'ы; без сессии — meta-fallback как раньше.
+        user = _current_user(app.state.db_path, request)
+        if user is not None and job.user != user["nick"]:
             raise HTTPException(404, "Job not found")
         return job.as_dict()
 
@@ -2478,6 +2515,9 @@ def create_api(
         if rec:
             # CLAIM: ник уже есть без пароля (старые данные) — дописываем
             # пароль+lichess(+fide), партии и аналитика сохраняются.
+            # Неактивному пользователю доступ закрыт (как при логине).
+            if not _is_active_record(rec):
+                raise HTTPException(403, "Доступ ограничен")
             db.set_password_hash(rec["nick"], hash_password(password))
             db.set_lichess(rec["nick"], lich)
             if fide_clean:
@@ -2571,6 +2611,9 @@ def create_api(
         if len(new or "") < 4:
             raise HTTPException(400, "Новый пароль: минимум 4 символа")
         db.set_password_hash(nick, hash_password(new))
+        # Все живые сессии (включая текущую) больше не действуют:
+        # с новым паролем нужно войти заново.
+        db.delete_user_sessions(nick)
         return {"ok": True}
 
     @app.post("/api/auth/lichess")

@@ -3,7 +3,7 @@
 const state = {
   user: null,
   currentView: 'dashboard',
-  jobPollTimer: null,
+  timers: { coach: null, task: null, llm: null, tool: null },
   gamesFilter: 'all',
   gameId: null,
   gameData: null,
@@ -166,6 +166,8 @@ function viewAuth(app) {
   const loginF = document.getElementById('auth-login-form');
   if (loginF) loginF.addEventListener('submit', async e => {
     e.preventDefault();
+    const btn = e.target.querySelector('button[type="submit"]');
+    if (btn) btn.disabled = true;
     try {
       await apiPost('/api/auth/login', new FormData(loginF));
       showNav();
@@ -173,11 +175,15 @@ function viewAuth(app) {
       navigate('dashboard');
     } catch (err) {
       fail(err.message);
+    } finally {
+      if (btn) btn.disabled = false;
     }
   });
   const regF = document.getElementById('auth-register-form');
   if (regF) regF.addEventListener('submit', async e => {
     e.preventDefault();
+    const btn = e.target.querySelector('button[type="submit"]');
+    if (btn) btn.disabled = true;
     try {
       await apiPost('/api/auth/register', new FormData(regF));
       showNav();
@@ -185,6 +191,8 @@ function viewAuth(app) {
       navigate('dashboard');
     } catch (err) {
       fail(err.message);
+    } finally {
+      if (btn) btn.disabled = false;
     }
   });
 }
@@ -203,6 +211,11 @@ function renderUserbox() {
       } catch { /* всё равно выходим */ }
       state.user = null;
       state.authMode = 'login';
+      Object.assign(state, {
+        gameId: null, gameData: null, task: null, taskKey: null, taskResult: null,
+        taskRevealed: false, taskExplanation: null, planLlmJobId: null,
+        planLlmGenerating: false, tool: 'repertoire', gamesFilter: 'all',
+      });
       hideNav();
       renderUserbox();
       render(state.currentView);
@@ -217,10 +230,6 @@ function renderUserbox() {
 async function render(view) {
   const app = document.getElementById('app');
   clearGameKeyboard();
-  if (state.jobPollTimer) {
-    clearInterval(state.jobPollTimer);
-    state.jobPollTimer = null;
-  }
   const auth = await authStatus();
   if (!auth.logged_in) {
     state.user = null;
@@ -247,6 +256,10 @@ async function render(view) {
       default: app.innerHTML = '<div class="card"><p>Неизвестная страница</p></div>';
     }
   } catch (err) {
+    if (isSessionError(err)) {
+      handleSessionExpired();
+      return;
+    }
     app.innerHTML = `<div class="alert alert-error">${esc(err.message)}</div>`;
   }
 }
@@ -265,13 +278,25 @@ async function viewDashboard(app) {
   }
 
   const [plan, progress, task] = await Promise.all([
-    api('/api/plan'),
-    api('/api/progress?windows=5'),
+    api('/api/plan').catch(() => null),
+    api('/api/progress?windows=5').catch(() => null),
     api('/api/task/today').catch(() => null),
   ]);
 
-  const scorePct = plan.score_pct != null ? plan.score_pct.toFixed(1) + '%' : '—';
-  const avgWinLoss = plan.avg_win_loss != null ? plan.avg_win_loss.toFixed(2) : '—';
+  if (!plan) {
+    app.innerHTML = `
+      <div class="onboarding card">
+        <div class="empty-icon">🏁</div>
+        <h1>Пока нет данных</h1>
+        <p>Зарегистрировался — запусти анализ: партии с Lichess пройдут через Stockfish, и здесь появится план тренировки.</p>
+        <a href="#" class="btn btn-primary" data-view="coach">Запустить анализ</a>
+      </div>`;
+    bindLinks(app);
+    return;
+  }
+
+  const scorePct = plan.score_pct != null ? fmt(plan.score_pct) + '%' : '—';
+  const avgWinLoss = plan.avg_win_loss != null ? fmt(plan.avg_win_loss, 2) : '—';
   const weakCount = plan.repertoire.weak_openings.length;
 
   let humanityHtml = '';
@@ -281,7 +306,7 @@ async function viewDashboard(app) {
       <div class="grid grid-3">
         <div class="stat"><div class="stat-value">${h.total}</div><div class="stat-label">Всего плохих</div></div>
         <div class="stat"><div class="stat-value">${h.unnatural}</div><div class="stat-label">Неестественных</div></div>
-        <div class="stat"><div class="stat-value">${h.unnatural_share_pct.toFixed(1)}%</div><div class="stat-label">Доля неестественных</div></div>
+        <div class="stat"><div class="stat-value">${fmt(h.unnatural_share_pct)}%</div><div class="stat-label">Доля неестественных</div></div>
       </div>`;
   } else {
     humanityHtml = '<p style="color:var(--c-text-muted)">Нет данных humanize.</p>';
@@ -297,9 +322,9 @@ async function viewDashboard(app) {
             <tr>
               <td>${esc(o.opening)}</td><td>${esc(o.eco)}</td>
               <td class="num">${o.games}</td>
-              <td class="num">${o.points_pct.toFixed(1)}%</td>
-              <td class="num">${o.errors_per_game.toFixed(2)}</td>
-              <td class="num">${o.avg_drop.toFixed(1)}%</td>
+              <td class="num">${fmt(o.points_pct)}%</td>
+              <td class="num">${fmt(o.errors_per_game, 2)}</td>
+              <td class="num">${fmt(o.avg_drop)}%</td>
             </tr>`).join('')}
         </tbody>
       </table>`;
@@ -317,9 +342,9 @@ async function viewDashboard(app) {
       const deltaClass = v.delta > 0 ? 'badge-bad' : 'badge-good';
       rows += `<tr>
         <td>${esc(m)}</td>
-        <td class="num">${v.from.toFixed(2)}</td>
-        <td class="num">${v.to.toFixed(2)}</td>
-        <td class="num ${deltaClass}">${v.delta >= 0 ? '+' : ''}${v.delta.toFixed(2)}</td>
+        <td class="num">${fmt(v.from, 2)}</td>
+        <td class="num">${fmt(v.to, 2)}</td>
+        <td class="num ${deltaClass}">${v.delta >= 0 ? '+' : ''}${fmt(v.delta, 2)}</td>
         <td>${esc(v.verdict)}</td>
       </tr>`;
     }
@@ -340,7 +365,7 @@ async function viewDashboard(app) {
         <thead><tr><th>Мотив</th><th>Частота</th><th>Ср. потеря win%</th></tr></thead>
         <tbody>
           ${plan.patterns.motifs.slice(0, 5).map(m => `
-            <tr><td>${esc(m[0])}</td><td class="num">${m[1].count}</td><td class="num">${m[1].avg_drop.toFixed(1)}%</td></tr>`).join('')}
+            <tr><td>${esc(m[0])}</td><td class="num">${m[1].count}</td><td class="num">${fmt(m[1].avg_drop)}%</td></tr>`).join('')}
         </tbody>
       </table>`;
   } else {
@@ -412,7 +437,18 @@ async function viewOverview(app) {
     app.innerHTML = '<div class="onboarding card"><div class="empty-icon">📋</div><h1>Нет данных</h1><p>Профиль не выбран.</p></div>';
     return;
   }
-  const ov = await api('/api/overview');
+  const ov = await api('/api/overview').catch(() => null);
+  if (!ov) {
+    app.innerHTML = `
+      <div class="onboarding card">
+        <div class="empty-icon">📋</div>
+        <h1>Пока нет данных</h1>
+        <p>Зарегистрировался — запусти анализ, чтобы собрать репертуар и обзор ошибок.</p>
+        <a href="#" class="btn btn-primary" data-view="coach">Запустить анализ</a>
+      </div>`;
+    bindLinks(app);
+    return;
+  }
 
   const whiteBranches = ov.branches.white || [];
   const blackBranches = ov.branches.black || [];
@@ -428,16 +464,16 @@ async function viewOverview(app) {
     <div class="grid grid-2">
       <div class="card">
         <div class="card-header"><span class="card-title">Репертуар белых</span></div>
-        ${whiteBranches.length ? `<table class="table-wrap"><thead><tr><th>Ветвь</th><th>Партий</th><th>Прочность</th></tr></thead><tbody>${whiteBranches.map(b => `<tr><td><code>${esc(b.moves.join(' '))}</code></td><td class="num">${b.count}</td><td class="num">${(b.path_ok_rate * 100).toFixed(0)}%</td></tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted)">Нет данных.</p>'}
+        ${whiteBranches.length ? `<table class="table-wrap"><thead><tr><th>Ветвь</th><th>Партий</th><th>Прочность</th></tr></thead><tbody>${whiteBranches.map(b => `<tr><td><code>${esc(b.moves.join(' '))}</code></td><td class="num">${b.count}</td><td class="num">${fmt(b.path_ok_rate * 100, 0)}%</td></tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted)">Нет данных.</p>'}
       </div>
       <div class="card">
         <div class="card-header"><span class="card-title">Репертуар чёрных</span></div>
-        ${blackBranches.length ? `<table class="table-wrap"><thead><tr><th>Ветвь</th><th>Партий</th><th>Прочность</th></tr></thead><tbody>${blackBranches.map(b => `<tr><td><code>${esc(b.moves.join(' '))}</code></td><td class="num">${b.count}</td><td class="num">${(b.path_ok_rate * 100).toFixed(0)}%</td></tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted)">Нет данных.</p>'}
+        ${blackBranches.length ? `<table class="table-wrap"><thead><tr><th>Ветвь</th><th>Партий</th><th>Прочность</th></tr></thead><tbody>${blackBranches.map(b => `<tr><td><code>${esc(b.moves.join(' '))}</code></td><td class="num">${b.count}</td><td class="num">${fmt(b.path_ok_rate * 100, 0)}%</td></tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted)">Нет данных.</p>'}
       </div>
     </div>
     <div class="card">
       <div class="card-header"><span class="card-title">Слабые места репертуара</span></div>
-      ${ov.openings.length ? `<table class="table-wrap"><thead><tr><th>Дебют</th><th>ECO</th><th>Партий</th><th>Очков %</th><th>Ошибок/партию</th><th>Ср. потеря</th></tr></thead><tbody>${ov.openings.slice(0, 12).map(o => `<tr><td>${esc(o.opening)}</td><td>${esc(o.eco)}</td><td class="num">${o.games}</td><td class="num">${o.points_pct.toFixed(1)}%</td><td class="num">${o.errors_per_game.toFixed(2)}</td><td class="num">${o.avg_drop.toFixed(1)}%</td></tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted)">Нет данных.</p>'}
+      ${ov.openings.length ? `<table class="table-wrap"><thead><tr><th>Дебют</th><th>ECO</th><th>Партий</th><th>Очков %</th><th>Ошибок/партию</th><th>Ср. потеря</th></tr></thead><tbody>${ov.openings.slice(0, 12).map(o => `<tr><td>${esc(o.opening)}</td><td>${esc(o.eco)}</td><td class="num">${o.games}</td><td class="num">${fmt(o.points_pct)}%</td><td class="num">${fmt(o.errors_per_game, 2)}</td><td class="num">${fmt(o.avg_drop)}%</td></tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted)">Нет данных.</p>'}
     </div>
     <div class="card">
       <div class="card-header"><span class="card-title">Человечность ошибок</span></div>
@@ -450,7 +486,18 @@ async function viewPlan(app) {
     app.innerHTML = '<div class="onboarding card"><div class="empty-icon">📋</div><h1>Нет плана</h1><p>Профиль не выбран.</p></div>';
     return;
   }
-  const plan = await api('/api/plan');
+  const plan = await api('/api/plan').catch(() => null);
+  if (!plan) {
+    app.innerHTML = `
+      <div class="onboarding card">
+        <div class="empty-icon">📋</div>
+        <h1>Пока нет плана</h1>
+        <p>Зарегистрировался — запусти анализ, и тренер соберёт план тренировки.</p>
+        <a href="#" class="btn btn-primary" data-view="coach">Запустить анализ</a>
+      </div>`;
+    bindLinks(app);
+    return;
+  }
   const [taskToday, track, report, goalData, weekData, llmData] = await Promise.all([
     api('/api/task/today').catch(() => null),
     api('/api/track/today').catch(() => null),
@@ -573,8 +620,8 @@ async function viewPlan(app) {
     }
   }
 
-  const scorePct = plan.score_pct != null ? plan.score_pct.toFixed(1) + '%' : '—';
-  const avgWinLoss = plan.avg_win_loss != null ? plan.avg_win_loss.toFixed(2) : '—';
+  const scorePct = plan.score_pct != null ? fmt(plan.score_pct) + '%' : '—';
+  const avgWinLoss = plan.avg_win_loss != null ? fmt(plan.avg_win_loss, 2) : '—';
 
   app.innerHTML = `
     <div class="card-header"><h1>План тренировки</h1><span class="badge badge-blue">${esc(state.user.nick)}</span></div>
@@ -591,27 +638,27 @@ async function viewPlan(app) {
     <div class="card">
       <div class="card-header"><span class="card-title">Репертуар — частые ветви</span></div>
       <div class="grid grid-2">
-        <div><h3>Белые</h3>${plan.repertoire.white.length ? `<table class="table-wrap" style="font-size:12px"><thead><tr><th>Ветвь</th><th>Партий</th><th>OK %</th></tr></thead><tbody>${plan.repertoire.white.map(b => `<tr><td><code>${esc(b.moves.join(' '))}</code></td><td class="num">${b.count}</td><td class="num">${(b.ok_rate * 100).toFixed(0)}%</td></tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted)">Нет данных.</p>'}</div>
-        <div><h3>Чёрные</h3>${plan.repertoire.black.length ? `<table class="table-wrap" style="font-size:12px"><thead><tr><th>Ветвь</th><th>Партий</th><th>OK %</th></tr></thead><tbody>${plan.repertoire.black.map(b => `<tr><td><code>${esc(b.moves.join(' '))}</code></td><td class="num">${b.count}</td><td class="num">${(b.ok_rate * 100).toFixed(0)}%</td></tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted)">Нет данных.</p>'}</div>
+        <div><h3>Белые</h3>${plan.repertoire.white.length ? `<table class="table-wrap" style="font-size:12px"><thead><tr><th>Ветвь</th><th>Партий</th><th>OK %</th></tr></thead><tbody>${plan.repertoire.white.map(b => `<tr><td><code>${esc(b.moves.join(' '))}</code></td><td class="num">${b.count}</td><td class="num">${fmt(b.ok_rate * 100, 0)}%</td></tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted)">Нет данных.</p>'}</div>
+        <div><h3>Чёрные</h3>${plan.repertoire.black.length ? `<table class="table-wrap" style="font-size:12px"><thead><tr><th>Ветвь</th><th>Партий</th><th>OK %</th></tr></thead><tbody>${plan.repertoire.black.map(b => `<tr><td><code>${esc(b.moves.join(' '))}</code></td><td class="num">${b.count}</td><td class="num">${fmt(b.ok_rate * 100, 0)}%</td></tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted)">Нет данных.</p>'}</div>
       </div>
     </div>
     <div class="card">
       <div class="card-header"><span class="card-title">Слабые дебюты</span></div>
-      ${plan.repertoire.weak_openings.length ? `<table class="table-wrap"><thead><tr><th>Дебют</th><th>ECO</th><th>Партий</th><th>Очков %</th><th>Ошибок/партию</th><th>Ср. потеря</th></tr></thead><tbody>${plan.repertoire.weak_openings.slice(0, 6).map(o => `<tr><td>${esc(o.opening)}</td><td>${esc(o.eco)}</td><td class="num">${o.games}</td><td class="num">${o.points_pct.toFixed(1)}%</td><td class="num">${o.errors_per_game.toFixed(2)}</td><td class="num">${o.avg_drop.toFixed(1)}%</td></tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted)">Нет слабых дебютов.</p>'}
+      ${plan.repertoire.weak_openings.length ? `<table class="table-wrap"><thead><tr><th>Дебют</th><th>ECO</th><th>Партий</th><th>Очков %</th><th>Ошибок/партию</th><th>Ср. потеря</th></tr></thead><tbody>${plan.repertoire.weak_openings.slice(0, 6).map(o => `<tr><td>${esc(o.opening)}</td><td>${esc(o.eco)}</td><td class="num">${o.games}</td><td class="num">${fmt(o.points_pct)}%</td><td class="num">${fmt(o.errors_per_game, 2)}</td><td class="num">${fmt(o.avg_drop)}%</td></tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted)">Нет слабых дебютов.</p>'}
     </div>
     <div class="grid grid-2">
       <div class="card">
         <div class="card-header"><span class="card-title">Мотивы ошибок</span></div>
-        ${plan.patterns.motifs.length ? `<table class="table-wrap"><thead><tr><th>Мотив</th><th>Частота</th><th>Ср. потеря</th></tr></thead><tbody>${plan.patterns.motifs.map(m => `<tr><td>${esc(m[0])}</td><td class="num">${m[1].count}</td><td class="num">${m[1].avg_drop.toFixed(1)}%</td></tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted)">Нет данных.</p>'}
+        ${plan.patterns.motifs.length ? `<table class="table-wrap"><thead><tr><th>Мотив</th><th>Частота</th><th>Ср. потеря</th></tr></thead><tbody>${plan.patterns.motifs.map(m => `<tr><td>${esc(m[0])}</td><td class="num">${m[1].count}</td><td class="num">${fmt(m[1].avg_drop)}%</td></tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted)">Нет данных.</p>'}
       </div>
       <div class="card">
         <div class="card-header"><span class="card-title">Фазы ошибок</span></div>
-        ${plan.patterns.phases.length ? `<table class="table-wrap"><thead><tr><th>Фаза</th><th>Ошибок</th><th>Грубых</th><th>Обычных</th><th>Ср. потеря</th></tr></thead><tbody>${plan.patterns.phases.map(p => `<tr><td>${esc(p[0])}</td><td class="num">${p[1].count}</td><td class="num">${p[1].blunders}</td><td class="num">${p[1].mistakes}</td><td class="num">${p[1].avg_drop.toFixed(1)}%</td></tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted)">Нет данных.</p>'}
+        ${plan.patterns.phases.length ? `<table class="table-wrap"><thead><tr><th>Фаза</th><th>Ошибок</th><th>Грубых</th><th>Обычных</th><th>Ср. потеря</th></tr></thead><tbody>${plan.patterns.phases.map(p => `<tr><td>${esc(p[0])}</td><td class="num">${p[1].count}</td><td class="num">${p[1].blunders}</td><td class="num">${p[1].mistakes}</td><td class="num">${fmt(p[1].avg_drop)}%</td></tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted)">Нет данных.</p>'}
       </div>
     </div>
     <div class="card">
       <div class="card-header"><span class="card-title">Человечность ошибок</span></div>
-      ${plan.humanity ? `<div class="grid grid-4"><div class="stat"><div class="stat-value">${plan.humanity.total}</div><div class="stat-label">Всего</div></div><div class="stat"><div class="stat-value">${plan.humanity.natural}</div><div class="stat-label">Естественные</div></div><div class="stat"><div class="stat-value">${plan.humanity.borderline}</div><div class="stat-label">Пограничные</div></div><div class="stat"><div class="stat-value">${plan.humanity.unnatural}</div><div class="stat-label">Неестественные</div></div></div><div style="margin-top:8px"><strong>Доля неестественных: </strong>${plan.humanity.unnatural_share_pct.toFixed(1)}%</div>` : '<p style="color:var(--c-text-muted)">Нет данных humanize.</p>'}
+      ${plan.humanity ? `<div class="grid grid-4"><div class="stat"><div class="stat-value">${plan.humanity.total}</div><div class="stat-label">Всего</div></div><div class="stat"><div class="stat-value">${plan.humanity.natural}</div><div class="stat-label">Естественные</div></div><div class="stat"><div class="stat-value">${plan.humanity.borderline}</div><div class="stat-label">Пограничные</div></div><div class="stat"><div class="stat-value">${plan.humanity.unnatural}</div><div class="stat-label">Неестественные</div></div></div><div style="margin-top:8px"><strong>Доля неестественных: </strong>${fmt(plan.humanity.unnatural_share_pct)}%</div>` : '<p style="color:var(--c-text-muted)">Нет данных humanize.</p>'}
     </div>`;
 
   app.querySelectorAll('[data-plan-act]').forEach(btn => {
@@ -681,7 +728,7 @@ async function viewPlan(app) {
   const llmRefresh = document.getElementById('plan-llm-refresh');
   if (llmRefresh) llmRefresh.addEventListener('click', () => planLlmGenerate(app, true));
   // вернулись на страницу, пока шёл план, — возобновляем поллинг джобы
-  if (state.planLlmGenerating && !state.jobPollTimer && state.planLlmJobId) {
+  if (state.planLlmGenerating && !state.timers.llm && state.planLlmJobId) {
     planLlmPoll(app, state.planLlmJobId);
   }
 }
@@ -711,14 +758,14 @@ async function planLlmGenerate(app, regenerate) {
 }
 
 function planLlmPoll(app, jobId) {
-  if (state.jobPollTimer) clearInterval(state.jobPollTimer);
-  state.jobPollTimer = setInterval(async () => {
+  if (state.timers.llm) clearInterval(state.timers.llm);
+  state.timers.llm = setInterval(async () => {
     let job;
     try {
       job = await api('/api/jobs/' + jobId);
     } catch {
-      clearInterval(state.jobPollTimer);
-      state.jobPollTimer = null;
+      clearInterval(state.timers.llm);
+      state.timers.llm = null;
       state.planLlmGenerating = false;
       state.planLlmJobId = null;
       state.planLlmError = 'Не удалось получить план';
@@ -726,14 +773,14 @@ function planLlmPoll(app, jobId) {
       return;
     }
     if (job.status === 'done') {
-      clearInterval(state.jobPollTimer);
-      state.jobPollTimer = null;
+      clearInterval(state.timers.llm);
+      state.timers.llm = null;
       state.planLlmGenerating = false;
       state.planLlmJobId = null;
       viewPlan(app);
     } else if (job.status === 'error') {
-      clearInterval(state.jobPollTimer);
-      state.jobPollTimer = null;
+      clearInterval(state.timers.llm);
+      state.timers.llm = null;
       state.planLlmGenerating = false;
       state.planLlmJobId = null;
       state.planLlmError = job.error || 'Не удалось получить план';
@@ -747,14 +794,25 @@ async function viewProgress(app) {
     app.innerHTML = '<div class="onboarding card"><div class="empty-icon">📈</div><h1>Нет данных</h1><p>Профиль не выбран.</p></div>';
     return;
   }
-  const pr = await api('/api/progress?windows=5');
+  const pr = await api('/api/progress?windows=5').catch(() => null);
+  if (!pr) {
+    app.innerHTML = `
+      <div class="onboarding card">
+        <div class="empty-icon">📈</div>
+        <h1>Пока нет данных</h1>
+        <p>Зарегистрировался — запусти анализ, чтобы увидеть прогресс по окнам.</p>
+        <a href="#" class="btn btn-primary" data-view="coach">Запустить анализ</a>
+      </div>`;
+    bindLinks(app);
+    return;
+  }
 
   let trendRows = '';
   if (pr.trend) {
     for (const [m, v] of Object.entries(pr.trend)) {
       if (['improving', 'worsening', 'overall'].includes(m)) continue;
       const deltaClass = v.delta > 0 ? 'badge-bad' : 'badge-good';
-      trendRows += `<tr><td>${esc(m)}</td><td class="num">${v.from.toFixed(2)}</td><td class="num">${v.to.toFixed(2)}</td><td class="num ${deltaClass}">${v.delta >= 0 ? '+' : ''}${v.delta.toFixed(2)}</td><td>${v.direction}</td><td><span class="badge ${v.verdict === 'better' ? 'badge-good' : v.verdict === 'worse' ? 'badge-bad' : 'badge-neutral'}">${v.verdict}</span></td></tr>`;
+      trendRows += `<tr><td>${esc(m)}</td><td class="num">${fmt(v.from, 2)}</td><td class="num">${fmt(v.to, 2)}</td><td class="num ${deltaClass}">${v.delta >= 0 ? '+' : ''}${fmt(v.delta, 2)}</td><td>${v.direction}</td><td><span class="badge ${v.verdict === 'better' ? 'badge-good' : v.verdict === 'worse' ? 'badge-bad' : 'badge-neutral'}">${v.verdict}</span></td></tr>`;
     }
   }
 
@@ -770,11 +828,11 @@ async function viewProgress(app) {
         <tbody>
           ${pr.windows_rows.map(w => `<tr>
             <td class="num">${w.index}</td><td>${esc(w.dates)}</td><td class="num">${w.games}</td>
-            <td class="num">${w.score_pct != null ? w.score_pct.toFixed(1) : '—'}</td>
-            <td class="num">${w.avg_win_loss != null ? w.avg_win_loss.toFixed(1) : '—'}</td>
-            <td class="num">${w.avg_win_before != null ? w.avg_win_before.toFixed(1) : '—'}</td>
-            <td class="num">${w.errors_per_game != null ? w.errors_per_game.toFixed(1) : '—'}</td>
-            <td class="num">${w.unnatural_share_pct != null ? w.unnatural_share_pct.toFixed(1) : '—'}%</td>
+            <td class="num">${fmt(w.score_pct)}</td>
+            <td class="num">${fmt(w.avg_win_loss)}</td>
+            <td class="num">${fmt(w.avg_win_before)}</td>
+            <td class="num">${fmt(w.errors_per_game)}</td>
+            <td class="num">${fmt(w.unnatural_share_pct)}%</td>
             <td class="num">${w.avg_rating != null ? w.avg_rating : '—'}</td>
           </tr>`).join('')}
         </tbody>
@@ -946,7 +1004,7 @@ function drawGameDetail(app) {
           <div class="card-header"><span class="card-title">Ходы</span></div>
           <div class="moves-list">${moveRowsHtml}</div>
           <div class="game-links">
-            ${game.link ? '<a class="btn btn-secondary" href="' + esc(game.link) + '" target="_blank" rel="noopener">Открыть партию</a>' : ''}
+            ${game.link ? '<a class="btn btn-secondary" href="' + safeHttp(game.link) + '" target="_blank" rel="noopener">Открыть партию</a>' : ''}
           </div>
         </div>
         <div class="card">
@@ -978,8 +1036,8 @@ function gameMetricsHtml(analysis) {
   const mistakes = (analysis.mistakes || []).length;
   const inaccuracies = (analysis.inaccuracies || []).length;
   const missed = (analysis.missed_wins || []).length;
-  const avgLoss = analysis.avg_win_loss != null ? analysis.avg_win_loss.toFixed(1) : '—';
-  const avgBefore = analysis.avg_win_before != null ? analysis.avg_win_before.toFixed(1) : '—';
+  const avgLoss = fmt(analysis.avg_win_loss);
+  const avgBefore = fmt(analysis.avg_win_before);
   return `
     <div class="grid grid-3">
       <div class="stat"><div class="stat-value" style="color:var(--c-err-blunder)">${blunders}</div><div class="stat-label">Зевки</div></div>
@@ -1109,10 +1167,10 @@ async function viewDrills(app) {
         <button class="btn btn-secondary" style="height:38px">Применить</button>
       </form>
     </div>
-    ${summary ? `<div class="grid grid-3"><div class="card stat"><div class="stat-value">${summary.found}</div><div class="stat-label">Ошибок найдено</div></div><div class="card stat"><div class="stat-value">${summary.games}</div><div class="stat-label">Партий</div></div><div class="card stat"><div class="stat-value">${summary.avg_drop != null ? summary.avg_drop.toFixed(1) + '%' : '—'}</div><div class="stat-label">Ср. потеря win%</div></div></div>` : ''}
+    ${summary ? `<div class="grid grid-3"><div class="card stat"><div class="stat-value">${summary.found}</div><div class="stat-label">Ошибок найдено</div></div><div class="card stat"><div class="stat-value">${summary.games}</div><div class="stat-label">Партий</div></div><div class="card stat"><div class="stat-value">${summary.avg_drop != null ? fmt(summary.avg_drop) + '%' : '—'}</div><div class="stat-label">Ср. потеря win%</div></div></div>` : ''}
     <div class="card">
       <div class="card-header"><span class="card-title">Список ошибок (${items.length})</span><div><a href="/api/drills.pgn?${params}" class="btn btn-secondary" style="font-size:12px;padding:4px 10px">PGN</a> <a href="/api/drills.json?${params}" class="btn btn-secondary" style="font-size:12px;padding:4px 10px;margin-left:4px">JSON</a></div></div>
-      ${items.length ? `<table class="table-wrap"><thead><tr><th>#</th><th>Партия</th><th>Ход</th><th>Сыграно</th><th>Лучше</th><th>Класс</th><th>Потеря</th><th>Win% до/после</th><th>Дебют</th><th>Результат</th></tr></thead><tbody>${items.map((d, i) => `<tr class="drill-row"><td class="num">${i + 1}</td><td>${d.link ? '<a href="' + esc(d.link) + '" target="_blank" rel="noopener" title="Открыть партию">' + esc(d.game_id.slice(0, 8)) + '</a>' : esc(d.game_id.slice(0, 8))}</td><td class="num">${d.ply}</td><td class="drill-san">${esc(d.san_played)}</td><td class="drill-best">${esc(d.best_move_san)}</td><td><span class="badge ${d.classification === 'blunder' ? 'badge-bad' : 'badge-neutral'}">${d.classification}</span></td><td class="num">${d.drop.toFixed(1)}%</td><td class="num">${d.win_before.toFixed(1)}% → ${d.win_after.toFixed(1)}%</td><td>${esc(d.opening)}</td><td class="center"><span class="badge ${d.result_for_user === 'win' ? 'badge-good' : d.result_for_user === 'loss' ? 'badge-bad' : 'badge-neutral'}">${d.result_for_user}</span></td></tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted);padding:16px">Ошибок не найдено.</p>'}
+      ${items.length ? `<table class="table-wrap"><thead><tr><th>#</th><th>Партия</th><th>Ход</th><th>Сыграно</th><th>Лучше</th><th>Класс</th><th>Потеря</th><th>Win% до/после</th><th>Дебют</th><th>Результат</th></tr></thead><tbody>${items.map((d, i) => `<tr class="drill-row"><td class="num">${i + 1}</td><td>${d.link ? '<a href="' + safeHttp(d.link) + '" target="_blank" rel="noopener" title="Открыть партию">' + esc(d.game_id.slice(0, 8)) + '</a>' : esc(d.game_id.slice(0, 8))}</td><td class="num">${d.ply}</td><td class="drill-san">${esc(d.san_played)}</td><td class="drill-best">${esc(d.best_move_san)}</td><td><span class="badge ${d.classification === 'blunder' ? 'badge-bad' : 'badge-neutral'}">${d.classification}</span></td><td class="num">${fmt(d.drop)}%</td><td class="num">${fmt(d.win_before)}% → ${fmt(d.win_after)}%</td><td>${esc(d.opening)}</td><td class="center"><span class="badge ${d.result_for_user === 'win' ? 'badge-good' : d.result_for_user === 'loss' ? 'badge-bad' : 'badge-neutral'}">${d.result_for_user}</span></td></tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted);padding:16px">Ошибок не найдено.</p>'}
     </div>`;
 
   document.getElementById('drills-filter').addEventListener('submit', e => {
@@ -1122,7 +1180,13 @@ async function viewDrills(app) {
     if (fd.get('min_drop')) p.set('min_drop', fd.get('min_drop'));
     if (fd.get('min_win')) p.set('min_win', fd.get('min_win'));
     if (fd.get('verdict')) p.set('verdict', fd.get('verdict'));
-    viewDrillsWithParams(app, p);
+    viewDrillsWithParams(app, p).catch(err => {
+      if (isSessionError(err)) {
+        handleSessionExpired();
+        return;
+      }
+      app.innerHTML = `<div class="alert alert-error">${esc(err.message)}</div>`;
+    });
   });
 }
 
@@ -1141,10 +1205,10 @@ async function viewDrillsWithParams(app, params) {
         <button class="btn btn-secondary" style="height:38px">Применить</button>
       </form>
     </div>
-    ${summary ? `<div class="grid grid-3"><div class="card stat"><div class="stat-value">${summary.found}</div><div class="stat-label">Ошибок найдено</div></div><div class="card stat"><div class="stat-value">${summary.games}</div><div class="stat-label">Партий</div></div><div class="card stat"><div class="stat-value">${summary.avg_drop != null ? summary.avg_drop.toFixed(1) + '%' : '—'}</div><div class="stat-label">Ср. потеря win%</div></div></div>` : ''}
+    ${summary ? `<div class="grid grid-3"><div class="card stat"><div class="stat-value">${summary.found}</div><div class="stat-label">Ошибок найдено</div></div><div class="card stat"><div class="stat-value">${summary.games}</div><div class="stat-label">Партий</div></div><div class="card stat"><div class="stat-value">${summary.avg_drop != null ? fmt(summary.avg_drop) + '%' : '—'}</div><div class="stat-label">Ср. потеря win%</div></div></div>` : ''}
     <div class="card">
       <div class="card-header"><span class="card-title">Список ошибок (${items.length})</span><div><a href="/api/drills.pgn?${params}" class="btn btn-secondary" style="font-size:12px;padding:4px 10px">PGN</a> <a href="/api/drills.json?${params}" class="btn btn-secondary" style="font-size:12px;padding:4px 10px;margin-left:4px">JSON</a></div></div>
-      ${items.length ? `<table class="table-wrap"><thead><tr><th>#</th><th>Партия</th><th>Ход</th><th>Сыграно</th><th>Лучше</th><th>Класс</th><th>Потеря</th><th>Win% до/после</th><th>Дебют</th><th>Результат</th></tr></thead><tbody>${items.map((d, i) => `<tr class="drill-row"><td class="num">${i + 1}</td><td>${d.link ? '<a href="' + esc(d.link) + '" target="_blank" rel="noopener" title="Открыть партию">' + esc(d.game_id.slice(0, 8)) + '</a>' : esc(d.game_id.slice(0, 8))}</td><td class="num">${d.ply}</td><td class="drill-san">${esc(d.san_played)}</td><td class="drill-best">${esc(d.best_move_san)}</td><td><span class="badge ${d.classification === 'blunder' ? 'badge-bad' : 'badge-neutral'}">${d.classification}</span></td><td class="num">${d.drop.toFixed(1)}%</td><td class="num">${d.win_before.toFixed(1)}% → ${d.win_after.toFixed(1)}%</td><td>${esc(d.opening)}</td><td class="center"><span class="badge ${d.result_for_user === 'win' ? 'badge-good' : d.result_for_user === 'loss' ? 'badge-bad' : 'badge-neutral'}">${d.result_for_user}</span></td></tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted);padding:16px">Ошибок не найдено.</p>'}
+      ${items.length ? `<table class="table-wrap"><thead><tr><th>#</th><th>Партия</th><th>Ход</th><th>Сыграно</th><th>Лучше</th><th>Класс</th><th>Потеря</th><th>Win% до/после</th><th>Дебют</th><th>Результат</th></tr></thead><tbody>${items.map((d, i) => `<tr class="drill-row"><td class="num">${i + 1}</td><td>${d.link ? '<a href="' + safeHttp(d.link) + '" target="_blank" rel="noopener" title="Открыть партию">' + esc(d.game_id.slice(0, 8)) + '</a>' : esc(d.game_id.slice(0, 8))}</td><td class="num">${d.ply}</td><td class="drill-san">${esc(d.san_played)}</td><td class="drill-best">${esc(d.best_move_san)}</td><td><span class="badge ${d.classification === 'blunder' ? 'badge-bad' : 'badge-neutral'}">${d.classification}</span></td><td class="num">${fmt(d.drop)}%</td><td class="num">${fmt(d.win_before)}% → ${fmt(d.win_after)}%</td><td>${esc(d.opening)}</td><td class="center"><span class="badge ${d.result_for_user === 'win' ? 'badge-good' : d.result_for_user === 'loss' ? 'badge-bad' : 'badge-neutral'}">${d.result_for_user}</span></td></tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted);padding:16px">Ошибок не найдено.</p>'}
     </div>`;
   document.getElementById('drills-filter').addEventListener('submit', e => {
     e.preventDefault();
@@ -1153,7 +1217,13 @@ async function viewDrillsWithParams(app, params) {
     if (fd.get('min_drop')) p.set('min_drop', fd.get('min_drop'));
     if (fd.get('min_win')) p.set('min_win', fd.get('min_win'));
     if (fd.get('verdict')) p.set('verdict', fd.get('verdict'));
-    viewDrillsWithParams(app, p);
+    viewDrillsWithParams(app, p).catch(err => {
+      if (isSessionError(err)) {
+        handleSessionExpired();
+        return;
+      }
+      app.innerHTML = `<div class="alert alert-error">${esc(err.message)}</div>`;
+    });
   });
 }
 
@@ -1192,7 +1262,7 @@ async function viewTask(app) {
   state.task = task;
   drawTask(app);
   // вернулись на страницу, пока шло объяснение — возобновляем поллинг джобы
-  if (state.taskExplaining && !state.jobPollTimer && state.taskJobId) {
+  if (state.taskExplaining && !state.timers.task && state.taskJobId) {
     taskPollExplanation(app, state.taskJobId);
   }
 }
@@ -1210,8 +1280,8 @@ function taskSolutionHtml(task) {
   const dropBadge = drop != null
     ? `<span class="badge ${drop >= 20 ? 'badge-bad' : 'badge-neutral'}">потеря ${drop >= 0 ? '−' : '+'}${Math.abs(drop).toFixed(1)}%</span>`
     : '';
-  const before = task.win_before != null ? Number(task.win_before).toFixed(1) : '—';
-  const after = task.win_after != null ? Number(task.win_after).toFixed(1) : '—';
+  const before = fmt(task.win_before);
+  const after = fmt(task.win_after);
   return `
     <div class="card">
       <div class="card-header"><span class="card-title">Решение</span>${dropBadge}</div>
@@ -1303,7 +1373,7 @@ function drawTask(app) {
     form.addEventListener('submit', onTaskAnswer);
     const input = document.getElementById('task-answer');
     input.addEventListener('input', () => { state.taskAnswerText = input.value; });
-    input.focus();
+    if (matchMedia('(pointer:fine)').matches) input.focus();
   }
   const showSolution = document.getElementById('task-show-solution');
   if (showSolution) {
@@ -1373,7 +1443,7 @@ async function submitTaskAnswer(app, san) {
     const res = await apiPost('/api/task/answer', fd);
     state.taskResult = res;
     state.taskRevealed = true;
-    state.task.done = true;
+    state.task.done = !!res.correct;
   } catch (err) {
     state.taskError = err.message;
   }
@@ -1413,14 +1483,14 @@ async function taskExplain(app) {
 }
 
 function taskPollExplanation(app, jobId) {
-  if (state.jobPollTimer) clearInterval(state.jobPollTimer);
-  state.jobPollTimer = setInterval(async () => {
+  if (state.timers.task) clearInterval(state.timers.task);
+  state.timers.task = setInterval(async () => {
     let job;
     try {
       job = await api('/api/jobs/' + jobId);
     } catch {
-      clearInterval(state.jobPollTimer);
-      state.jobPollTimer = null;
+      clearInterval(state.timers.task);
+      state.timers.task = null;
       state.taskExplaining = false;
       state.taskJobId = null;
       state.taskError = 'Не удалось получить объяснение';
@@ -1428,15 +1498,15 @@ function taskPollExplanation(app, jobId) {
       return;
     }
     if (job.status === 'done') {
-      clearInterval(state.jobPollTimer);
-      state.jobPollTimer = null;
+      clearInterval(state.timers.task);
+      state.timers.task = null;
       state.taskExplaining = false;
       state.taskJobId = null;
       state.taskExplanation = (job.result && job.result.explanation) || '';
       drawTask(app);
     } else if (job.status === 'error') {
-      clearInterval(state.jobPollTimer);
-      state.jobPollTimer = null;
+      clearInterval(state.timers.task);
+      state.timers.task = null;
       state.taskExplaining = false;
       state.taskJobId = null;
       state.taskError = job.error || 'Не удалось получить объяснение';
@@ -1459,13 +1529,13 @@ async function viewCoach(app) {
     reportHtml = `
       <div class="grid grid-4" style="margin-bottom:12px">
         <div class="card stat"><div class="stat-value">${report.games_analyzed}</div><div class="stat-label">Проанализировано</div></div>
-        <div class="card stat"><div class="stat-value">${report.score.score_pct.toFixed(1)}%</div><div class="stat-label">Счёт</div></div>
-        <div class="card stat"><div class="stat-value">${report.avg.avg_win_loss.toFixed(2)}</div><div class="stat-label">Ср. потеря win%</div></div>
+        <div class="card stat"><div class="stat-value">${fmt(report.score.score_pct)}%</div><div class="stat-label">Счёт</div></div>
+        <div class="card stat"><div class="stat-value">${fmt(report.avg.avg_win_loss, 2)}</div><div class="stat-label">Ср. потеря win%</div></div>
         <div class="card stat"><div class="stat-value">${report.total.blunders + report.total.mistakes}</div><div class="stat-label">Ошибок всего</div></div>
       </div>
-      ${report.worst_games.length ? `<div class="card" style="margin-top:12px"><h3 style="font-size:14px;margin-bottom:8px">Худшие партии</h3><table class="table-wrap" style="font-size:12px"><thead><tr><th>Партия</th><th>Соперник</th><th>Результат</th><th>Ср. потеря</th><th>Win% до</th><th>Грубых</th></tr></thead><tbody>${report.worst_games.slice(0, 5).map(g => `<tr><td>${esc(g.game_id.slice(0, 8))}</td><td>${esc(g.opponent)}</td><td>${esc(g.result)}</td><td class="num">${g.avg_win_loss.toFixed(1)}%</td><td class="num">${g.avg_win_before.toFixed(1)}%</td><td class="num">${g.blunders}</td></tr>`).join('')}</tbody></table></div>` : ''}
-      ${report.missed_wins.length ? `<div class="card" style="margin-top:12px"><h3 style="font-size:14px;margin-bottom:8px">Упущенные выигрыши (топ-5)</h3><table class="table-wrap" style="font-size:12px"><thead><tr><th>Партия</th><th>Ход</th><th>SAN</th><th>Win% до</th><th>Win% после</th><th>Лучший ход</th></tr></thead><tbody>${report.missed_wins.slice(0, 5).map(m => `<tr><td>${esc(m.game_id.slice(0, 8))}</td><td>${m.ply}</td><td class="drill-san">${esc(m.san)}</td><td class="num">${m.win_before.toFixed(1)}%</td><td class="num">${m.win_after.toFixed(1)}%</td><td class="drill-best">${esc(m.best_move_san)}</td></tr>`).join('')}</tbody></table></div>` : ''}
-      <div class="card" style="margin-top:12px"><h3 style="font-size:14px;margin-bottom:8px">Тайм-тробль</h3><div class="grid grid-3"><div class="stat"><div class="stat-value">${report.time_pressure.moves_count}</div><div class="stat-label">Ходов в ТТ</div></div><div class="stat"><div class="stat-value">${report.time_pressure.blunders_in_tp}</div><div class="stat-label">Грубых в ТТ</div></div><div class="stat"><div class="stat-value">${report.time_pressure.tp_blunder_rate_pct.toFixed(1)}%</div><div class="stat-label">% грубых в ТТ</div></div></div></div>`;
+      ${report.worst_games.length ? `<div class="card" style="margin-top:12px"><h3 style="font-size:14px;margin-bottom:8px">Худшие партии</h3><table class="table-wrap" style="font-size:12px"><thead><tr><th>Партия</th><th>Соперник</th><th>Результат</th><th>Ср. потеря</th><th>Win% до</th><th>Грубых</th></tr></thead><tbody>${report.worst_games.slice(0, 5).map(g => `<tr><td>${esc(g.game_id.slice(0, 8))}</td><td>${esc(g.opponent)}</td><td>${esc(g.result)}</td><td class="num">${fmt(g.avg_win_loss)}%</td><td class="num">${fmt(g.avg_win_before)}%</td><td class="num">${g.blunders}</td></tr>`).join('')}</tbody></table></div>` : ''}
+      ${report.missed_wins.length ? `<div class="card" style="margin-top:12px"><h3 style="font-size:14px;margin-bottom:8px">Упущенные выигрыши (топ-5)</h3><table class="table-wrap" style="font-size:12px"><thead><tr><th>Партия</th><th>Ход</th><th>SAN</th><th>Win% до</th><th>Win% после</th><th>Лучший ход</th></tr></thead><tbody>${report.missed_wins.slice(0, 5).map(m => `<tr><td>${esc(m.game_id.slice(0, 8))}</td><td>${m.ply}</td><td class="drill-san">${esc(m.san)}</td><td class="num">${fmt(m.win_before)}%</td><td class="num">${fmt(m.win_after)}%</td><td class="drill-best">${esc(m.best_move_san)}</td></tr>`).join('')}</tbody></table></div>` : ''}
+      <div class="card" style="margin-top:12px"><h3 style="font-size:14px;margin-bottom:8px">Тайм-тробль</h3><div class="grid grid-3"><div class="stat"><div class="stat-value">${report.time_pressure.moves_count}</div><div class="stat-label">Ходов в ТТ</div></div><div class="stat"><div class="stat-value">${report.time_pressure.blunders_in_tp}</div><div class="stat-label">Грубых в ТТ</div></div><div class="stat"><div class="stat-value">${fmt(report.time_pressure.tp_blunder_rate_pct)}%</div><div class="stat-label">% грубых в ТТ</div></div></div></div>`;
   } else {
     reportHtml = '<p style="color:var(--c-text-muted)">Пока нет отчёта. Запусти анализ выше.</p>';
   }
@@ -1514,14 +1584,6 @@ async function viewCoach(app) {
     }
   });
 
-  // Check for running jobs
-  try {
-    const jobs = await api('/api/jobs');
-    if (jobs && jobs.length > 0) {
-      const running = jobs.find(j => j.status === 'running');
-      if (running) showJob(app, running.id);
-    }
-  } catch { /* ignore */ }
 }
 
 function unlockCoachButton() {
@@ -1548,15 +1610,15 @@ function showJob(app, jobId) {
       <div id="job-summary"></div>
     </div>`;
 
-  if (state.jobPollTimer) clearInterval(state.jobPollTimer);
-  state.jobPollTimer = setInterval(async () => {
+  if (state.timers.coach) clearInterval(state.timers.coach);
+  state.timers.coach = setInterval(async () => {
     try {
       const j = await api('/api/jobs/' + jobId);
       const bar = document.getElementById('progress-bar');
       const phase = document.getElementById('job-phase');
       const detail = document.getElementById('job-detail');
       const status = document.getElementById('job-status');
-      if (!bar || !phase || !detail || !status) { clearInterval(state.jobPollTimer); return; }
+      if (!bar || !phase || !detail || !status) { clearInterval(state.timers.coach); state.timers.coach = null; return; }
       bar.style.width = j.total ? (j.done * 100 / j.total) + '%' : '0%';
       phase.textContent = j.phase;
       detail.textContent = j.done + ' / ' + j.total + (j.current ? ' (' + j.current.slice(0, 8) + ')' : '');
@@ -1565,15 +1627,21 @@ function showJob(app, jobId) {
         document.getElementById('job-error').innerHTML = `<div class="job-error">${esc(j.error)}</div>`;
       }
       if (j.status === 'done') {
-        clearInterval(state.jobPollTimer);
+        clearInterval(state.timers.coach);
+        state.timers.coach = null;
         unlockCoachButton();
         document.getElementById('job-summary').innerHTML = `<div class="alert alert-success" style="margin-top:12px">${esc(j.summary)}</div>`;
-        setTimeout(() => navigate('coach'), 1500);
+        if (state.currentView === 'coach') setTimeout(() => navigate('coach'), 1500);
       } else if (j.status === 'error') {
-        clearInterval(state.jobPollTimer);
+        clearInterval(state.timers.coach);
+        state.timers.coach = null;
         unlockCoachButton();
       }
-    } catch { clearInterval(state.jobPollTimer); }
+    } catch {
+      clearInterval(state.timers.coach);
+      state.timers.coach = null;
+      unlockCoachButton();
+    }
   }, 1000);
 }
 
@@ -1680,6 +1748,10 @@ function toolFormHtml(tool) {
     return `
       <form id="tool-form">
         <div class="form-group"><label>Заметки для тренера (опц.)<textarea name="notes" rows="3" placeholder="Хочу сильнее играть эндшпиль, особенно ладейные..."></textarea></label></div>
+        <div class="form-row">
+          <div class="form-group" style="flex:2;min-width:200px"><label>Конкретная партия (опц.) <input type="text" name="game_id" placeholder="2SXfzXV2"></label></div>
+          <div class="form-group"><label>Глубина анализа <input type="number" name="max_depth" value="16" min="1" max="30"></label></div>
+        </div>
         <button type="submit" class="btn btn-primary" style="width:fit-content">Спросить тренера</button>
       </form>
       <p style="color:var(--c-text-muted);font-size:13px;margin-top:12px">Тренер строит план по твоим партиям, дебютам, ошибкам и прогрессу — и выдаёт личные задания. Требует LLM_API_KEY (см. README).</p>`;
@@ -1689,6 +1761,7 @@ function toolFormHtml(tool) {
     <form id="tool-form">
       <div class="form-row">
         <div class="form-group"><label>FIDE ID <input type="text" name="id" required placeholder="4130005" value="${esc(prefill)}"></label></div>
+        <div class="form-group"><label>Окна истории <input type="number" name="windows" value="4" min="1" max="52"></label></div>
       </div>
       <button type="submit" class="btn btn-primary" style="width:fit-content">Показать</button>
     </form>`;
@@ -1734,6 +1807,10 @@ function bindToolForm(tool) {
 }
 
 function toolError(err) {
+  if (isSessionError(err)) {
+    handleSessionExpired();
+    return;
+  }
   const box = document.getElementById('tool-result');
   if (box) box.innerHTML = `<div class="alert alert-error">${esc(err.message)}</div>`;
 }
@@ -1749,16 +1826,16 @@ function startToolJob(jobId, onDone) {
       <div id="tool-error"></div>
     </div>`;
 
-  if (state.jobPollTimer) clearInterval(state.jobPollTimer);
-  state.jobPollTimer = setInterval(async () => {
+  if (state.timers.tool) clearInterval(state.timers.tool);
+  state.timers.tool = setInterval(async () => {
     const bar = document.getElementById('tool-bar');
-    if (!bar) { clearInterval(state.jobPollTimer); state.jobPollTimer = null; return; }
+    if (!bar) { clearInterval(state.timers.tool); state.timers.tool = null; return; }
     let j;
     try {
       j = await api('/api/jobs/' + jobId);
     } catch {
-      clearInterval(state.jobPollTimer);
-      state.jobPollTimer = null;
+      clearInterval(state.timers.tool);
+      state.timers.tool = null;
       return;
     }
     bar.style.width = j.total ? (j.done * 100 / j.total) + '%' : '0%';
@@ -1769,8 +1846,8 @@ function startToolJob(jobId, onDone) {
       document.getElementById('tool-error').innerHTML = `<div class="job-error">${esc(j.error)}</div>`;
     }
     if (j.status === 'done' || j.status === 'error') {
-      clearInterval(state.jobPollTimer);
-      state.jobPollTimer = null;
+      clearInterval(state.timers.tool);
+      state.timers.tool = null;
       if (j.status === 'done') onDone(j.result || {});
     }
   }, 700);
@@ -1800,7 +1877,7 @@ function renderRepertoire(d) {
       ${openings.length ? `
         <h3 style="font-size:14px;margin:16px 0 8px">Дебюты — ошибки по названиям</h3>
         <table class="table-wrap"><thead><tr><th>Дебют</th><th>ECO</th><th class="num">Партий</th><th class="num">Очков %</th><th class="num">Ошибок/партию</th><th class="num">Ср. потеря</th></tr></thead>
-        <tbody>${openings.map(o => `<tr><td>${esc(o.opening)}</td><td>${esc(o.eco || '—')}</td><td class="num">${o.games}</td><td class="num">${o.points_pct.toFixed(1)}%</td><td class="num">${o.errors_per_game.toFixed(2)}</td><td class="num">${o.avg_drop.toFixed(1)}%</td></tr>`).join('')}</tbody></table>` : ''}
+        <tbody>${openings.map(o => `<tr><td>${esc(o.opening)}</td><td>${esc(o.eco || '—')}</td><td class="num">${o.games}</td><td class="num">${fmt(o.points_pct)}%</td><td class="num">${fmt(o.errors_per_game, 2)}</td><td class="num">${fmt(o.avg_drop)}%</td></tr>`).join('')}</tbody></table>` : ''}
     </div>`;
 }
 
@@ -1818,16 +1895,16 @@ function renderOpponent(d) {
       openRows.push(`<tr>
         <td>${TOOL_COLOR_RU[color]}</td>
         <td>${esc(o.opening)}${o.variant !== o.opening ? ` <span style="color:var(--c-text-muted)">(${esc(o.variant)})</span>` : ''}</td>
-        <td class="num">${o.games}</td><td class="num">${o.points_pct.toFixed(1)}%</td>
-        <td class="num">${o.errors_per_game.toFixed(2)}</td><td class="num">${o.avg_drop.toFixed(1)}%</td>
+        <td class="num">${o.games}</td><td class="num">${fmt(o.points_pct)}%</td>
+        <td class="num">${fmt(o.errors_per_game, 2)}</td><td class="num">${fmt(o.avg_drop)}%</td>
       </tr>`);
     }
   }
 
   const weakness = p.weaknesses || {};
   const weakRows = [
-    ...(weakness.phases || []).map(w => `<tr><td>фаза</td><td>${esc(w.label)}</td><td class="num">${w.bad_moves}</td><td class="num">${w.avg_drop != null ? w.avg_drop.toFixed(1) + '%' : '—'}</td></tr>`),
-    ...(weakness.motifs || []).map(w => `<tr><td>мотив</td><td>${esc(w.motif)}</td><td class="num">${w.bad_moves}</td><td class="num">${w.avg_drop != null ? w.avg_drop.toFixed(1) + '%' : '—'}</td></tr>`),
+    ...(weakness.phases || []).map(w => `<tr><td>фаза</td><td>${esc(w.label)}</td><td class="num">${w.bad_moves}</td><td class="num">${w.avg_drop != null ? fmt(w.avg_drop) + '%' : '—'}</td></tr>`),
+    ...(weakness.motifs || []).map(w => `<tr><td>мотив</td><td>${esc(w.motif)}</td><td class="num">${w.bad_moves}</td><td class="num">${w.avg_drop != null ? fmt(w.avg_drop) + '%' : '—'}</td></tr>`),
   ];
 
   box.innerHTML = `
@@ -1838,7 +1915,7 @@ function renderOpponent(d) {
       </div>
       ${p.small_sample ? '<div class="alert alert-warn">Меньше 20 партий — выводы о репертуаре соперника шумные.</div>' : ''}
       <div class="grid grid-4">
-        <div class="stat"><div class="stat-value">${p.score_pct != null ? p.score_pct.toFixed(1) + '%' : '—'}</div><div class="stat-label">Его очки</div></div>
+        <div class="stat"><div class="stat-value">${p.score_pct != null ? fmt(p.score_pct) + '%' : '—'}</div><div class="stat-label">Его очки</div></div>
         <div class="stat"><div class="stat-value">${ratingText}</div><div class="stat-label">Его рейтинг</div></div>
         <div class="stat"><div class="stat-value" style="font-size:15px">${esc(p.trend || '—')}</div><div class="stat-label">Качество игры</div></div>
         <div class="stat"><div class="stat-value" style="font-size:15px">${speed}</div><div class="stat-label">Контроль времени</div></div>
@@ -1855,8 +1932,8 @@ function renderOpponent(d) {
           <td>${esc(c.opening)}</td>
           <td>${TOOL_COLOR_RU[c.his_color]}: ${c.his_games} парт.</td>
           <td><code>${esc(c.your_reply)}</code> (${c.your_reply_games} парт.)</td>
-          <td class="num">${c.his_errors_per_game.toFixed(2)}</td>
-          <td class="num">${c.your_errors_per_game.toFixed(2)}</td>
+           <td class="num">${fmt(c.his_errors_per_game, 2)}</td>
+           <td class="num">${fmt(c.your_errors_per_game, 2)}</td>
         </tr>`).join('')}</tbody></table>`
         : '<p style="color:var(--c-text-muted)">Пересечений с твоим репертуаром не нашлось: готовиться пока не к чему.</p>'}
     </div>`;
@@ -1886,7 +1963,7 @@ function renderHumanity(d) {
           <td class="num">${i.ply}</td>
           <td class="drill-san">${esc(i.san || '')}</td>
           <td>${esc(i.classification || '—')}</td>
-          <td class="num">${i.drop != null ? i.drop.toFixed(1) + '%' : '—'}</td>
+          <td class="num">${i.drop != null ? fmt(i.drop) + '%' : '—'}</td>
           <td class="num">${i.beta != null ? i.beta : '—'}</td>
           <td><span class="badge ${verdictBadge(i.verdict)}">${esc(i.verdict || '—')}</span></td>
         </tr>`).join('')}</tbody></table>`
@@ -1986,7 +2063,7 @@ function renderReview(d) {
         <div style="margin-top:8px">
           <code>${esc(m.san || '—')}</code>
           <span class="badge ${cls === 'blunder' ? 'badge-bad' : cls === 'mistake' ? 'badge-neutral' : 'badge-good'}">${esc(cls)}</span>
-          <span style="color:var(--c-text-muted);font-size:12px">полуход ${m.ply || '—'}${m.drop != null ? ` · потеря win% ${m.drop.toFixed(1)}` : ''}</span>
+          <span style="color:var(--c-text-muted);font-size:12px">полуход ${m.ply || '—'}${m.drop != null ? ` · потеря win% ${fmt(m.drop)}` : ''}</span>
           <div style="margin-top:2px">${m.text ? esc(m.text) : '<span style="color:var(--c-text-muted)">(нет объяснения)</span>'}</div>
         </div>`;
     }).join('');
@@ -1996,7 +2073,7 @@ function renderReview(d) {
           <span class="card-title">${esc(g.game_id)} · ${esc(g.white)} — ${esc(g.black)}</span>
           <span class="badge ${resBadge(g.result)}">${resLabel(g.result)}</span>
         </div>
-        <p style="color:var(--c-text-muted);font-size:13px;margin:0 0 8px">${esc(g.opening || '—')}${g.avg_win_loss != null ? ` · ср. потеря win% ${g.avg_win_loss.toFixed(1)}` : ''}</p>
+        <p style="color:var(--c-text-muted);font-size:13px;margin:0 0 8px">${esc(g.opening || '—')}${g.avg_win_loss != null ? ` · ср. потеря win% ${fmt(g.avg_win_loss)}` : ''}</p>
         ${moments || '<p style="color:var(--c-text-muted)">Ключевых моментов нет.</p>'}
         ${g.summary ? `<p style="margin-top:8px"><strong>Итог:</strong> ${esc(g.summary)}</p>` : ''}
       </div>`;
@@ -2072,9 +2149,9 @@ function openLichessManual() {
   const fail = msg => {
     err.textContent = msg;
     err.style.display = 'inline-block';
-    input.focus();
+    if (matchMedia('(pointer:fine)').matches) input.focus();
   };
-  input.focus();
+  if (matchMedia('(pointer:fine)').matches) input.focus();
   form.addEventListener('submit', async e => {
     e.preventDefault();
     err.style.display = 'none';
@@ -2234,6 +2311,11 @@ async function viewUsers(app) {
     } catch { /* всё равно выходим */ }
     state.user = null;
     state.authMode = 'login';
+    Object.assign(state, {
+      gameId: null, gameData: null, task: null, taskKey: null, taskResult: null,
+      taskRevealed: false, taskExplanation: null, planLlmJobId: null,
+      planLlmGenerating: false, tool: 'repertoire', gamesFilter: 'all',
+    });
     hideNav();
     renderUserbox();
     render(state.currentView);
@@ -2248,40 +2330,28 @@ async function viewUsers(app) {
   }
 }
 
-function openFideEdit(link, rerender) {
-  const td = link.closest('.fide-cell');
-  if (!td) return;
-  const nick = td.dataset.nick;
-  const shown = td.querySelector('.fide-value');
-  const value = shown && shown.textContent !== '—' ? shown.textContent : '';
-  td.innerHTML = `<form class="fide-form">
-      <input type="text" name="fide_id" value="${esc(value)}" placeholder="4130005">
-      <button class="btn btn-primary" style="font-size:12px;padding:3px 8px" title="Сохранить">✓</button>
-      <button type="button" class="btn btn-secondary fide-cancel" style="font-size:12px;padding:3px 8px" title="Отмена">✕</button>
-    </form>`;
-  const form = td.querySelector('.fide-form');
-  const input = form.querySelector('input');
-  input.focus();
-  input.select();
-  form.addEventListener('submit', async e => {
-    e.preventDefault();
-    const fd = new FormData(form);
-    fd.set('nick', nick);
-    try {
-      await apiPost('/api/user/fide', fd);
-      await rerender();
-    } catch (err) {
-      alert(err.message);
-    }
-  });
-  form.querySelector('.fide-cancel').addEventListener('click', () => rerender());
-}
-
 // --- Utilities ---
 
 function esc(s) {
   if (s == null) return '';
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function safeHttp(u) {
+  return /^https?:\/\//i.test(u || '') ? u : '#';
+}
+
+const fmt = (v, d = 1) => (v != null ? Number(v).toFixed(d) : '—');
+
+function isSessionError(err) {
+  return /No current user|Not authenticated|401/.test((err && err.message) || '');
+}
+
+function handleSessionExpired() {
+  state.user = null;
+  hideNav();
+  renderUserbox();
+  viewAuth(document.getElementById('app'));
 }
 
 function bindLinks(root) {

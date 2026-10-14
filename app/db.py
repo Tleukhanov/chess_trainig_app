@@ -434,23 +434,23 @@ class Database:
                 row["column_name"]
                 for row in conn.execute(
                     "SELECT column_name FROM information_schema.columns "
-                    "WHERE table_name = 'users'"
+                    "WHERE table_name = 'users' AND table_schema = 'public'"
                 ).fetchall()
             }
             for coldef in _USERS_AUTH_COLUMNS:
                 if coldef.split()[0] not in existing:
-                    conn.execute(f"ALTER TABLE users ADD COLUMN {coldef}")
+                    conn.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {coldef}")
             conn.execute("UPDATE users SET role = 'user' WHERE role IS NULL")
             conn.execute("UPDATE users SET is_active = 1 WHERE is_active IS NULL")
             games_cols = {
                 row["column_name"]
                 for row in conn.execute(
                     "SELECT column_name FROM information_schema.columns "
-                    "WHERE table_name = 'games'"
+                    "WHERE table_name = 'games' AND table_schema = 'public'"
                 ).fetchall()
             }
             if "link" not in games_cols:
-                conn.execute("ALTER TABLE games ADD COLUMN link TEXT")
+                conn.execute("ALTER TABLE games ADD COLUMN IF NOT EXISTS link TEXT")
             conn.execute(
                 "UPDATE games SET link = 'https://lichess.org/' || id "
                 "WHERE (link IS NULL OR link = '') "
@@ -737,11 +737,29 @@ class Database:
         with self._connection() as conn:
             conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
 
+    def delete_user_sessions(self, nick: str) -> None:
+        """Удаляет все сессии пользователя (например, после смены пароля).
+
+        DELETE одинаков для SQLite и PG: ник в sessions хранится в том же
+        написании, что и в users.nick (create_session пишет его как есть).
+        """
+        key = (nick or "").strip()
+        if not key:
+            return
+        with self._connection() as conn:
+            conn.execute("DELETE FROM sessions WHERE nick = ?", (key,))
+
     def list_users(self) -> list[dict[str, Any]]:
-        """Все профили с числом партий и анализов для команды ``user list``."""
+        """Все профили с числом партий и анализов для команды ``user list``.
+
+        Список колонок явный: ``password_hash`` наружу не отдаём (даже в
+        CLI/API — хеш не должен покидать БД). ``nick_lower`` остаётся: он
+        нужен identity и CLI (служебный, не секретный).
+        """
         with self._connection() as conn:
             rows = conn.execute(
-                "SELECT u.*, "
+                "SELECT u.nick_lower, u.nick, u.lichess, u.fide_id, u.role, "
+                "u.is_active, u.created_at, u.last_seen_at, u.bound_at, "
                 "(SELECT count(*) FROM games g WHERE g.user = u.nick) AS games, "
                 "(SELECT count(*) FROM analyses a JOIN games g2 ON g2.id = a.game_id "
                 " WHERE g2.user = u.nick) AS analyses "

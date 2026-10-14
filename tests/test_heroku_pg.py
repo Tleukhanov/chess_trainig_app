@@ -248,6 +248,20 @@ class BackendSelectionTest(unittest.TestCase):
             self.assertIn("%s", sql)
             self.assertNotIn("?", sql)
 
+    def test_pg_migration_sql_uses_if_not_exists_and_public_schema(self) -> None:
+        """PG-миграция: ADD COLUMN IF NOT EXISTS и information_schema с public."""
+        log: list = []
+        _install_psycopg_stub(log)
+        with mock.patch.dict(
+            os.environ, {"DATABASE_URL": "postgresql://u:p@host:5432/db"}
+        ):
+            db = Database(self._db_path())
+            db.init_db()
+        statements = [sql for sql, _ in log if isinstance(sql, str)]
+        blob = "\n".join(statements)
+        self.assertIn("ADD COLUMN IF NOT EXISTS", blob)
+        self.assertIn("table_schema = 'public'", blob)
+
     def test_psycopg_not_required_without_database_url(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("DATABASE_URL", None)
