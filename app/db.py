@@ -30,7 +30,7 @@ from .openings import classify_opening
 _GAMES_DDL = """
 CREATE TABLE IF NOT EXISTS {table}(
     id TEXT NOT NULL,
-    user TEXT NOT NULL COLLATE NOCASE,
+    player TEXT NOT NULL,
     rated INTEGER,
     speed TEXT,
     created_at INTEGER,
@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS {table}(
     moves_json TEXT,
     clocks_json TEXT,
     fetched_at INTEGER,
-    PRIMARY KEY(id, user)
+    PRIMARY KEY(id, player)
 )
 """
 
@@ -89,7 +89,7 @@ CREATE TABLE IF NOT EXISTS {table}(
 _TASK_EXPLANATIONS_DDL = """
 CREATE TABLE IF NOT EXISTS {table}(
     task_key TEXT PRIMARY KEY,
-    user TEXT,
+    player TEXT,
     game_id TEXT,
     ply INTEGER,
     explanation TEXT,
@@ -98,7 +98,7 @@ CREATE TABLE IF NOT EXISTS {table}(
 """
 
 _GAME_COLUMNS = (
-    "id, user, rated, speed, created_at, status, winner, white, black, "
+    "id, player, rated, speed, created_at, status, winner, white, black, "
     "opening, eco, user_color, opponent, user_rating, user_rating_diff, "
     "result_for_user, link, moves_json, clocks_json, fetched_at"
 )
@@ -106,7 +106,7 @@ _GAME_COLUMNS = (
 # (INSERT ... SELECT по этим колонкам; link тогда остаётся NULL и
 # добивается backfill-миграцией в init_db).
 _GAME_COLUMNS_NO_LINK = (
-    "id, user, rated, speed, created_at, status, winner, white, black, "
+    "id, player, rated, speed, created_at, status, winner, white, black, "
     "opening, eco, user_color, opponent, user_rating, user_rating_diff, "
     "result_for_user, moves_json, clocks_json, fetched_at"
 )
@@ -127,8 +127,8 @@ CREATE TABLE IF NOT EXISTS sessions(
     created_at INTEGER,
     expires_at INTEGER
 );
-CREATE INDEX IF NOT EXISTS idx_games_user ON games(user);
-CREATE INDEX IF NOT EXISTS idx_task_explanations_user ON task_explanations(user);
+CREATE INDEX IF NOT EXISTS idx_games_player ON games(player);
+CREATE INDEX IF NOT EXISTS idx_task_explanations_player ON task_explanations(player);
 CREATE INDEX IF NOT EXISTS idx_sessions_nick ON sessions(nick);
 """
 
@@ -150,6 +150,11 @@ def _pg_dsn() -> str | None:
     """
     url = pgdb.normalize_database_url(os.environ.get("DATABASE_URL", ""))
     return url or None
+
+
+def _is_heroku() -> bool:
+    """True, если процесс запущен на Heroku (есть DYNO в окружении)."""
+    return bool(os.environ.get("DYNO"))
 
 
 # Предикат «id похож на личессовский» для backfill колонки games.link.
@@ -247,18 +252,20 @@ def _table_ddl(conn: Any, name: str) -> str:
 
 
 def _rebuild_table(
-    conn: Any, ddl: str, tmp: str, table: str, columns: str
+    conn: Any, ddl: str, tmp: str, table: str, columns: str, select_columns: str | None = None
 ) -> None:
     """Пересоздаёт таблицу по новому DDL, копируя в неё строки.
 
     Копирование идёт по явному списку колонок, а не через SELECT *: состав
     старой схемы мог отличаться, и любое расхождение вылезло бы здесь тихим
     сдвигом данных. Имя во временном DDL подставляем сами, чтобы не плодить
-    копию текста схемы.
+    копию текста схемы. ``select_columns`` — список колонок старой таблицы,
+    если имена отличаются (переименование ``user`` → ``player``).
     """
     conn.execute(ddl.format(table=tmp))
+    src = select_columns or columns
     conn.execute(
-        f"INSERT INTO {tmp}({columns}) SELECT {columns} FROM {table}"
+        f"INSERT INTO {tmp}({columns}) SELECT {src} FROM {table}"
     )
     conn.execute(f"DROP TABLE {table}")
     conn.execute(f"ALTER TABLE {tmp} RENAME TO {table}")
@@ -275,10 +282,10 @@ def _backfill_users(conn: Any) -> None:
     if not _table_ddl(conn, "games"):
         return
     rows = conn.execute(
-        "SELECT user, max(created_at) AS last_at FROM games "
-        "GROUP BY user ORDER BY last_at DESC"
+        "SELECT player, max(created_at) AS last_at FROM games "
+        "GROUP BY LOWER(player) ORDER BY last_at DESC"
     ).fetchall()
-    users = [str(row["user"] or "").strip() for row in rows]
+    users = [str(row["player"] or "").strip() for row in rows]
     users = [nick for nick in users if nick]
     if not users:
         return
@@ -325,10 +332,24 @@ def _migrate_v3(path: Path | str) -> None:
             _rebuild_table(
                 conn, _ANALYSES_DDL, "analyses_migrated", "analyses", _ANALYSIS_COLUMNS
             )
-        if _table_ddl(conn, "games") and "(id, user)" not in _table_ddl(conn, "games"):
+        if _table_ddl(conn, "games") and "(id, user)" not in _table_ddl(conn, "games") and "(id, player)" not in _table_ddl(conn, "games"):
             _rebuild_table(
-                conn, _GAMES_DDL, "games_migrated", "games", _GAME_COLUMNS_NO_LINK
+                conn,
+                _GAMES_DDL,
+                "games_migrated",
+                "games",
+                _GAME_COLUMNS_NO_LINK,
+                select_columns=_GAME_COLUMNS_NO_LINK.replace("player", "user"),
             )
+        # Переименование user → player в базах, уже мигрированных на (id, user):
+        # SQLite терпит `user`, PostgreSQL — нет (зарезервированное слово).
+        for _tbl in ("games", "task_explanations"):
+            try:
+                _cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({_tbl})").fetchall()]
+            except Exception:
+                continue
+            if "user" in _cols and "player" not in _cols:
+                conn.execute(f"ALTER TABLE {_tbl} RENAME COLUMN user TO player")
 
         _backfill_users(conn)
         conn.commit()
@@ -350,6 +371,12 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.dsn = _pg_dsn()
         self.backend = "pg" if self.dsn else "sqlite"
+        if self.backend == "sqlite" and _is_heroku():
+            raise RuntimeError(
+                "На Heroku не задан DATABASE_URL — база ушла бы в SQLite на "
+                "эфемерный диск и данные терялись бы при каждом рестарте. "
+                "Добавь аддон: heroku addons:create heroku-postgresql:essential-0"
+            )
 
     def connect(self) -> Any:
         """Открывает соединение выбранного бэкенда."""
@@ -493,7 +520,7 @@ class Database:
                 )
                 cur = conn.execute(
                     f"INSERT INTO games({_GAME_COLUMNS}) VALUES ({_GAME_PLACEHOLDERS}) "
-                    "ON CONFLICT(id, user) DO NOTHING",
+                    "ON CONFLICT(id, player) DO NOTHING",
                     values,
                 )
                 inserted += cur.rowcount
@@ -503,7 +530,7 @@ class Database:
         """Возвращает партии пользователя в порядке created_at ASC."""
         with self._connection() as conn:
             rows = conn.execute(
-                "SELECT * FROM games WHERE user = ? "
+                "SELECT * FROM games WHERE LOWER(player) = LOWER(?) "
                 "ORDER BY created_at ASC, id ASC LIMIT ?",
                 (user, limit),
             ).fetchall()
@@ -520,7 +547,7 @@ class Database:
         with self._connection() as conn:
             if user:
                 row = conn.execute(
-                    "SELECT * FROM games WHERE id = ? AND user = ?",
+                    "SELECT * FROM games WHERE id = ? AND LOWER(player) = LOWER(?)",
                     (game_id, user),
                 ).fetchone()
             else:
@@ -591,7 +618,7 @@ class Database:
             rows = conn.execute(
                 "SELECT g.*, a.analysis_json AS analysis_json "
                 "FROM games g JOIN analyses a ON a.game_id = g.id "
-                "WHERE g.user = ? ORDER BY g.created_at ASC, g.id ASC LIMIT ?",
+                "WHERE LOWER(g.player) = LOWER(?) ORDER BY g.created_at ASC, g.id ASC LIMIT ?",
                 (user, limit),
             ).fetchall()
         result: list[tuple[Game, dict]] = []
@@ -760,9 +787,9 @@ class Database:
             rows = conn.execute(
                 "SELECT u.nick_lower, u.nick, u.lichess, u.fide_id, u.role, "
                 "u.is_active, u.created_at, u.last_seen_at, u.bound_at, "
-                "(SELECT count(*) FROM games g WHERE g.user = u.nick) AS games, "
+                "(SELECT count(*) FROM games g WHERE LOWER(g.player) = u.nick_lower) AS games, "
                 "(SELECT count(*) FROM analyses a JOIN games g2 ON g2.id = a.game_id "
-                " WHERE g2.user = u.nick) AS analyses "
+                " WHERE LOWER(g2.player) = u.nick_lower) AS analyses "
                 "FROM users u ORDER BY u.bound_at ASC, u.nick_lower ASC"
             ).fetchall()
         return [dict(row) for row in rows]
@@ -849,10 +876,10 @@ class Database:
         with self._connection() as conn:
             conn.execute(
                 "INSERT INTO task_explanations"
-                "(task_key, user, game_id, ply, explanation, created_at) "
+                "(task_key, player, game_id, ply, explanation, created_at) "
                 "VALUES (?,?,?,?,?,?) "
                 "ON CONFLICT(task_key) DO UPDATE SET "
-                "user = excluded.user, "
+                "player = excluded.player, "
                 "game_id = excluded.game_id, "
                 "ply = excluded.ply, "
                 "explanation = excluded.explanation, "
@@ -898,11 +925,11 @@ class Database:
             is_current = bool(row) and (str(row["value"] or "").strip().lower() == key)
             conn.execute(
                 "DELETE FROM analyses WHERE game_id IN "
-                "(SELECT id FROM games WHERE user = ?) "
-                "AND game_id NOT IN (SELECT id FROM games WHERE user <> ?)",
+                "(SELECT id FROM games WHERE LOWER(player) = LOWER(?)) "
+                "AND game_id NOT IN (SELECT id FROM games WHERE LOWER(player) <> LOWER(?))",
                 (key, key),
             )
-            conn.execute("DELETE FROM games WHERE user = ?", (key,))
+            conn.execute("DELETE FROM games WHERE LOWER(player) = LOWER(?)", (key,))
             cur = conn.execute("DELETE FROM users WHERE nick_lower = ?", (key,))
         if is_current:
             self.clear_current_user()

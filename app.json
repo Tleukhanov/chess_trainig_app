@@ -10,8 +10,11 @@
       "url": "heroku/python"
     }
   ],
-  "addons": [],
-  "_shared_db_note": "Postgres Essential-0 создаётся один раз и аттачится ко всем приложениям (см. план деплоя), чтобы держать $13/мес.",
+  "addons": [
+    {
+      "plan": "heroku-postgresql:essential-0"
+    }
+  ],
   "env": {
     "STOCKFISH_PATH": {
       "description": "Path to the Stockfish binary from the Aptfile package.",
