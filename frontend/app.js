@@ -1584,6 +1584,19 @@ async function viewCoach(app) {
     }
   });
 
+  // Если задача уже бежит (обновили страницу) — блокируем кнопку и цепляем polling.
+  try {
+    const active = await api('/api/jobs/active');
+    if (active && active.id) {
+      const btn = document.querySelector('#coach-form button[type="submit"]');
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Идёт анализ…';
+      }
+      showJob(app, active.id);
+    }
+  } catch { /* нет активной задачи — кнопка свободна */ }
+
 }
 
 function unlockCoachButton() {
@@ -1637,10 +1650,17 @@ function showJob(app, jobId) {
         state.timers.coach = null;
         unlockCoachButton();
       }
-    } catch {
+    } catch (pollErr) {
       clearInterval(state.timers.coach);
       state.timers.coach = null;
       unlockCoachButton();
+      const msg = String((pollErr && pollErr.message) || '');
+      if (/404/.test(msg)) {
+        const errBox = document.getElementById('job-error');
+        if (errBox) errBox.innerHTML = `<div class="job-error">Задача потеряна (сервер перезапустился). Можно запускать заново.</div>`;
+        const st = document.getElementById('job-status');
+        if (st) st.textContent = 'LOST';
+      }
     }
   }, 1000);
 }

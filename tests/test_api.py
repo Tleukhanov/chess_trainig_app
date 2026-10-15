@@ -2736,6 +2736,25 @@ class JobLimitTests(ApiTestBase):
         finally:
             _JOBS.clear()
 
+    def test_active_job_roundtrip(self):
+        """GET /api/jobs/active: своя running видна, чужая — нет, пусто — 404."""
+        self._login()
+        try:
+            resp = self.client.get("/api/jobs/active")
+            self.assertEqual(resp.status_code, 404)
+            self._insert_running_job("limiter", "job-active-1")
+            resp = self.client.get("/api/jobs/active")
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(resp.json()["id"], "job-active-1")
+            self._insert_running_job("stranger", "job-stranger-1")
+            resp = self.client.get("/api/jobs/active")
+            self.assertEqual(resp.json()["id"], "job-active-1")
+            _JOBS["job-active-1"].status = "done"
+            resp = self.client.get("/api/jobs/active")
+            self.assertEqual(resp.status_code, 404)
+        finally:
+            _JOBS.clear()
+
     def test_limit_released_after_done(self):
         self._login()
         self._insert_running_job("limiter", "job-running-1")

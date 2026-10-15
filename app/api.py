@@ -2037,6 +2037,18 @@ def create_api(
 
         return {"job_id": job.id, "status": "started"}
 
+    @app.get("/api/jobs/active")
+    def api_active_job(request: Request):
+        """Активная задача текущего пользователя (для блокировки кнопки)."""
+        user = _current_user(app.state.db_path, request)
+        if not user:
+            raise HTTPException(404, "No current user")
+        with _JOBS_LOCK:
+            for job in _JOBS.values():
+                if job.status == "running" and job.user == user["nick"]:
+                    return job.as_dict()
+        raise HTTPException(404, "No active job")
+
     @app.get("/api/jobs/{job_id}")
     def api_job_status(job_id: str, request: Request):
         job = _get_job(job_id)
