@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -19,7 +20,7 @@ from fastapi.testclient import TestClient
 
 import chess
 
-from app.api import create_api, _plan_llm_input, _task_done_key, _today
+from app.api import create_api, _plan_llm_input, _task_done_key, _today, _JOBS
 from app.db import Database
 from app.fide import FidePlayer, FideRatings
 from app.games import Game
@@ -342,8 +343,21 @@ class CoachApiTests(ApiTestBase):
 
     def setUp(self) -> None:
         super().setUp()
+        _JOBS.clear()
         self._seed_user("tester", "t")
         self._set_current("tester")
+
+    def tearDown(self) -> None:
+        deadline = time.time() + 30.0
+        while time.time() < deadline:
+            running = [
+                j for j in _JOBS.values()
+                if j.user == "tester" and j.status == "running"
+            ]
+            if not running:
+                break
+            time.sleep(0.2)
+        _JOBS.clear()
 
     def _engine_patch(self, path: str):
         """Патчит settings.stockfish_path (pre-flight движка в coach/run)."""
@@ -1765,7 +1779,7 @@ class PlanLlmTests(ApiTestBase):
     )
 
     def _add_user(self) -> None:
-        self._register("tester")
+        self._register("plantester")
 
     def _wait_job(self, job_id: str, timeout: float = 15.0) -> dict:
         deadline = time.time() + timeout
@@ -1786,12 +1800,25 @@ class PlanLlmTests(ApiTestBase):
 
     def setUp(self) -> None:
         super().setUp()
+        _JOBS.clear()
         # Герметичность: live-рейтинг Lichess по умолчанию выключен
         # (fallback на БД), иначе тесты ходили бы в реальную сеть.
         # Live-тесты ниже переопределяют мок своим patch.
         _live = patch("app.api.fetch_lichess_rating", return_value=None)
         _live.start()
         self.addCleanup(_live.stop)
+
+    def tearDown(self) -> None:
+        deadline = time.time() + 30.0
+        while time.time() < deadline:
+            running = [
+                j for j in _JOBS.values()
+                if j.user == "plantester" and j.status == "running"
+            ]
+            if not running:
+                break
+            time.sleep(0.2)
+        _JOBS.clear()
 
     def test_live_rating_beats_db(self):
         """Live 1900 побеждает DB 2100: entry берёт rating/speed из live."""
@@ -1803,13 +1830,13 @@ class PlanLlmTests(ApiTestBase):
                     "lv1", ["e4"], created_at=100,
                     user_rating=2100, speed="rapid",
                 )],
-                "tester",
+                "plantester",
             )
         live = {"rating": 1900, "speed": "blitz"}
         with patch("app.api.fetch_lichess_rating", return_value=live):
             with Database(self.db_path) as db:
                 db.init_db()
-                entry = _plan_llm_input(db, "tester", self.data_dir)
+                entry = _plan_llm_input(db, "plantester", self.data_dir)
             self.assertEqual(entry["rating"], 1900)
             self.assertEqual(entry["speed"], "blitz")
             prompts = self._dry_run_prompts()
@@ -1828,12 +1855,12 @@ class PlanLlmTests(ApiTestBase):
                     "lv2", ["e4"], created_at=100,
                     user_rating=2100, speed="rapid",
                 )],
-                "tester",
+                "plantester",
             )
         with patch("app.api.fetch_lichess_rating", return_value=None):
             with Database(self.db_path) as db:
                 db.init_db()
-                entry = _plan_llm_input(db, "tester", self.data_dir)
+                entry = _plan_llm_input(db, "plantester", self.data_dir)
         self.assertEqual(entry["rating"], 2100)
         self.assertEqual(entry["speed"], "rapid")
 
@@ -1843,7 +1870,7 @@ class PlanLlmTests(ApiTestBase):
         with patch("app.api.fetch_lichess_rating", return_value=None):
             with Database(self.db_path) as db:
                 db.init_db()
-                entry = _plan_llm_input(db, "tester", self.data_dir)
+                entry = _plan_llm_input(db, "plantester", self.data_dir)
             self.assertIsNone(entry["rating"])
             prompts = self._dry_run_prompts()
         user = self._prompt_by_role(prompts, "user")
@@ -1860,7 +1887,7 @@ class PlanLlmTests(ApiTestBase):
                     "lv3", ["e4"], created_at=100,
                     user_rating=2100, speed="rapid",
                 )],
-                "tester",
+                "plantester",
             )
         garbage_cases = (
             None,
@@ -1875,7 +1902,7 @@ class PlanLlmTests(ApiTestBase):
                 with patch("app.api.fetch_lichess_rating", return_value=garbage):
                     with Database(self.db_path) as db:
                         db.init_db()
-                        entry = _plan_llm_input(db, "tester", self.data_dir)
+                        entry = _plan_llm_input(db, "plantester", self.data_dir)
                 self.assertEqual(entry["rating"], 2100)
                 self.assertEqual(entry["speed"], "rapid")
 
@@ -2080,11 +2107,11 @@ class PlanLlmTests(ApiTestBase):
                         user_rating=2100, speed="rapid",
                     ),
                 ],
-                "tester",
+                "plantester",
             )
         with Database(self.db_path) as db:
             db.init_db()
-            entry = _plan_llm_input(db, "tester", self.data_dir)
+            entry = _plan_llm_input(db, "plantester", self.data_dir)
         self.assertEqual(entry["rating"], 2100)
         self.assertEqual(entry["speed"], "rapid")
         prompts = self._dry_run_prompts()
@@ -2106,7 +2133,7 @@ class PlanLlmTests(ApiTestBase):
                     "rt1", ["e4"], created_at=100,
                     user_rating=2100, speed="rapid",
                 )],
-                "tester",
+                "plantester",
             )
         with patch.dict(os.environ, {"LLM_API_KEY": "test-key"}), \
                 patch("app.api.LLMClient",
@@ -2126,7 +2153,7 @@ class PlanLlmTests(ApiTestBase):
                         "rt2", ["e4"], created_at=200,
                         user_rating=1900, speed="rapid",
                     )],
-                    "tester",
+                    "plantester",
                 )
             third = self.client.post("/api/plan/generate", data={})
             self.assertEqual(third.status_code, 200)
@@ -2140,7 +2167,7 @@ class PlanLlmTests(ApiTestBase):
         self._add_user()
         with Database(self.db_path) as db:
             db.init_db()
-            entry = _plan_llm_input(db, "tester", self.data_dir)
+            entry = _plan_llm_input(db, "plantester", self.data_dir)
         self.assertIsNone(entry["rating"])
         prompts = self._dry_run_prompts()
         user = self._prompt_by_role(prompts, "user")
@@ -2156,10 +2183,10 @@ class PlanLlmTests(ApiTestBase):
                 [mkgame_moves(
                     "rz1", ["e4"], created_at=100, user_rating=0,
                 )],
-                "tester",
+                "plantester",
             )
             db.init_db()
-            entry = _plan_llm_input(db, "tester", self.data_dir)
+            entry = _plan_llm_input(db, "plantester", self.data_dir)
         self.assertIsNone(entry["rating"])
         prompts = self._dry_run_prompts()
         user = self._prompt_by_role(prompts, "user")
@@ -2182,7 +2209,7 @@ class PlanLlmTests(ApiTestBase):
                     f"rl{rating}", ["e4"], created_at=100,
                     user_rating=rating, speed="rapid",
                 )],
-                "tester",
+                "plantester",
             )
 
     def test_generate_basic_topics_rejected_for_advanced(self):
@@ -2523,7 +2550,7 @@ class GameLinkTests(ApiTestBase):
                         created_at=200,
                     ),
                 ],
-                "tester",
+                "plantester",
             )
             db.save_analysis(
                 "lnk1",
@@ -2572,17 +2599,17 @@ class GameLinkTests(ApiTestBase):
                 },
                 depth=8,
             )
-            db.set_current_user("tester")
+            db.set_current_user("plantester")
 
     def test_db_roundtrip(self):
         self._seed_two()
         with Database(self.db_path) as db:
-            games = {g.id: g for g in db.get_games("tester")}
+            games = {g.id: g for g in db.get_games("plantester")}
         self.assertEqual(games["lnk1"].link, "https://lichess.org/abcd1234")
         self.assertIsNone(games["lnk2"].link)
         with Database(self.db_path) as db:
             self.assertEqual(
-                db.get_game("lnk1", "tester").link, "https://lichess.org/abcd1234"
+                db.get_game("lnk1", "plantester").link, "https://lichess.org/abcd1234"
             )
 
     def test_api_summary_has_link(self):
@@ -2633,14 +2660,95 @@ class GameLinkTests(ApiTestBase):
                         "qwer1234", ["e4"], link="https://example.com/x"
                     ),
                 ],
-                "tester",
+                "plantester",
             )
             db.init_db()  # повторный прогон: backfill старых строк
-            games = {g.id: g for g in db.get_games("tester")}
+            games = {g.id: g for g in db.get_games("plantester")}
         self.assertEqual(games["abcd1234"].link, "https://lichess.org/abcd1234")
         self.assertIsNone(games["abcdefg"].link)
         self.assertIsNone(games["my-game!!"].link)
         self.assertEqual(games["qwer1234"].link, "https://example.com/x")
+
+
+class JobLimitTests(ApiTestBase):
+    """Лимиты фоновых задач: 1 на юзера, 3 глобально (503 с дружелюбным текстом)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        _JOBS.clear()
+
+    def tearDown(self) -> None:
+        _JOBS.clear()
+
+    def _login(self, nick: str = "limiter") -> None:
+        self.client.post(
+            "/api/auth/register",
+            data={"login": nick, "password": "pass1234", "lichess": nick},
+        )
+
+    def _insert_running_job(self, nick: str, job_id: str) -> None:
+        from app.api import CoachJob
+
+        job = CoachJob(id=job_id, user=nick, phase="Тест")
+        job.status = "running"
+        _JOBS[job_id] = job
+
+    def test_per_user_limit(self):
+        self._login()
+        self._insert_running_job("limiter", "job-running-1")
+        try:
+            resp = self.client.post(
+                "/api/coach/run",
+                data={"max": "10", "perf": "rapid", "depth": "5",
+                      "multipv": "1", "cached_only": "on"},
+            )
+            self.assertEqual(resp.status_code, 503)
+            self.assertIn("уже выполняется", resp.json()["detail"])
+        finally:
+            _JOBS.clear()
+
+    def test_global_limit(self):
+        self._login()
+        for i in range(3):
+            self._insert_running_job(f"other{i}", f"job-global-{i}")
+        try:
+            resp = self.client.post(
+                "/api/coach/run",
+                data={"max": "10", "perf": "rapid", "depth": "5",
+                      "multipv": "1", "cached_only": "on"},
+            )
+            self.assertEqual(resp.status_code, 503)
+            self.assertIn("других игроков", resp.json()["detail"])
+        finally:
+            _JOBS.clear()
+
+    def test_light_jobs_not_limited(self):
+        """Лёгкие задачи (fide) не упираются в лимит."""
+        self._login()
+        for i in range(3):
+            self._insert_running_job(f"other{i}", f"job-global-{i}")
+        try:
+            fide = self.client.post(
+                "/api/fide/run", data={"id": "12345", "windows": "4"}
+            )
+            self.assertEqual(fide.status_code, 200)
+            self.assertIn("job_id", fide.json())
+        finally:
+            _JOBS.clear()
+
+    def test_limit_released_after_done(self):
+        self._login()
+        self._insert_running_job("limiter", "job-running-1")
+        _JOBS["job-running-1"].status = "done"
+        try:
+            resp = self.client.post(
+                "/api/coach/run",
+                data={"max": "10", "perf": "rapid", "depth": "5",
+                      "multipv": "1", "cached_only": "on"},
+            )
+            self.assertEqual(resp.status_code, 200)
+        finally:
+            _JOBS.clear()
 
 
 if __name__ == "__main__":

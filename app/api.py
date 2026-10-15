@@ -96,6 +96,34 @@ def _get_job(job_id: str) -> CoachJob | None:
     with _JOBS_LOCK:
         return _JOBS.get(job_id)
 
+
+JOBS_GLOBAL_LIMIT = 3
+JOBS_PER_USER_LIMIT = 1
+
+
+def _running_jobs_count() -> int:
+    with _JOBS_LOCK:
+        return sum(1 for j in _JOBS.values() if j.status == "running")
+
+
+def _user_running_jobs_count(nick: str) -> int:
+    with _JOBS_LOCK:
+        return sum(
+            1 for j in _JOBS.values() if j.status == "running" and j.user == nick
+        )
+
+
+def _check_job_limits(nick: str) -> None:
+    if _user_running_jobs_count(nick) >= JOBS_PER_USER_LIMIT:
+        raise HTTPException(
+            503, "У тебя уже выполняется задача — дождись завершения"
+        )
+    if _running_jobs_count() >= JOBS_GLOBAL_LIMIT:
+        raise HTTPException(
+            503,
+            "Сейчас анализируются задачи других игроков — попробуй через минуту",
+        )
+
 # --- background job --------------------------------------------------------
 
 def _run_coach_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None:
@@ -1945,6 +1973,7 @@ def create_api(
                     "weeks_left": saved.get("weeks_left"),
                 },
             }
+        _check_job_limits(user["nick"])
         job = CoachJob(
             id=uuid.uuid4().hex,
             user=user["nick"],
@@ -1986,8 +2015,9 @@ def create_api(
             raise HTTPException(
                 503,
                 f"Stockfish не найден по пути {settings.stockfish_path!r}. "
-                "Задай STOCKFISH_PATH (например, в .env или переменной окружения).",
+                "Задай STOCKFISH_PATH (например, в .env или переменной окружении).",
             )
+        _check_job_limits(user["nick"])
 
         job = CoachJob(id=uuid.uuid4().hex, user=user["nick"])
         _register_job(job)
@@ -2160,6 +2190,7 @@ def create_api(
             raise HTTPException(400, "Укажи ник соперника")
         if not 1 <= max <= 200:
             raise HTTPException(400, "max должен быть от 1 до 200")
+        _check_job_limits(user["nick"])
         job = CoachJob(
             id=uuid.uuid4().hex,
             user=user["nick"],
@@ -2281,6 +2312,7 @@ def create_api(
                 _select_analyzed_pairs(db, user["nick"], gid, max if gid else 1)
         except RuntimeError as exc:
             raise HTTPException(404, str(exc)) from exc
+        _check_job_limits(user["nick"])
 
         job = CoachJob(
             id=uuid.uuid4().hex,
@@ -2320,6 +2352,7 @@ def create_api(
                 _select_analyzed_pairs(db, user["nick"], gid, 1 if gid else None)
         except RuntimeError as exc:
             raise HTTPException(404, str(exc)) from exc
+        _check_job_limits(user["nick"])
 
         job = CoachJob(
             id=uuid.uuid4().hex,
@@ -2390,6 +2423,7 @@ def create_api(
         cached = payload.get("explanation")
         if cached and not _is_bad_explanation(cached):
             return {"cached": True, "explanation": cached}
+        _check_job_limits(user["nick"])
         job = CoachJob(
             id=uuid.uuid4().hex,
             user=user["nick"],
