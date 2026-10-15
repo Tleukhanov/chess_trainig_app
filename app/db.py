@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS {table}(
     player TEXT NOT NULL,
     rated INTEGER,
     speed TEXT,
-    created_at INTEGER,
+    created_at BIGINT,
     status TEXT,
     winner TEXT,
     white TEXT,
@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS {table}(
     link TEXT,
     moves_json TEXT,
     clocks_json TEXT,
-    fetched_at INTEGER,
+    fetched_at BIGINT,
     PRIMARY KEY(id, player)
 )
 """
@@ -63,7 +63,7 @@ CREATE TABLE IF NOT EXISTS {table}(
     engine TEXT,
     depth INTEGER,
     analysis_json TEXT,
-    analyzed_at INTEGER
+    analyzed_at BIGINT
 )
 """
 
@@ -72,8 +72,8 @@ CREATE TABLE IF NOT EXISTS {table}(
     nick_lower TEXT PRIMARY KEY,
     nick TEXT NOT NULL,
     fide_id TEXT,
-    bound_at INTEGER,
-    last_seen_at INTEGER
+    bound_at BIGINT,
+    last_seen_at BIGINT
 )
 """
 
@@ -93,7 +93,7 @@ CREATE TABLE IF NOT EXISTS {table}(
     game_id TEXT,
     ply INTEGER,
     explanation TEXT,
-    created_at INTEGER
+    created_at BIGINT
 )
 """
 
@@ -115,6 +115,37 @@ _ANALYSIS_COLUMNS = "game_id, engine, depth, analysis_json, analyzed_at"
 
 _CURRENT_USER_KEY = "current_user"
 
+# Метки времени в миллисекундах (~1.7e12) не влезают в PG INTEGER (int4,
+# максимум ~2.1e9) — отсюда был "integer out of range". BIGINT в обеих СУБД
+# (в SQLite типизация динамическая, смена типа ничего не ломает).
+_BIGINT_COLUMNS = (
+    ("games", "created_at"),
+    ("games", "fetched_at"),
+    ("analyses", "analyzed_at"),
+    ("users", "bound_at"),
+    ("users", "last_seen_at"),
+    ("users", "created_at"),
+    ("sessions", "created_at"),
+    ("sessions", "expires_at"),
+    ("task_explanations", "created_at"),
+)
+
+
+def _ensure_bigint(conn: Any) -> None:
+    """Переводит временные колонки уже созданных PG-таблиц на BIGINT.
+
+    Идемпотентно: проверяет тип через information_schema, правит только int4.
+    Свежие таблицы создаются сразу с BIGINT по DDL выше.
+    """
+    for table, column in _BIGINT_COLUMNS:
+        row = conn.execute(
+            "SELECT data_type FROM information_schema.columns "
+            "WHERE table_schema = 'public' AND table_name = ? AND column_name = ?",
+            (table, column),
+        ).fetchone()
+        if row and row["data_type"] == "integer":
+            conn.execute(f"ALTER TABLE {table} ALTER COLUMN {column} TYPE BIGINT")
+
 _SCHEMA = f"""
 {_GAMES_DDL.format(table="games")};
 {_ANALYSES_DDL.format(table="analyses")};
@@ -124,8 +155,8 @@ _SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS sessions(
     token TEXT PRIMARY KEY,
     nick TEXT,
-    created_at INTEGER,
-    expires_at INTEGER
+    created_at BIGINT,
+    expires_at BIGINT
 );
 CREATE INDEX IF NOT EXISTS idx_games_player ON games(player);
 CREATE INDEX IF NOT EXISTS idx_task_explanations_player ON task_explanations(player);
@@ -138,7 +169,7 @@ _USERS_AUTH_COLUMNS = (
     "lichess TEXT",
     "role TEXT DEFAULT 'user'",
     "is_active INTEGER DEFAULT 1",
-    "created_at INTEGER",
+    "created_at BIGINT",
 )
 
 
@@ -457,6 +488,7 @@ class Database:
         schema = _SCHEMA.replace("COLLATE NOCASE", "")
         with self._connection() as conn:
             conn.executescript(schema)
+            _ensure_bigint(conn)
             existing = {
                 row["column_name"]
                 for row in conn.execute(
