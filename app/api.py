@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import datetime
+import gc
 import hashlib
 import json
 import logging
@@ -175,6 +176,11 @@ def _run_coach_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None:
                         logger.warning("Анализ партии %s пропущен: %s", game.id, exc)
                         job.phase = f"Анализ движком (пропущено битых: {failed})"
                         continue
+                    finally:
+                        # Память на Eco не резиновая: после каждой партии
+                        # принудительно отдаём Python-кучу и проверяем, что
+                        # движок точно убит (зомби-процессы копят hash).
+                        gc.collect()
                     job.done = i
                     job.current = game.id
                 if failed:
