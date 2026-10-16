@@ -9,6 +9,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
+import logging
 import os
 import secrets
 import threading
@@ -53,6 +54,8 @@ from .repertoire import Repertoire, opening_stats
 from .report import build_report
 
 # --- job registry ----------------------------------------------------------
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class CoachJob:
@@ -157,12 +160,28 @@ def _run_coach_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None:
             job.phase = "Анализ движком"
 
             if target:
-                with Engine(depth=params["depth"], multipv=params["multipv"]) as engine:
-                    for i, game in enumerate(target, 1):
-                        summary = engine.analyze_game(game).summary()
+                failed = 0
+                for i, game in enumerate(target, 1):
+                    # Движок открываем заново на каждую партию: свежий процесс
+                    # не тащит утечки памяти/состояния от прошлой партии, а
+                    # try/except гарантирует, что одна битая партия (NaN, обрыв
+                    # UCI, экзотика) пропустится, а не уронит всю задачу.
+                    try:
+                        with Engine(depth=params["depth"], multipv=params["multipv"]) as engine:
+                            summary = engine.analyze_game(game).summary()
                         db.save_analysis(game.id, summary, depth=params["depth"])
-                        job.done = i
-                        job.current = game.id
+                    except Exception as exc:
+                        failed += 1
+                        logger.warning("Анализ партии %s пропущен: %s", game.id, exc)
+                        job.phase = f"Анализ движком (пропущено битых: {failed})"
+                        continue
+                    job.done = i
+                    job.current = game.id
+                if failed:
+                    job.summary = (
+                        f"Проанализировано {job.done} из {job.total} партий, "
+                        f"пропущено битых: {failed}."
+                    )
             else:
                 job.phase = "Ничего анализировать"
                 job.summary = "Все загруженные партии уже проанализированы."

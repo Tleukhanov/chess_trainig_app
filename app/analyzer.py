@@ -205,6 +205,23 @@ def _san_key(san: str) -> str:
     return san.rstrip("+#")
 
 
+def _finite(value: Any, default: float = 0.0) -> float:
+    """Страховка от NaN/inf: JSON и сравнения их не переживают одинаково везде."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if number != number or number in (float("inf"), float("-inf")):
+        return default
+    return number
+
+
+# Потолок длины анализа: эндшпильные качания дальше 60-го хода почти неинформативны,
+# а каждая позиция — это время и память. На слабом хостинге (512 МБ) длинные
+# партии без этого лимита роняют процесс.
+MAX_ANALYZE_PLIES = 120
+
+
 class Engine:
     """Обёртка над Stockfish: контекстный менеджер для анализа позиций и партий."""
 
@@ -332,10 +349,11 @@ class Engine:
         (avg_win_loss, blunders и т.п.) — только по ходам пользователя.
         """
         user_is_white = game.user_color == "white"
-        entries = self._analyze_sequence(game.moves)
+        moves = game.moves[:MAX_ANALYZE_PLIES]
+        entries = self._analyze_sequence(moves)
         analyses: list[MoveAnalysis] = []
 
-        for ply, san in enumerate(game.moves):
+        for ply, san in enumerate(moves):
             if ply + 1 >= len(entries):
                 break  # движок не смог проанализировать остаток партии
             mover_is_white = ply % 2 == 0
@@ -343,10 +361,10 @@ class Engine:
 
             before_side, best_move_san, full_pv = entries[ply]
             after_next_side, _, _ = entries[ply + 1]
-            win_before = _side_win(before_side)
+            win_before = _finite(_side_win(before_side))
             # win_after для стороны, СДЕЛАВШЕЙ ход: обратная величина к win% стороны,
             # которой теперь ходить.
-            win_after = 100.0 - _side_win(after_next_side)
+            win_after = _finite(100.0 - _finite(_side_win(after_next_side)))
 
             drop = win_before - win_after
             is_best = best_move_san is not None and _san_key(best_move_san) == _san_key(san)
@@ -378,7 +396,7 @@ class Engine:
                     clock_used=clock_used,
                     time_pressure=time_pressure,
                     best_line=full_pv[1:7] if full_pv else [],
-                    played_line=game.moves[ply + 1 : ply + 1 + 5],
+                    played_line=moves[ply + 1 : ply + 1 + 5],
                 )
             )
 
