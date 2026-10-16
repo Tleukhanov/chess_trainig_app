@@ -563,10 +563,15 @@ async function viewPlan(app) {
         </div>
         <div id="plan-goal-slot" style="margin-top:8px"></div></div>`;
     } else {
-      goalHtml = `<div class="card"><div class="card-header"><span class="card-title">Твоя цель</span></div>
-        <p style="color:var(--c-text-muted);font-size:13px;margin-top:0">Скажи, к чему идём, — и неделя посчитается под твою цель.</p>
+      goalHtml = `<div class="card"><div class="card-header"><span class="card-title">Твоя цель</span><span class="badge badge-blue">шаг 1 из 2</span></div>
+        <p style="color:var(--c-text-muted);font-size:13px;margin-top:0">Скажи, к чему идём — и неделя посчитается под твою цель.</p>
         ${goalFormHtml('', 30, 'auto', 'fix_weak', '', '')}</div>`;
     }
+  } else {
+    // Цели ещё нет вообще: показываем опросник сразу, а не пустое место.
+    goalHtml = `<div class="card"><div class="card-header"><span class="card-title">Твоя цель</span><span class="badge badge-blue">шаг 1 из 2</span></div>
+      <p style="color:var(--c-text-muted);font-size:13px;margin-top:0">С чего начнём? Укажи цель, время в день и ближайший турнир — дальше тренер соберёт неделю под тебя.</p>
+      ${goalFormHtml('', 30, 'auto', 'fix_weak', '', '')}</div>`;
   }
 
   let llmHtml = '';
@@ -579,7 +584,7 @@ async function viewPlan(app) {
       ${state.planLlmError ? `<div class="alert alert-error" style="margin-top:8px">${esc(state.planLlmError)}</div>` : ''}
       <div style="margin-top:8px"><button class="btn btn-secondary" id="plan-llm-refresh" style="font-size:12px;padding:4px 10px">Обновить</button></div></div>`;
   } else {
-    llmHtml = `<div class="card"><div class="card-header"><span class="card-title">Индивидуальный план</span></div>
+    llmHtml = `<div class="card"><div class="card-header"><span class="card-title">Индивидуальный план</span><span class="badge badge-blue">шаг 2 из 2</span></div>
       <p style="color:var(--c-text-muted);font-size:13px;margin-top:0">Пройди опросник выше — и тренер соберёт неделю под твою цель, время и слабые места.</p>
       ${state.planLlmError ? `<div class="alert alert-error" style="margin-bottom:8px">${esc(state.planLlmError)}</div>` : ''}
       <button class="btn btn-primary" id="plan-llm-create" style="width:fit-content">Создать план на неделю (LLM)</button></div>`;
