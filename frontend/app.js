@@ -1556,6 +1556,13 @@ async function viewCoach(app) {
           </div>
           <div class="checkbox"><input type="checkbox" name="cached_only" id="cached_only"><label for="cached_only">Только из кеша (не ходить в сеть)</label></div>
           <div class="checkbox"><input type="checkbox" name="refresh" id="refresh"><label for="refresh">Переанализировать всё заново</label></div>
+          <div class="card" style="background:var(--c-bg-soft);font-size:13px;line-height:1.6">
+            <b>💡 Какую глубину выбрать?</b><br>
+            До 1500 — хватит глубины 8: ищи зевки и висячие фигуры.<br>
+            1500–2000 — ставь 10–12: уже видна тактика и слабые поля.<br>
+            2000+ — бери 12–14 и Multipv 2: сравнивай свою идею с первой линией.<br>
+            <span style="color:var(--c-text-muted)">Глубже 14 на облаке не уедет — для этого будет воркер на VPS.</span>
+          </div>
           <button type="submit" class="btn btn-primary" style="width:fit-content">Запустить</button>
         </form>
       </div>
@@ -1585,17 +1592,24 @@ async function viewCoach(app) {
   });
 
   // Если задача уже бежит (обновили страницу) — блокируем кнопку и цепляем polling.
-  try {
-    const active = await api('/api/jobs/active');
-    if (active && active.id) {
-      const btn = document.querySelector('#coach-form button[type="submit"]');
-      if (btn) {
-        btn.disabled = true;
-        btn.textContent = 'Идёт анализ…';
+  // Ретраим 3 раза: одиночный сетевой чих не должен разблокировать кнопку.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const active = await api('/api/jobs/active');
+      if (active && active.id) {
+        const btn = document.querySelector('#coach-form button[type="submit"]');
+        if (btn) {
+          btn.disabled = true;
+          btn.textContent = 'Идёт анализ…';
+        }
+        showJob(app, active.id);
       }
-      showJob(app, active.id);
+      break;
+    } catch {
+      if (attempt < 2) await new Promise(r => setTimeout(r, 1500));
+      /* после 3 неудач — кнопка свободна (сервер недоступен или задач нет) */
     }
-  } catch { /* нет активной задачи — кнопка свободна */ }
+  }
 
 }
 
@@ -1619,47 +1633,111 @@ function showJob(app, jobId) {
       <div class="job-progress"><div class="job-progress-bar" id="progress-bar" style="width:0%"></div></div>
       <div class="job-phase" id="job-phase">Загрузка...</div>
       <div class="job-detail" id="job-detail">0 / 0</div>
+      <div id="job-eta" style="color:var(--c-text-muted);font-size:13px"></div>
+      <div id="job-quote" style="margin-top:10px;font-style:italic;color:var(--c-text-muted);font-size:13px;line-height:1.6"></div>
       <div id="job-error"></div>
       <div id="job-summary"></div>
     </div>`;
 
+  // Цитаты, пока движок считает — чтобы не было скучно.
+  const QUOTES = [
+    ["Когда видишь хороший ход, ищи ход получше.", "Эмануил Ласкер"],
+    ["Шахматы — это борьба, главным образом со своими ошибками.", "Сергей Прокофьев"],
+    ["Лучший ход — тот, который ставит соперника в тупик.", "Михаил Таль"],
+    ["Я не верю в психологию. Я верю в сильные ходы.", "Бобби Фишер"],
+    ["Тактика — это знание того, что делать, когда есть что делать.", "Савелий Тартаковер"],
+    ["Слабые поля — это дыры в позиции. Занимай их конями.", "Арон Нимцович"],
+    ["Проигранных партий нет — есть недоигранные.", "Михаил Ботвинник"],
+    ["Конь на краю доски — позор.", "Зигберт Тарраш"],
+    ["Пешка — душа шахмат.", "Франсуа Филидор"],
+    ["Атака — лучшая защита, если она корректна.", "Гарри Каспаров"],
+    ["Сначала стратегия, потом тактика: без плана ходы слепы.", "Макс Эйве"],
+    ["Время на часах — тоже материал. Не отдавай его даром.", "Народное"],
+  ];
+  let quoteIdx = Math.floor(Math.random() * QUOTES.length);
+  const paintQuote = () => {
+    const box = document.getElementById('job-quote');
+    if (!box) return;
+    const [text, author] = QUOTES[quoteIdx % QUOTES.length];
+    box.innerHTML = `♟ «${esc(text)}» — <b>${esc(author)}</b>`;
+    quoteIdx++;
+  };
+  paintQuote();
+  const quoteTimer = setInterval(paintQuote, 8000);
+
+  const startedAt = Date.now();
+  const stopQuote = () => clearInterval(quoteTimer);
+
   if (state.timers.coach) clearInterval(state.timers.coach);
+  let pollFails = 0;
   state.timers.coach = setInterval(async () => {
     try {
       const j = await api('/api/jobs/' + jobId);
+      pollFails = 0;
       const bar = document.getElementById('progress-bar');
       const phase = document.getElementById('job-phase');
       const detail = document.getElementById('job-detail');
       const status = document.getElementById('job-status');
-      if (!bar || !phase || !detail || !status) { clearInterval(state.timers.coach); state.timers.coach = null; return; }
+      if (!bar || !phase || !detail || !status) { clearInterval(state.timers.coach); state.timers.coach = null; stopQuote(); return; }
       bar.style.width = j.total ? (j.done * 100 / j.total) + '%' : '0%';
       phase.textContent = j.phase;
       detail.textContent = j.done + ' / ' + j.total + (j.current ? ' (' + j.current.slice(0, 8) + ')' : '');
       status.textContent = j.status.toUpperCase();
+      // ETA по текущему темпу: прошло / сделано * осталось.
+      const etaBox = document.getElementById('job-eta');
+      if (etaBox) {
+        if (j.done > 0 && j.total > j.done && j.status === 'running') {
+          const elapsed = (Date.now() - startedAt) / 1000;
+          const remain = Math.round(elapsed / j.done * (j.total - j.done));
+          const mm = Math.floor(remain / 60), ss = remain % 60;
+          etaBox.textContent = `⏳ Прошло ${Math.floor(elapsed / 60)}:${String(Math.floor(elapsed % 60)).padStart(2, '0')} · осталось примерно ${mm}:${String(ss).padStart(2, '0')}`;
+        } else if (j.total > 0 && j.done === 0) {
+          etaBox.textContent = `⏳ Греем движок, первая партия почти готова…`;
+        } else {
+          etaBox.textContent = '';
+        }
+      }
       if (j.error) {
         document.getElementById('job-error').innerHTML = `<div class="job-error">${esc(j.error)}</div>`;
       }
       if (j.status === 'done') {
         clearInterval(state.timers.coach);
         state.timers.coach = null;
+        stopQuote();
         unlockCoachButton();
         document.getElementById('job-summary').innerHTML = `<div class="alert alert-success" style="margin-top:12px">${esc(j.summary)}</div>`;
         if (state.currentView === 'coach') setTimeout(() => navigate('coach'), 1500);
       } else if (j.status === 'error') {
         clearInterval(state.timers.coach);
         state.timers.coach = null;
+        stopQuote();
         unlockCoachButton();
       }
     } catch (pollErr) {
-      clearInterval(state.timers.coach);
-      state.timers.coach = null;
-      unlockCoachButton();
       const msg = String((pollErr && pollErr.message) || '');
       if (/404/.test(msg)) {
+        // Задача мертва (рестарт сервера): честный LOST + разблок.
+        clearInterval(state.timers.coach);
+        state.timers.coach = null;
+        stopQuote();
+        unlockCoachButton();
         const errBox = document.getElementById('job-error');
         if (errBox) errBox.innerHTML = `<div class="job-error">Задача потеряна (сервер перезапустился). Можно запускать заново.</div>`;
         const st = document.getElementById('job-status');
         if (st) st.textContent = 'LOST';
+        return;
+      }
+      // Сетевой чих (обрыв polling-запроса): НЕ разблокируем, ждём следующий тик.
+      pollFails += 1;
+      const phase = document.getElementById('job-phase');
+      if (phase) phase.textContent = `Переподключение… (${pollFails})`;
+      if (pollFails >= 10) {
+        clearInterval(state.timers.coach);
+        state.timers.coach = null;
+        stopQuote();
+        unlockCoachButton();
+        const errBox = document.getElementById('job-error');
+        if (errBox) errBox.innerHTML = `<div class="job-error">Сервер не отвечает (10 попыток). Проверьте соединение и обновите страницу.</div>`;
       }
     }
   }, 1000);
