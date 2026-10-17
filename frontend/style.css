@@ -458,3 +458,17 @@ td.center { text-align: center; }
   .topbar-right { order: 4; width: 100%; justify-content: center; }
   .grid-2, .grid-3, .grid-4, .game-layout { grid-template-columns: 1fr; }
 }
+
+@media (max-width: 720px) {
+  .onboarding { max-width: 100%; padding: 0 8px; }
+  .onboarding .card, .onboarding form { padding: 16px 12px; }
+  .onboarding .form-group input[type="text"],
+  .onboarding .form-group input[type="password"],
+  .onboarding .form-group input[type="number"] { max-width: 100% !important; width: 100%; }
+  .onboarding .form-row { flex-direction: column; gap: 8px; }
+  .onboarding .games-filter { width: 100%; }
+  .onboarding .games-filter .btn { flex: 1; padding: 10px 8px; font-size: 14px; }
+  .onboarding .btn-primary, .onboarding .btn-secondary { width: 100%; padding: 12px; font-size: 15px; }
+  .onboarding .btn { min-width: 0; }
+  .onboarding p { font-size: 14px; }
+}
