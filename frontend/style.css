@@ -471,4 +471,13 @@ td.center { text-align: center; }
   .onboarding .btn-primary, .onboarding .btn-secondary { width: 100%; padding: 12px; font-size: 15px; }
   .onboarding .btn { min-width: 0; }
   .onboarding p { font-size: 14px; }
+
+  .card[style*="max-width:420px"] { max-width: 100% !important; margin: 16px auto !important; padding: 16px 12px; }
+  .card[style*="max-width:420px"] .form-group input[type="text"],
+  .card[style*="max-width:420px"] .form-group input[type="password"],
+  .card[style*="max-width:420px"] .form-group input[type="number"] { max-width: 100% !important; width: 100%; }
+  .card[style*="max-width:420px"] .games-filter { width: 100%; }
+  .card[style*="max-width:420px"] .games-filter .btn { flex: 1; padding: 10px 8px; font-size: 14px; }
+  .card[style*="max-width:420px"] .btn-primary, .card[style*="max-width:420px"] .btn-secondary { width: 100%; padding: 12px; font-size: 15px; }
+  .card[style*="max-width:420px"] .btn { min-width: 0; }
 }
