@@ -14,6 +14,8 @@ import chess
 from app.openings import (
     DEFAULT_LAM,
     MAX_LAM,
+    MAX_STYLE_DELTA,
+    MIN_RATIO,
     STYLES,
     STYLE_LABELS_RU,
     OpeningGame,
@@ -34,6 +36,8 @@ from app.openings import (
 _CHECK_SAC_FEN = "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/8/PPPP1PPP/RNBQK1NR w KQkq - 3 3"
 # Позиция с доступным равным разменом Nxe5 и жертвой Bxf7+.
 _TRADE_SAC_FEN = "4k3/3p1ppp/8/4n3/2B5/5N2/PPPP1PPP/4K3 w - - 0 1"
+# Нимпович после 1.e4 Nc6 2.d4 (ход чёрных): Maia переоценивает откат Nb8.
+_NIMZO_FEN = "r1bqkbnr/pppppppp/2n5/8/3PP3/8/PPP2PPP/RNBQKBNR b KQkq - 0 2"
 
 
 class FakePolicy:
@@ -170,6 +174,80 @@ class PickMoveTests(unittest.TestCase):
         )
         self.assertEqual(san, "Bxf7+")
         self.assertIn("корол", reason)
+
+
+class PlausibilityTests(unittest.TestCase):
+    """Соперник не должен выбирать неправдоподобные ходы Maia (реальный баг)."""
+
+    def test_tail_move_is_dropped_by_default_ratio(self) -> None:
+        board = chess.Board()
+        candidates = [("e4", 0.95), ("d4", 0.03), ("Nf3", 0.02)]
+        ranked = rerank(board, candidates, "universal")
+        self.assertEqual([s for s, _ in ranked], ["e4"])
+
+    def test_implausible_styled_move_not_picked(self) -> None:
+        # Шах-жертва Bxf7+ стилево привлекательна, но Maia её почти не даёт.
+        board = chess.Board(_CHECK_SAC_FEN)
+        candidates = [("Nf3", 0.97), ("Bxf7+", 0.02), ("Qh5", 0.01)]
+        for seed in range(25):
+            san, _ = pick_move(
+                board, candidates, "aggressive", rng=random.Random(seed)
+            )
+            self.assertNotEqual(san, "Bxf7+")
+
+    def test_low_probability_retreat_not_selected(self) -> None:
+        board = chess.Board(_NIMZO_FEN)
+        candidates = [("d5", 0.9), ("Nf6", 0.08), ("Nb8", 0.02)]
+        for seed in range(25):
+            san, _ = pick_move(
+                board, candidates, "positional", rng=random.Random(seed)
+            )
+            self.assertNotEqual(san, "Nb8")
+
+    def test_high_probability_retreat_still_avoided(self) -> None:
+        # Прямой аналог репорта: Maia ставит откат ...Nb8 на первое место (p=0.9),
+        # но тренер обязан сыграть развивающий ход.
+        board = chess.Board(_NIMZO_FEN)
+        candidates = [("Nb8", 0.90), ("d5", 0.05), ("Nf6", 0.03), ("e6", 0.02)]
+        chosen = {
+            pick_move(board, candidates, "positional", rng=random.Random(seed))[0]
+            for seed in range(60)
+        }
+        self.assertNotIn("Nb8", chosen)
+        self.assertTrue(chosen & {"d5", "Nf6", "e6"})
+        self.assertTrue(chosen <= {"d5", "Nf6", "e6"})
+
+    def test_development_guard_keeps_only_candidate(self) -> None:
+        # Откат нельзя выбросить, если это единственный кандидат (напр. фолбэк).
+        board = chess.Board(_NIMZO_FEN)
+        ranked = rerank(board, [("Nb8", 1.0)], "universal")
+        self.assertEqual([s for s, _ in ranked], ["Nb8"])
+
+    def test_style_still_shifts_among_plausible_moves(self) -> None:
+        board = chess.Board(_NIMZO_FEN)
+        candidates = [("d5", 0.5), ("Nf6", 0.3), ("e6", 0.2)]
+        self.assertEqual(rerank(board, candidates, "positional", lam=0.0)[0][0], "d5")
+        # Позиционный стиль предпочитает развитие Nf6, но выбор остаётся в Maia-наборе.
+        ranked = rerank(board, candidates, "positional")
+        self.assertEqual(ranked[0][0], "Nf6")
+        self.assertEqual({s for s, _ in ranked}, {"d5", "Nf6", "e6"})
+
+    def test_style_delta_clamped(self) -> None:
+        board = chess.Board(_NIMZO_FEN)
+        candidates = [("d5", 0.5), ("Nf6", 0.3), ("e6", 0.2)]
+        tight = rerank(
+            board, candidates, "positional", lam=MAX_LAM, max_style_delta=0.0
+        )
+        self.assertEqual([s for s, _ in tight], ["d5", "Nf6", "e6"])
+        loose = rerank(
+            board, candidates, "positional", lam=MAX_LAM, max_style_delta=99.0
+        )
+        self.assertAlmostEqual(sum(p for _, p in loose), 1.0, places=9)
+
+    def test_constants_are_sane(self) -> None:
+        self.assertGreater(MIN_RATIO, 0.0)
+        self.assertLess(MIN_RATIO, 1.0)
+        self.assertGreater(MAX_STYLE_DELTA, 0.0)
 
 
 class SessionTests(unittest.TestCase):

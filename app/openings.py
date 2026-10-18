@@ -34,6 +34,8 @@ __all__ = [
     "DEFAULT_LAM",
     "MIN_LAM",
     "MAX_LAM",
+    "MIN_RATIO",
+    "MAX_STYLE_DELTA",
     "PIECE_VALUES",
     "king_zone",
     "is_hanging",
@@ -145,6 +147,15 @@ DEFAULT_LAM: float = 0.4
 MIN_LAM: float = 0.0
 MAX_LAM: float = 1.5
 
+#: Минимальная доля от лучшей вероятности Maia, ниже которой ход считается
+#: «хвостом» и отбрасывается до стилевого ре-ранка. ``0.05`` = 5% от лучшего.
+MIN_RATIO: float = 0.05
+
+#: Максимальный по модулю вклад стиля в логарифмический вес хода. Ограничивает
+#: ``lam * style_score``: при ``lam`` по умолчанию стиль почти всегда укладывается
+#: в предел, но на больших ``lam`` он не может «воскресить» маловероятный ход.
+MAX_STYLE_DELTA: float = 3.0
+
 #: Ценность фигур для эвристик (король = 0: его нельзя «съесть»).
 PIECE_VALUES: dict[int, float] = {
     chess.PAWN: 1.0,
@@ -239,6 +250,38 @@ def _captured_value(board: chess.Board, move: chess.Move) -> float:
     return _value(board.piece_at(move.to_square))
 
 
+def _developed_count(board: chess.Board, color: chess.Color) -> int:
+    """Число развитых фигур ``color``: кони/слоны/ладьи/ферзь вне домашнего ранга."""
+    home_rank = 0 if color == chess.WHITE else 7
+    count = 0
+    for piece_type in _MINORS_MAJORS:
+        for sq in board.pieces(piece_type, color):
+            if chess.square_rank(sq) != home_rank:
+                count += 1
+    return count
+
+
+def _undevelops(board: chess.Board, move: chess.Move) -> bool:
+    """True, если ход отводит уже развитую фигуру назад (регресс развития).
+
+    Возврат фигуры на домашний ранг без взятия, шаха и превращения в дебюте
+    почти всегда бессмыслен (например, конь c6->b8), но Maia иногда переоценивает
+    такие ходы из-за смещения обучающей выборки. Используется как фильтр
+    правдоподобия в :func:`rerank`.
+    """
+    piece = board.piece_at(move.from_square)
+    if piece is None or piece.piece_type not in _MINORS_MAJORS:
+        return False
+    if board.is_capture(move) or move.promotion is not None:
+        return False
+    before = _developed_count(board, board.turn)
+    after = board.copy(stack=False)
+    after.push(move)
+    if after.is_check():
+        return False
+    return _developed_count(after, board.turn) < before
+
+
 def _features(board: chess.Board, move: chess.Move) -> dict[str, Any]:
     """Собирает дешёвые статические признаки хода (позиция ДО хода).
 
@@ -301,12 +344,7 @@ def _features(board: chess.Board, move: chess.Move) -> dict[str, Any]:
             center += 1
 
     # Активность: развитые кони/слоны/ладьи/ферзь (вне домашнего ранга).
-    home_rank = 0 if mover == chess.WHITE else 7
-    activity = 0
-    for piece_type in _MINORS_MAJORS:
-        for sq in after.pieces(piece_type, mover):
-            if chess.square_rank(sq) != home_rank:
-                activity += 1
+    activity = _developed_count(after, mover)
 
     # Форпост и пассивное расположение по конечному полю хода.
     to_sq = move.to_square
@@ -455,20 +493,77 @@ def _clamp_lam(lam: float) -> float:
     return max(MIN_LAM, min(MAX_LAM, value))
 
 
+def _clamp_style_delta(value: float, limit: float) -> float:
+    """Ограничивает стилевой вклад ``value`` диапазоном ``[-limit, +limit]``."""
+    try:
+        limit = abs(float(limit))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"max_style_delta должен быть числом, получено {limit!r}"
+        ) from exc
+    if math.isnan(limit):
+        raise ValueError("max_style_delta не может быть NaN")
+    return max(-limit, min(limit, value))
+
+
+def _plausible_candidates(
+    board: chess.Board,
+    parsed: list[tuple[str, chess.Move, float]],
+    *,
+    min_ratio: float,
+    max_candidates: int | None,
+) -> list[tuple[str, chess.Move, float]]:
+    """Отсеивает неправдоподобные ходы Maia до стилевого ре-ранка.
+
+    Два фильтра:
+
+    1. Ходы-откаты развития (:func:`_undevelops`) отбрасываются, если остаётся
+       хотя бы один нормальный ход (иначе набор сохраняется целиком).
+    2. Оставляются ходы с вероятностью не ниже ``min_ratio`` от лучшей; лучший
+       ход сохраняется всегда. При заданном ``max_candidates`` список обрезается
+       до стольких лучших ходов. Порядок — по убыванию вероятности Maia.
+    """
+    sound = [item for item in parsed if not _undevelops(board, item[1])]
+    kept = sound if sound else list(parsed)
+    if not kept:
+        return []
+    try:
+        ratio = min(1.0, max(0.0, float(min_ratio)))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"min_ratio должен быть числом, получено {min_ratio!r}") from exc
+    best = max(prob for _, _, prob in kept)
+    if best > 0.0:
+        threshold = ratio * best
+        kept = [item for item in kept if item[2] >= threshold]
+    kept.sort(key=lambda item: item[2], reverse=True)
+    if max_candidates is not None:
+        limit = int(max_candidates)
+        if limit > 0:
+            kept = kept[:limit]
+    return kept
+
+
 def rerank(
     board: chess.Board,
     candidates: list[tuple[str, float]],
     style: str,
     *,
     lam: float = DEFAULT_LAM,
+    min_ratio: float = MIN_RATIO,
+    max_style_delta: float = MAX_STYLE_DELTA,
+    max_candidates: int | None = None,
 ) -> list[tuple[str, float]]:
     """Переранжирует кандидатов Maia с учётом стиля и нормирует в распределение.
 
-    Комбинирует логиты ``score = log(prob) + lam * style_score(...)`` и берёт
-    softmax по ним. ``lam`` мал по умолчанию (см. :data:`DEFAULT_LAM`), так что
-    стиль лишь мягко смещает исходное распределение Maia. Возвращает список
-    ``(san, prob)`` по убыванию вероятности; сумма вероятностей ≈ 1.0.
-    Порядок сохраняет исходный при равных вероятностях (стабильная сортировка).
+    Сначала кандидаты сужаются до правдоподобных (:func:`_plausible_candidates`):
+    отбрасываются «откаты» развития и маловероятный «хвост» Maia, поэтому
+    маловероятный ход недостижим для выбора. Затем комбинирует логиты
+    ``score = log(prob) + clamp(lam * style_score(...), ±max_style_delta)`` и
+    берёт softmax. Стиль — лишь мягкий сдвиг: он может переупорядочить
+    правдоподобные ходы, но не поднять маловероятный.
+
+    Возвращает список ``(san, prob)`` по убыванию вероятности; сумма ≈ 1.0.
+    Порядок при равных вероятностях сохраняется (стабильная сортировка).
     """
     if style not in STYLES:
         raise ValueError(f"Неизвестный стиль: {style!r}. Доступны: {', '.join(STYLES)}")
@@ -476,13 +571,18 @@ def rerank(
     if not candidates:
         return []
 
+    parsed = [(san, board.parse_san(san), float(prob)) for san, prob in candidates]
+    parsed = _plausible_candidates(
+        board, parsed, min_ratio=min_ratio, max_candidates=max_candidates
+    )
+    if not parsed:
+        return []
+
     logits: list[tuple[str, float]] = []
-    for san, prob in candidates:
-        move = board.parse_san(san)
-        p = float(prob)
-        if p <= 0.0:
-            p = 1e-12
-        logits.append((san, math.log(p) + lam * style_score(board, move, style)))
+    for san, move, prob in parsed:
+        p = prob if prob > 0.0 else 1e-12
+        delta = _clamp_style_delta(lam * style_score(board, move, style), max_style_delta)
+        logits.append((san, math.log(p) + delta))
 
     top = max(value for _, value in logits)
     exps = [(san, math.exp(value - top)) for san, value in logits]
@@ -546,17 +646,29 @@ def pick_move(
     lam: float = DEFAULT_LAM,
     temperature: float = 1.0,
     rng: random.Random | None = None,
+    min_ratio: float = MIN_RATIO,
+    max_style_delta: float = MAX_STYLE_DELTA,
+    max_candidates: int | None = None,
 ) -> tuple[str, str]:
     """Выбирает один ход из ``candidates`` со стилевым ре-ранжированием.
 
     Возвращает ``(san, reason_ru)``. ``rng`` — :class:`random.Random` для
     детерминизма. ``temperature`` > 1 сглаживает распределение (больше
-    неожиданностей), < 1 делает выбор жёстче. Ход всегда легален и входит в
-    ``candidates``. Пустой список кандидатов -> ``ValueError``.
+    неожиданностей), < 1 делает выбор жёстче. ``min_ratio`` / ``max_style_delta``
+    / ``max_candidates`` передаются в :func:`rerank` (см. там). Ход всегда
+    легален и входит в ``candidates``. Пустой список кандидатов -> ``ValueError``.
     """
     if not candidates:
         raise ValueError("Нет кандидатов для выбора хода")
-    ranked = rerank(board, candidates, style, lam=lam)
+    ranked = rerank(
+        board,
+        candidates,
+        style,
+        lam=lam,
+        min_ratio=min_ratio,
+        max_style_delta=max_style_delta,
+        max_candidates=max_candidates,
+    )
     temp = temperature if temperature and temperature > 0 else 1.0
     if abs(temp - 1.0) < 1e-9:
         weighted = list(ranked)
@@ -658,8 +770,11 @@ def opponent_move(
     k: int = 8,
     temperature: float = 1.0,
     rng: random.Random | None = None,
+    min_ratio: float = MIN_RATIO,
+    max_style_delta: float = MAX_STYLE_DELTA,
+    max_candidates: int | None = None,
 ) -> tuple[str, str]:
-    """Ход соперника: ``policy.probs`` -> ре-ранк по стилю -> выбор.
+    """Ход соперника: ``policy.probs`` -> фильтр правдоподобия/стиль -> выбор.
 
     Возвращает ``(san, reason_ru)`` и дописывает ход в ``game.moves``.
     Политика — любой объект с методом ``probs(board, *, k=...)``. Бросает
@@ -676,6 +791,9 @@ def opponent_move(
         lam=lam,
         temperature=temperature,
         rng=rng,
+        min_ratio=min_ratio,
+        max_style_delta=max_style_delta,
+        max_candidates=max_candidates,
     )
     game.moves.append(san)
     return san, reason
