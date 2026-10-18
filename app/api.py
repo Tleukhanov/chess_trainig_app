@@ -59,6 +59,7 @@ from .openings import (
     classify_opening,
     is_finished,
     new_game,
+    opponent_color,
     opponent_move,
     result,
     user_move,
@@ -609,6 +610,12 @@ class OpeningAnalyzeBody(BaseModel):
     session_id: str = ""
 
 
+class OpeningReplyBody(BaseModel):
+    """Тело POST /api/opening/reply."""
+
+    session_id: str = ""
+
+
 def _opening_policy(opp_elo: int, my_elo: int) -> tuple[Any, str]:
     """Политика соперника: Maia-2 ONNX, при отсутствии модели — MaiaLite.
 
@@ -665,6 +672,14 @@ def _opening_game_from_session(session: dict[str, Any]) -> OpeningGame:
     )
 
 
+def _opening_need_reply(game: OpeningGame) -> bool:
+    """Нужен ли ответ соперника: его очередь и у него есть ход."""
+    if is_finished(game):
+        return False
+    board = board_from_moves(game.moves)
+    return board.turn == opponent_color(game) and any(board.legal_moves)
+
+
 def _opening_state(
     session: dict[str, Any],
     *,
@@ -686,6 +701,7 @@ def _opening_state(
         "opp_elo": game.opp_elo,
         "plies": game.plies,
         "finished": is_finished(game),
+        "need_reply": _opening_need_reply(game),
         "result": session.get("result"),
         "report": session.get("report"),
     }
@@ -2038,7 +2054,7 @@ def create_api(
     db_path: Path | None = None,
     data_dir: Path | None = None,
 ) -> FastAPI:
-    app = FastAPI(title="Chess Trainer API", version="0.4.4", docs_url="/api/docs", redoc_url=None)
+    app = FastAPI(title="Chess Trainer API", version="0.4.5", docs_url="/api/docs", redoc_url=None)
     app.state.db_path = Path(db_path) if db_path else settings.db_path
     app.state.data_dir = Path(data_dir) if data_dir else settings.data_dir
 
@@ -3021,16 +3037,46 @@ def create_api(
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
 
-        # Ответ соперника считаем синхронно: Maia ~17мс, фоновый job не нужен.
-        last_reply: dict[str, Any] | None = None
-        engine_name: str | None = None
-        if not is_finished(game):
-            policy, engine_name = _opening_policy(game.opp_elo, game.my_elo)
-            try:
-                san, reason = opponent_move(game, policy, rng=random.Random())
-            finally:
-                _close_opening_policy(policy, engine_name)
-            last_reply = {"san": san, "reason": reason}
+        # Только ход игрока: ответ соперника считает отдельный /reply,
+        # чтобы фронтенд показал ход сразу, не дожидаясь соперника.
+        finished = is_finished(game)
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            kwargs: dict[str, Any] = {
+                "moves": game.moves,
+                "status": _OPENING_DONE if finished else _OPENING_IN_PROGRESS,
+            }
+            if finished:
+                kwargs["result"] = result(game)
+            db.update_opening_session(body.session_id, **kwargs)
+            session = db.get_opening_session(body.session_id)
+        return _opening_state(session)
+
+    @app.post("/api/opening/reply")
+    def api_opening_reply(request: Request, body: OpeningReplyBody):
+        user = _current_user(app.state.db_path, request)
+        if not user:
+            raise HTTPException(404, "No current user")
+        nick = user["nick"]
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            session = _opening_owned(db, nick, body.session_id)
+        if session is None:
+            raise HTTPException(404, "Сессия не найдена")
+
+        # Идемпотентно: не очередь соперника или партия завершена — без хода.
+        if session.get("status") != _OPENING_IN_PROGRESS:
+            return _opening_state(session)
+        game = _opening_game_from_session(session)
+        if not _opening_need_reply(game):
+            return _opening_state(session)
+
+        policy, engine_name = _opening_policy(game.opp_elo, game.my_elo)
+        try:
+            san, reason = opponent_move(game, policy, rng=random.Random())
+        finally:
+            _close_opening_policy(policy, engine_name)
+        last_reply = {"san": san, "reason": reason}
 
         finished = is_finished(game)
         with Database(app.state.db_path) as db:

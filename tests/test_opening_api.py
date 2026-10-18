@@ -202,6 +202,12 @@ class OpeningApiTestBase(unittest.TestCase):
             )
             self.assertEqual(resp.status_code, 200, resp.text)
             state = resp.json()
+            if state["need_reply"]:
+                resp = self.client.post(
+                    "/api/opening/reply", json={"session_id": state["id"]}
+                )
+                self.assertEqual(resp.status_code, 200, resp.text)
+                state = resp.json()
         return state
 
     def _wait_job(self, job_id: str, timeout: float = 15.0) -> dict:
@@ -319,7 +325,8 @@ class OpeningStartTests(OpeningApiTestBase):
 # Ходы
 # --------------------------------------------------------------------------- #
 class OpeningMoveTests(OpeningApiTestBase):
-    def test_move_happy_path(self):
+    def test_move_shows_user_move_without_reply(self):
+        """Ход игрока виден сразу: ответ соперника ещё не посчитан."""
         self._register(self.client, "tester")
         state = self._start("white")
         resp = self.client.post(
@@ -327,12 +334,108 @@ class OpeningMoveTests(OpeningApiTestBase):
         )
         self.assertEqual(resp.status_code, 200, resp.text)
         data = resp.json()
+        self.assertEqual(data["moves"], ["e4"])  # только ход игрока
+        self.assertNotIn("last_reply", data)
+        self.assertNotIn("engine", data)
+        self.assertEqual(data["turn"], "black")  # теперь очередь соперника
+        self.assertTrue(data["need_reply"])
+        self.assertFalse(data["finished"])
+
+    def test_reply_applies_opponent_move(self):
+        self._register(self.client, "tester")
+        state = self._start("white")
+        after_move = self.client.post(
+            "/api/opening/move", json={"session_id": state["id"], "san": "e4"}
+        ).json()
+        resp = self.client.post(
+            "/api/opening/reply", json={"session_id": state["id"]}
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
         self.assertEqual(data["moves"], ["e4", "Nf6"])  # ответ соперника-чёрных
-        self.assertEqual(data["engine"], "maia2")
         self.assertEqual(data["last_reply"]["san"], "Nf6")
         self.assertTrue(data["last_reply"]["reason"])
-        self.assertEqual(data["turn"], "white")
+        self.assertEqual(data["engine"], "maia2")
+        self.assertEqual(data["turn"], "white")  # снова ход игрока
+        self.assertFalse(data["need_reply"])
         self.assertFalse(data["finished"])
+        self.assertEqual(after_move["moves"], ["e4"])
+
+    def test_reply_idempotent_user_turn(self):
+        """Не очередь соперника — ответ не считаем и не падаем."""
+        self._register(self.client, "tester")
+        state = self._start("white")  # ход белых (игрока)
+        resp = self.client.post(
+            "/api/opening/reply", json={"session_id": state["id"]}
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["moves"], [])
+        self.assertNotIn("last_reply", data)
+        self.assertFalse(data["need_reply"])
+
+    def test_reply_idempotent_finished(self):
+        self._register(self.client, "tester")
+        self._seed_session(
+            "s1", "tester", moves=_toggle_moves(40), status="done", result="*"
+        )
+        resp = self.client.post(
+            "/api/opening/reply", json={"session_id": "s1"}
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(len(data["moves"]), 40)  # ход не добавился
+        self.assertNotIn("last_reply", data)
+        self.assertFalse(data["need_reply"])
+        self.assertTrue(data["finished"])
+
+    def test_user_move_finishing_game_needs_no_reply(self):
+        """Ход игрока, доигравший лимит полуходов: need_reply=false, ответ не нужен."""
+        self._register(self.client, "tester")
+        # 39 полуходов: сейчас очередь чёрных (игрок — чёрные).
+        self._seed_session("s1", "tester", moves=_toggle_moves(39), color="black")
+        board = chess.Board()
+        for san in _toggle_moves(39):
+            board.push_san(san)
+        resp = self.client.post(
+            "/api/opening/move",
+            json={"session_id": "s1", "san": _toggle_san(board)},
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertTrue(data["finished"])
+        self.assertEqual(data["status"], "done")
+        self.assertEqual(data["result"], "*")
+        self.assertFalse(data["need_reply"])
+        self.assertEqual(len(data["moves"]), 40)
+        # Ответ после финала — идемпотентно, без нового хода.
+        again = self.client.post(
+            "/api/opening/reply", json={"session_id": "s1"}
+        ).json()
+        self.assertEqual(len(again["moves"]), 40)
+        self.assertNotIn("last_reply", again)
+
+    def test_user_move_checkmate_needs_no_reply(self):
+        """Мат ходом игрока: need_reply=false даже до лимита полуходов."""
+        self._register(self.client, "tester")
+        self._seed_session(
+            "s1",
+            "tester",
+            moves=["e4", "e5", "Bc4", "Nc6", "Qh5", "Nf6"],
+            color="white",
+        )
+        resp = self.client.post(
+            "/api/opening/move", json={"session_id": "s1", "san": "Qxf7#"}
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertFalse(data["finished"])  # лимит полуходов не достигнут
+        self.assertFalse(data["need_reply"])  # но соперник ответить не может
+        again = self.client.post(
+            "/api/opening/reply", json={"session_id": "s1"}
+        ).json()
+        self.assertEqual(len(again["moves"]), 7)
+        self.assertNotIn("last_reply", again)
 
     def test_move_illegal_san_400(self):
         self._register(self.client, "tester")
@@ -374,6 +477,22 @@ class OpeningMoveTests(OpeningApiTestBase):
         self._register(self.client, "tester")
         resp = self.client.post(
             "/api/opening/move", json={"session_id": "nope", "san": "e4"}
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    def test_reply_ownership_404(self):
+        self._register(self.client, "alice")
+        state = self._start("white", client=self.client)
+        self._register(self.client2, "bob")
+        resp = self.client2.post(
+            "/api/opening/reply", json={"session_id": state["id"]}
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    def test_reply_missing_session_404(self):
+        self._register(self.client, "tester")
+        resp = self.client.post(
+            "/api/opening/reply", json={"session_id": "nope"}
         )
         self.assertEqual(resp.status_code, 404)
 
@@ -528,7 +647,8 @@ class OpeningStateTests(OpeningApiTestBase):
         data = resp.json()
         for key in (
             "id", "status", "moves", "fen", "turn", "color", "style",
-            "my_elo", "opp_elo", "plies", "finished", "result", "report",
+            "my_elo", "opp_elo", "plies", "finished", "need_reply",
+            "result", "report",
         ):
             self.assertIn(key, data)
         self.assertTrue(chess.Board(data["fen"]).is_valid())
@@ -577,6 +697,26 @@ class OpeningStateTests(OpeningApiTestBase):
         data = resp.json()
         self.assertFalse(data["your_turn"])
         self.assertEqual(data["moves"], [])
+
+    def test_legal_opponent_turn_after_move_empty(self):
+        """После хода игрока (до ответа) ходы недоступны — очередь соперника."""
+        self._register(self.client, "tester")
+        state = self._start("white")
+        after = self.client.post(
+            "/api/opening/move", json={"session_id": state["id"], "san": "e4"}
+        ).json()
+        self.assertTrue(after["need_reply"])
+        resp = self.client.get(f"/api/opening/{state['id']}/legal")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertFalse(data["your_turn"])
+        self.assertEqual(data["moves"], [])
+        # После ответа соперника ход снова за игроком.
+        self.client.post("/api/opening/reply", json={"session_id": state["id"]})
+        resp = self.client.get(f"/api/opening/{state['id']}/legal")
+        data = resp.json()
+        self.assertTrue(data["your_turn"])
+        self.assertTrue(data["moves"])
 
     def test_legal_missing_404(self):
         self._register(self.client, "tester")

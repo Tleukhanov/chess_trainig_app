@@ -1900,15 +1900,40 @@ async function submitOpeningMove(app, san) {
   state.openingThinking = true;
   state.openingError = null;
   drawOpening(app);
+  let moveState;
   try {
-    const res = await api('/api/opening/move', {
+    moveState = await api('/api/opening/move', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ session_id: s.id, san }),
     });
-    if (state.openingFens) state.openingFens.push(res.fen);
-    state.openingSession = res;
-    state.openingLastReply = res.last_reply || null;
+  } catch (err) {
+    if (isSessionError(err)) { handleSessionExpired(); return; }
+    state.openingError = err.message;
+    state.openingThinking = false;
+    drawOpening(app);
+    return;
+  }
+  // Ход игрока показываем сразу, не дожидаясь ответа соперника.
+  if (state.openingFens) state.openingFens.push(moveState.fen);
+  state.openingSession = moveState;
+  state.openingLastReply = null;
+  state.openingThinking = false;
+  drawOpening(app);
+  if (!moveState.need_reply) return;
+
+  // Соперник отвечает отдельным запросом — доска уже показывает ход игрока.
+  state.openingThinking = true;
+  drawOpening(app);
+  try {
+    const replyState = await api('/api/opening/reply', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: s.id }),
+    });
+    if (state.openingFens) state.openingFens.push(replyState.fen);
+    state.openingSession = replyState;
+    state.openingLastReply = replyState.last_reply || null;
   } catch (err) {
     if (isSessionError(err)) { handleSessionExpired(); return; }
     state.openingError = err.message;
