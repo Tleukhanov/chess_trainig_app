@@ -48,6 +48,7 @@ __all__ = [
     "opponent_move",
     "user_move",
     "is_finished",
+    "game_over",
     "user_color",
     "opponent_color",
     "result",
@@ -749,17 +750,34 @@ def opponent_color(game: OpeningGame) -> chess.Color:
     return chess.BLACK if user_color(game) == chess.WHITE else chess.WHITE
 
 
+def game_over(game: OpeningGame) -> bool:
+    """Партия объективно завершена по правилам (мат или пат) на текущей позиции.
+
+    Проверяются только два конкретных терминальных исхода — мат и пат; прочие
+    «мягкие» ничьи (повтор/50 ходов) намеренно не учитываются.
+    """
+    board = board_from_moves(game.moves)
+    return board.is_checkmate() or board.is_stalemate()
+
+
 def is_finished(game: OpeningGame) -> bool:
-    """Партия тренера завершена, если сыграно не меньше ``plies`` полуходов."""
-    return len(game.moves) >= game.plies
+    """Партия завершена: доигран лимит ``plies`` либо мат/пат раньше лимита."""
+    return len(game.moves) >= game.plies or game_over(game)
 
 
 def result(game: OpeningGame) -> str | None:
-    """Результат усечённой на ``plies`` партии: None пока не завершена, иначе ``"*"``.
+    """Результат партии: None пока не завершена.
 
-    Победитель по обрезанной партии не вычисляется — возвращается ``"*"``.
+    Если позиция реально окончена (мат/пат) — настоящий результат доски
+    (``"1-0"``/``"0-1"``/``"1/2-1/2"``). Если партия завершена лишь по лимиту
+    полуходов — ``"*"`` (победитель по обрезанной партии не вычисляется).
     """
-    return "*" if is_finished(game) else None
+    if not is_finished(game):
+        return None
+    board = board_from_moves(game.moves)
+    if board.is_checkmate() or board.is_stalemate():
+        return board.result(claim_draw=False)
+    return "*"
 
 
 def opponent_move(

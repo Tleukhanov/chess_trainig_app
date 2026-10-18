@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -19,7 +20,7 @@ from unittest.mock import MagicMock, patch
 import chess
 from fastapi.testclient import TestClient
 
-from app.api import _JOBS, _build_opening_report, create_api
+from app.api import _JOBS, CoachJob, _build_opening_report, _persist_job, create_api
 from app.db import Database
 from app.games import Game
 from app.openings import STYLES
@@ -429,8 +430,10 @@ class OpeningMoveTests(OpeningApiTestBase):
         )
         self.assertEqual(resp.status_code, 200, resp.text)
         data = resp.json()
-        self.assertFalse(data["finished"])  # лимит полуходов не достигнут
-        self.assertFalse(data["need_reply"])  # но соперник ответить не может
+        self.assertTrue(data["finished"])  # мат — партия завершена до лимита
+        self.assertEqual(data["status"], "done")
+        self.assertEqual(data["result"], "1-0")
+        self.assertFalse(data["need_reply"])  # соперник ответить не может
         again = self.client.post(
             "/api/opening/reply", json={"session_id": "s1"}
         ).json()
@@ -730,6 +733,89 @@ class OpeningAnalyzeTests(OpeningApiTestBase):
             job = self._wait_job(resp.json()["job_id"])
         self.assertEqual(job["status"], "error")
         self.assertIn("LLM_API_KEY", job["error"])
+
+    # --- переживание перезапуска (снапшоты в meta) -------------------------- #
+
+    def _meta(self, job_id: str) -> dict | None:
+        with Database(self.db_path) as db:
+            db.init_db()
+            raw = db.get_meta(f"job:{job_id}")
+        return json.loads(raw) if raw else None
+
+    def _wait_meta(self, job_id: str, timeout: float = 10.0) -> dict | None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            data = self._meta(job_id)
+            if data is not None:
+                return data
+            time.sleep(0.02)
+        return None
+
+    def test_persisted_running_job_without_owner_is_error(self):
+        """Job в meta «running», но процесса-владельца нет — как после рестарта."""
+        self._register(self.client, "tester")
+        self._seed_session("s1", "tester", moves=_toggle_moves(40), status="done")
+        release = threading.Event()
+
+        class BlockingEngine(FakeEngine):
+            def analyze_game(self, game):
+                release.wait(timeout=15)
+                return super().analyze_game(game)
+
+        llm = MagicMock()
+        llm.chat.return_value = _REPORT_JSON
+        try:
+            with patch("app.api.Engine", BlockingEngine), \
+                    patch("app.api.LLMClient", return_value=llm):
+                job_id = self._analyze("s1")
+                # Ждём, пока фоновый поток запишет running-снапшот фазы.
+                self.assertIsNotNone(self._wait_meta(job_id))
+                _JOBS.clear()  # имитируем перезапуск: память пуста
+                resp = self.client.get(f"/api/jobs/{job_id}")
+                self.assertEqual(resp.status_code, 200, resp.text)
+                data = resp.json()
+                self.assertEqual(data["status"], "error")
+                self.assertIn("перезапуст", data["error"])
+                # Хранимый снапшот не мутирован — в meta всё ещё running.
+                self.assertEqual(self._meta(job_id)["status"], "running")
+        finally:
+            release.set()
+
+    def test_persisted_running_job_ownership_404(self):
+        """Чужой running-снапшот из meta не отдаём (как и in-memory job)."""
+        self._register(self.client, "alice")
+        _persist_job(
+            self.db_path, CoachJob(id="ajob", user="alice", status="running")
+        )
+        self._register(self.client2, "bob")
+        resp = self.client2.get("/api/jobs/ajob")
+        self.assertEqual(resp.status_code, 404)
+
+    def test_persisted_done_snapshot_returned_as_is(self):
+        """Снапшот done из meta (не в _JOBS) отдаётся без перезаписи статуса."""
+        self._register(self.client, "tester")
+        job = CoachJob(
+            id="donejob",
+            user="tester",
+            status="done",
+            phase="Готово",
+            summary="отчёт готов",
+            result={"report": {"summary": "вышел из дебюта нормально"}},
+        )
+        _persist_job(self.db_path, job, session_id="s1")
+        self.assertNotIn("donejob", _JOBS)
+        resp = self.client.get("/api/jobs/donejob")
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["status"], "done")
+        self.assertEqual(data["summary"], "отчёт готов")
+        self.assertEqual(
+            data["result"]["report"]["summary"], "вышел из дебюта нормально"
+        )
+
+    def test_missing_job_still_404(self):
+        self._register(self.client, "tester")
+        self.assertEqual(self.client.get("/api/jobs/nope").status_code, 404)
 
 
 # --------------------------------------------------------------------------- #

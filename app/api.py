@@ -117,6 +117,49 @@ def _get_job(job_id: str) -> CoachJob | None:
         return _JOBS.get(job_id)
 
 
+# --- persisted job snapshots (переживают перезапуск процесса) --------------
+
+_JOB_META_PREFIX = "job:"
+
+
+def _persist_job(
+    db_path: Path, job: CoachJob, *, session_id: str | None = None
+) -> None:
+    """Best-effort снапшот job'а в meta: сбой записи не ломает саму задачу.
+
+    Кладёт ``{**job.as_dict(), "session_id": ..., "updated": time.time()}`` под
+    ключом ``job:<id>``. Служит для опроса после перезапуска dyno, когда
+    in-memory ``_JOBS`` уже пуст.
+    """
+    try:
+        payload = {**job.as_dict(), "session_id": session_id, "updated": time.time()}
+        with Database(db_path) as db:
+            db.init_db()
+            db.set_meta(
+                f"{_JOB_META_PREFIX}{job.id}",
+                json.dumps(payload, ensure_ascii=False),
+            )
+    except Exception:
+        logger.warning("Не удалось сохранить job %s в meta", job.id, exc_info=True)
+
+
+def _load_job_meta(db_path: Path, job_id: str) -> dict[str, Any] | None:
+    """Читает снапшот job'а из meta; None если записи нет или она битая."""
+    try:
+        with Database(db_path) as db:
+            db.init_db()
+            raw = db.get_meta(f"{_JOB_META_PREFIX}{job_id}")
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 JOBS_GLOBAL_LIMIT = 3
 JOBS_PER_USER_LIMIT = 1
 
@@ -945,9 +988,11 @@ def _run_opening_analyze_job(
         # Память на Eco не резиновая: Maia (ONNX ~179MB) и Stockfish вместе
         # не помещаются, поэтому до подъёма движка освобождаем сессию Maia.
         job.phase = "Освобождение Maia"
+        _persist_job(app.state.db_path, job, session_id=session_id)
         _unload_maia()
 
         job.phase = "Анализ движком"
+        _persist_job(app.state.db_path, job, session_id=session_id)
         game = Game(
             id=f"opening-{session_id}",
             moves=moves,
@@ -967,6 +1012,7 @@ def _run_opening_analyze_job(
         opening = classify_opening(moves)
 
         job.phase = "Отчёт тренера"
+        _persist_job(app.state.db_path, job, session_id=session_id)
         report = _build_opening_report(
             session, moves, user_entries, opening, analysis
         )
@@ -979,9 +1025,11 @@ def _run_opening_analyze_job(
         job.result = {"report": report}
         job.summary = f"Отчёт по дебюту готов ({len(moves)} полуходов)"
         job.status = "done"
+        _persist_job(app.state.db_path, job, session_id=session_id)
     except Exception as exc:
         job.status = "error"
         job.error = str(exc)
+        _persist_job(app.state.db_path, job, session_id=session_id)
     finally:
         job.finished = time.time()
 
@@ -2497,15 +2545,29 @@ def create_api(
 
     @app.get("/api/jobs/{job_id}")
     def api_job_status(job_id: str, request: Request):
-        job = _get_job(job_id)
-        if not job:
-            raise HTTPException(404, "Job not found")
-        # Чужую задачу (результаты LLM, данные соперника) не отдаём:
-        # с сессией — только свои job'ы; без сессии — meta-fallback как раньше.
         user = _current_user(app.state.db_path, request)
-        if user is not None and job.user != user["nick"]:
+        job = _get_job(job_id)
+        if job is not None:
+            # Чужую задачу (результаты LLM, данные соперника) не отдаём:
+            # с сессией — только свои job'ы; без сессии — meta-fallback как раньше.
+            if user is not None and job.user != user["nick"]:
+                raise HTTPException(404, "Job not found")
+            return job.as_dict()
+
+        # Job'а нет в памяти: возможно, процесс перезапустился. Пробуем снапшот из meta.
+        meta = _load_job_meta(app.state.db_path, job_id)
+        if meta is None:
             raise HTTPException(404, "Job not found")
-        return job.as_dict()
+        if user is not None and meta.get("user") != user["nick"]:
+            raise HTTPException(404, "Job not found")
+        if meta.get("status") == "running":
+            # Снапшот «running», но процесса-владельца в памяти уже нет — значит
+            # сервер упал/перезапустился посреди анализа. Отдаём копию как error.
+            stale = dict(meta)
+            stale["status"] = "error"
+            stale["error"] = "Анализ прерван: сервер перезапустился"
+            return stale
+        return meta
 
     # --- Games (просмотр партий) ---
     def _game_summary(g) -> dict:
@@ -3148,6 +3210,7 @@ def create_api(
         _check_job_limits(nick)
         job = CoachJob(id=uuid.uuid4().hex, user=nick, phase="Анализ дебюта")
         _register_job(job)
+        _persist_job(app.state.db_path, job, session_id=body.session_id)
         threading.Thread(
             target=_run_opening_analyze_job,
             args=(app, job, body.session_id),

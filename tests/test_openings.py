@@ -20,6 +20,7 @@ from app.openings import (
     STYLE_LABELS_RU,
     OpeningGame,
     board_from_moves,
+    game_over,
     is_finished,
     new_game,
     opponent_color,
@@ -38,6 +39,16 @@ _CHECK_SAC_FEN = "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/8/PPPP1PPP/RNBQK1NR w KQkq - 3
 _TRADE_SAC_FEN = "4k3/3p1ppp/8/4n3/2B5/5N2/PPPP1PPP/4K3 w - - 0 1"
 # Нимпович после 1.e4 Nc6 2.d4 (ход чёрных): Maia переоценивает откат Nb8.
 _NIMZO_FEN = "r1bqkbnr/pppppppp/2n5/8/3PP3/8/PPP2PPP/RNBQKBNR b KQkq - 0 2"
+
+# Детский мат (белые), 7 полуходов: мат задолго до лимита 40 полуходов.
+_SCHOLARS_MATE = ["e4", "e5", "Bc4", "Nc6", "Qh5", "Nf6", "Qxf7#"]
+# Мат в два хода (чёрные): мат до лимита 40 полуходов.
+_FOOLS_MATE = ["f3", "e5", "g4", "Qh4#"]
+# Самый быстрый пат (19 полуходов): ничья до лимита 40 полуходов.
+_QUICK_STALEMATE = [
+    "e3", "a5", "Qh5", "Ra6", "Qxa5", "h5", "Qxc7", "Rah6", "h4", "f6",
+    "Qxd7+", "Kf7", "Qxb7", "Qd3", "Qxb8", "Qh7", "Qxc8", "Kg6", "Qe6",
+]
 
 
 class FakePolicy:
@@ -322,6 +333,49 @@ class SessionTests(unittest.TestCase):
         self.assertTrue(board.is_valid())
         self.assertEqual(board.turn, chess.BLACK)
         self.assertEqual(board.fullmove_number, 3)
+
+
+class TerminalPositionTests(unittest.TestCase):
+    """Мат/пат до лимита полуходов завершают партию (реальный баг: доска вставала)."""
+
+    def _game(self, moves: list[str]) -> OpeningGame:
+        game = new_game(1500, 1500, "universal", "white", plies=40)
+        game.moves = list(moves)
+        return game
+
+    def test_checkmate_white_detected_before_ply_limit(self) -> None:
+        game = self._game(_SCHOLARS_MATE)
+        self.assertLess(len(game.moves), game.plies)
+        self.assertTrue(game_over(game))
+        self.assertTrue(is_finished(game))
+        self.assertEqual(result(game), "1-0")
+
+    def test_checkmate_black_detected_before_ply_limit(self) -> None:
+        game = self._game(_FOOLS_MATE)
+        self.assertLess(len(game.moves), game.plies)
+        self.assertTrue(game_over(game))
+        self.assertTrue(is_finished(game))
+        self.assertEqual(result(game), "0-1")
+
+    def test_stalemate_detected_before_ply_limit(self) -> None:
+        game = self._game(_QUICK_STALEMATE)
+        self.assertLess(len(game.moves), game.plies)
+        self.assertTrue(game_over(game))
+        self.assertTrue(is_finished(game))
+        self.assertEqual(result(game), "1/2-1/2")
+
+    def test_ply_limit_truncation_still_returns_star(self) -> None:
+        game = new_game(1500, 1500, "universal", "white", plies=3)
+        game.moves = ["e4", "e5", "Nf3"]
+        self.assertFalse(game_over(game))  # позиция не терминальна
+        self.assertTrue(is_finished(game))  # но лимит полуходов достигнут
+        self.assertEqual(result(game), "*")
+
+    def test_non_terminal_position_not_finished(self) -> None:
+        game = self._game(["e4", "e5", "Nf3"])
+        self.assertFalse(game_over(game))
+        self.assertFalse(is_finished(game))
+        self.assertIsNone(result(game))
 
 
 if __name__ == "__main__":
