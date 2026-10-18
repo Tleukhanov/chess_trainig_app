@@ -16,12 +16,19 @@
 и :func:`unload`. Перед запуском Stockfish (который сам просит сотни МБ)
 вызовите ``unload()`` — сессия будет освобождена, а при следующем ходе
 пересоздана лениво.
+
+Загрузка модели: если файла модели (или словаря) нет в момент вызова
+:func:`get_policy`, то при включённом ``MAIA_AUTO_FETCH`` (по умолчанию —
+включён) артефакты автоматически скачиваются через
+``tools/fetch_maia_onnx.py`` до загрузки. При выключенном флаге поведение
+прежнее — понятный ``RuntimeError``.
 """
 
 from __future__ import annotations
 
 import gc
 import json
+import os
 import threading
 from pathlib import Path
 from typing import Any
@@ -33,6 +40,7 @@ import onnxruntime as ort
 __all__ = [
     "MaiaOnnxPolicy",
     "apply_mask_and_softmax",
+    "autofetch_enabled",
     "encode_board",
     "elo_bucket",
     "load_vocabulary",
@@ -353,6 +361,62 @@ _POLICY_KEY: tuple[Any, ...] | None = None
 _POLICY_LOCK = threading.Lock()
 
 
+# --------------------------------------------------------------------------- #
+# Авто-загрузка модели (Heroku eco: эфемерный диск -> модель качается заново)
+# --------------------------------------------------------------------------- #
+_FALSY_ENV = frozenset({"0", "false", "no", "off"})
+
+
+def autofetch_enabled() -> bool:
+    """Флаг ``MAIA_AUTO_FETCH``: включён по умолчанию.
+
+    Не задан, пустой, ``1`` или ``true`` (любой регистр) — включено;
+    ``0`` / ``false`` / ``no`` / ``off`` — выключено. Любое иное значение
+    трактуется как включено (безопасный дефолт для Heroku).
+    """
+    raw = os.environ.get("MAIA_AUTO_FETCH")
+    if raw is None or raw.strip() == "":
+        return True
+    return raw.strip().lower() not in _FALSY_ENV
+
+
+def _fetch_maia_artifacts(vocab_dir: Path) -> None:
+    """Скачивает модель и словари через ``tools/fetch_maia_onnx.py``.
+
+    Импорт ленивый: держим ``import app.maia_onnx`` лёгким и без циклов.
+    Отдельная функция — шов для тестов (её подменяют заглушкой, чтобы не
+    качать ~93 MiB). Инструмент кладёт модель и словари в ``vocab_dir``.
+    """
+    from tools.fetch_maia_onnx import download_all
+
+    download_all(maia_dir=vocab_dir)
+
+
+def _ensure_artifacts(model_path: Path, vocab_dir: Path) -> None:
+    """Гарантирует наличие модели и словаря перед созданием политики.
+
+    Если файлов нет и :func:`autofetch_enabled` — вызывает загрузчик; при
+    выключенном флаге молча выходит (конструктор политики сам бросит
+    понятный ``RuntimeError``). Сбои загрузки оборачиваются в
+    ``RuntimeError`` с указанием на ``tools/fetch_maia_onnx.py``.
+    """
+    model_ok = model_path.is_file()
+    vocab_ok = (vocab_dir / "all_moves.txt").is_file() and (
+        vocab_dir / "elo_dict.json"
+    ).is_file()
+    if model_ok and vocab_ok:
+        return
+    if not autofetch_enabled():
+        return
+    try:
+        _fetch_maia_artifacts(vocab_dir)
+    except Exception as error:  # noqa: BLE001
+        raise RuntimeError(
+            "Не удалось автоматически скачать модель Maia "
+            f"(tools/fetch_maia_onnx.py): {error}"
+        ) from error
+
+
 def _defaults() -> tuple[Path, Path, int]:
     from .config import settings
 
@@ -378,6 +442,8 @@ def get_policy(
     self_elo = d_elo if self_elo is None else int(self_elo)
     opp_elo = self_elo if opp_elo is None else int(opp_elo)
     key = (str(model_path), str(vocab_dir), self_elo, opp_elo, float(temperature), int(threads))
+
+    _ensure_artifacts(model_path, vocab_dir)
 
     global _POLICY, _POLICY_KEY
     with _POLICY_LOCK:

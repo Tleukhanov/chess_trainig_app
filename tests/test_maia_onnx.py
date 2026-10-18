@@ -16,18 +16,22 @@
 from __future__ import annotations
 
 import json
+import os
 import statistics
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import chess
 import numpy as np
 
+from app import maia_onnx
 from app.config import settings
 from app.maia_onnx import (
     MaiaOnnxPolicy,
     apply_mask_and_softmax,
+    autofetch_enabled,
     encode_board,
     elo_bucket,
     load_vocabulary,
@@ -244,6 +248,100 @@ class PolicyConstructionTests(unittest.TestCase):
         with self.assertRaises(RuntimeError) as ctx:
             MaiaOnnxPolicy(FIXTURES_DIR / "absent.onnx", FIXTURES_DIR, 1500, 1500)
         self.assertIn("fetch_maia_onnx", str(ctx.exception))
+
+
+class AutoFetchFlagTests(unittest.TestCase):
+    """Разбор MAIA_AUTO_FETCH: дефолт включён, '0'/'false' выключают."""
+
+    def _enabled(self, value: str | None) -> bool:
+        if value is None:
+            with mock.patch.dict(os.environ):
+                os.environ.pop("MAIA_AUTO_FETCH", None)
+                return autofetch_enabled()
+        with mock.patch.dict(os.environ, {"MAIA_AUTO_FETCH": value}):
+            return autofetch_enabled()
+
+    def test_disabled_values(self) -> None:
+        for value in ("0", "false", "FALSE", "no", "off", " 0 "):
+            self.assertFalse(self._enabled(value), value)
+
+    def test_enabled_values(self) -> None:
+        for value in (None, "", "1", "true", "TRUE", "yes", "on"):
+            self.assertTrue(self._enabled(value), repr(value))
+
+
+class AutoFetchPolicyTests(unittest.TestCase):
+    """get_policy дергает авто-загрузку только когда модель отсутствует."""
+
+    _ABSENT_MODEL = FIXTURES_DIR / "absent.onnx"
+    _ABSENT_VOCAB = FIXTURES_DIR / "absent-vocab"
+
+    def setUp(self) -> None:
+        self._saved_policy = maia_onnx._POLICY
+        self._saved_key = maia_onnx._POLICY_KEY
+        maia_onnx._POLICY = None
+        maia_onnx._POLICY_KEY = None
+
+    def tearDown(self) -> None:
+        maia_onnx._POLICY = self._saved_policy
+        maia_onnx._POLICY_KEY = self._saved_key
+
+    def test_disabled_does_not_attempt_download(self) -> None:
+        with mock.patch.dict(os.environ, {"MAIA_AUTO_FETCH": "0"}):
+            with mock.patch.object(maia_onnx, "_fetch_maia_artifacts") as fetch:
+                with self.assertRaises(RuntimeError):
+                    maia_onnx.get_policy(
+                        model_path=self._ABSENT_MODEL,
+                        vocab_dir=self._ABSENT_VOCAB,
+                    )
+                fetch.assert_not_called()
+
+    def test_enabled_invokes_fetcher_then_fails_cleanly(self) -> None:
+        calls: list[Path] = []
+
+        def stub(vocab_dir: Path) -> None:
+            calls.append(Path(vocab_dir))
+
+        with mock.patch.dict(os.environ, {"MAIA_AUTO_FETCH": "1"}):
+            with mock.patch.object(maia_onnx, "_fetch_maia_artifacts", stub):
+                with self.assertRaises(RuntimeError) as ctx:
+                    maia_onnx.get_policy(
+                        model_path=self._ABSENT_MODEL,
+                        vocab_dir=self._ABSENT_VOCAB,
+                    )
+        self.assertEqual(calls, [self._ABSENT_VOCAB])
+        self.assertIn("fetch_maia_onnx", str(ctx.exception))
+
+    def test_unset_defaults_to_enabled(self) -> None:
+        calls: list[Path] = []
+
+        def stub(vocab_dir: Path) -> None:
+            calls.append(Path(vocab_dir))
+
+        with mock.patch.dict(os.environ):
+            os.environ.pop("MAIA_AUTO_FETCH", None)
+            with mock.patch.object(maia_onnx, "_fetch_maia_artifacts", stub):
+                with self.assertRaises(RuntimeError):
+                    maia_onnx.get_policy(
+                        model_path=self._ABSENT_MODEL,
+                        vocab_dir=self._ABSENT_VOCAB,
+                    )
+        self.assertEqual(len(calls), 1)
+
+    def test_fetch_failure_wrapped_as_runtime_error(self) -> None:
+        def boom(vocab_dir: Path) -> None:
+            raise OSError("network down")
+
+        with mock.patch.dict(os.environ, {"MAIA_AUTO_FETCH": "true"}):
+            with mock.patch.object(maia_onnx, "_fetch_maia_artifacts", boom):
+                with self.assertRaises(RuntimeError) as ctx:
+                    maia_onnx.get_policy(
+                        model_path=self._ABSENT_MODEL,
+                        vocab_dir=self._ABSENT_VOCAB,
+                    )
+        text = str(ctx.exception)
+        self.assertIn("fetch_maia_onnx", text)
+        self.assertIn("network down", text)
 
 
 # --------------------------------------------------------------------------- #

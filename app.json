@@ -1,6 +1,6 @@
 {
   "name": "Chess Trainer",
-  "description": "Personal chess trainer: Lichess games, Stockfish analysis, LLM coaching, drills and repertoire.",
+  "description": "Personal chess trainer: Lichess games, Stockfish analysis, LLM coaching, drills, repertoire and a Maia-2 opening trainer.",
   "stack": "heroku-24",
   "buildpacks": [
     {
@@ -31,6 +31,14 @@
     "STOCKFISH_TIME_MS": {
       "description": "Stockfish time limit per position in ms.",
       "value": "1500"
+    },
+    "MAIA_AUTO_FETCH": {
+      "description": "Auto-download the Maia-2 ONNX model + vocab on first opening-trainer use (Heroku eco has an ephemeral disk).",
+      "value": "1"
+    },
+    "OPENING_PLIES": {
+      "description": "Number of opening plies kept for the opening trainer analysis.",
+      "value": "40"
     },
     "LLM_API_KEY": {
       "description": "LLM API key (OpenRouter or any OpenAI-compatible provider). Fill in after deploy.",
