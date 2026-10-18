@@ -78,6 +78,19 @@ class Settings:
     data_dir: Path = PROJECT_ROOT / "data"
     db_path: Path = PROJECT_ROOT / "data" / "trainer.db"
 
+    # --- Maia-2 (тренер дебютов) ---
+    maia_onnx_path: Path = Path(
+        _cfg("MAIA_ONNX_PATH", str(PROJECT_ROOT / "data" / "maia" / "maia2-rapid.onnx"))
+    )
+    maia_dir: Path = Path(_cfg("MAIA_DIR", str(PROJECT_ROOT / "data" / "maia")))
+    maia_model_url: str = _cfg(
+        "MAIA_MODEL_URL",
+        "https://media.githubusercontent.com/media/ChessWaveIO/maia2-uci/main/"
+        "models/maia2-rapid.onnx",
+    )
+    maia_default_elo: int = int(_cfg("MAIA_DEFAULT_ELO", "1500"))
+    opening_plies: int = int(_cfg("OPENING_PLIES", "40"))
+
     # --- LLM (M1) ---
     llm_api_key: str = _cfg("LLM_API_KEY", "")
     llm_base_url: str = _cfg("LLM_BASE_URL", "https://openrouter.ai/api/v1")
