@@ -554,6 +554,36 @@ class OpeningStateTests(OpeningApiTestBase):
         self.assertEqual(ids[0], second["id"])  # новые первыми
         self.assertIn(first["id"], ids)
 
+    def test_legal_your_turn(self):
+        self._register(self.client, "tester")
+        state = self._start("white")
+        resp = self.client.get(f"/api/opening/{state['id']}/legal")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertTrue(data["your_turn"])
+        self.assertEqual(data["turn"], "white")
+        self.assertTrue(data["moves"])
+        board = chess.Board(data["fen"])
+        for mv in data["moves"]:
+            parsed = board.parse_san(mv["san"])
+            self.assertEqual(chess.square_name(parsed.from_square), mv["from"])
+            self.assertEqual(chess.square_name(parsed.to_square), mv["to"])
+
+    def test_legal_after_finished_empty(self):
+        self._register(self.client, "tester")
+        state = self._play_to_done("white")
+        resp = self.client.get(f"/api/opening/{state['id']}/legal")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertFalse(data["your_turn"])
+        self.assertEqual(data["moves"], [])
+
+    def test_legal_missing_404(self):
+        self._register(self.client, "tester")
+        self.assertEqual(
+            self.client.get("/api/opening/nope/legal").status_code, 404
+        )
+
     def test_endpoints_require_auth(self):
         self.assertEqual(self.client.get("/api/opening").status_code, 404)
         self.assertEqual(self.client.get("/api/opening/x").status_code, 404)

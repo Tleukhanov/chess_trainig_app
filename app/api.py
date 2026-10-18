@@ -3090,6 +3090,49 @@ def create_api(
             raise HTTPException(404, "Сессия не найдена")
         return _opening_state(session)
 
+    @app.get("/api/opening/{session_id}/legal")
+    def api_opening_legal(session_id: str, request: Request):
+        """Легальные ходы текущей позиции — для click-to-move на доске.
+
+        Ходы отдаются, только когда сейчас ход игрока и партия не завершена;
+        иначе список пуст (ходит соперник или всё закончилось).
+        """
+        user = _current_user(app.state.db_path, request)
+        if not user:
+            raise HTTPException(404, "No current user")
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            session = _opening_owned(db, user["nick"], session_id)
+        if session is None:
+            raise HTTPException(404, "Сессия не найдена")
+
+        game = _opening_game_from_session(session)
+        board = board_from_moves(game.moves)
+        user_is_white = game.color == "white"
+        your_turn = (
+            not is_finished(game)
+            and board.turn == (chess.WHITE if user_is_white else chess.BLACK)
+        )
+        moves = (
+            [
+                {
+                    "from": chess.square_name(m.from_square),
+                    "to": chess.square_name(m.to_square),
+                    "san": board.san(m),
+                }
+                for m in board.legal_moves
+            ]
+            if your_turn
+            else []
+        )
+        return {
+            "session_id": session_id,
+            "fen": board.fen(),
+            "turn": "white" if board.turn == chess.WHITE else "black",
+            "your_turn": your_turn,
+            "moves": moves,
+        }
+
     # --- Auth: регистрация и вход (логин+пароль+lichess) ---
     @app.post("/api/auth/register")
     def api_auth_register(
