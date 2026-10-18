@@ -450,6 +450,12 @@ td.center { text-align: center; }
 .game-meta div { margin-bottom: 4px; }
 .game-meta strong { color: var(--c-text); }
 
+/* Тренер дебютов */
+.opening-style-desc { color: var(--c-text-muted); font-size: 13px; margin-top: 6px; min-height: 18px; }
+.opening-reply { margin-top: 10px; font-size: 13px; }
+.opening-report-moment { padding: 8px 0; border-bottom: 1px solid var(--c-border); }
+.opening-report-moment:last-child { border-bottom: none; }
+
 /* Responsive */
 @media (max-width: 720px) {
   .topbar-inner { flex-wrap: wrap; height: auto; padding: 12px 16px; gap: 12px; }

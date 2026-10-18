@@ -3,7 +3,7 @@
 const state = {
   user: null,
   currentView: 'dashboard',
-  timers: { coach: null, task: null, llm: null, tool: null },
+  timers: { coach: null, task: null, llm: null, tool: null, opening: null },
   gamesFilter: 'all',
   gameId: null,
   gameData: null,
@@ -22,6 +22,16 @@ const state = {
   planLlmGenerating: false,
   planLlmJobId: null,
   planLlmError: null,
+  openingSession: null,
+  openingStyles: null,
+  openingStyle: null,
+  openingColor: 'white',
+  openingFens: null,
+  openingThinking: false,
+  openingAnalyzing: false,
+  openingJobId: null,
+  openingError: null,
+  openingLastReply: null,
   authMode: 'login',
   trackStarted: false,
 };
@@ -75,7 +85,7 @@ function setupTheme() {
 
 // --- Navigation ---
 
-const views = ['dashboard', 'overview', 'plan', 'progress', 'games', 'drills', 'task', 'coach', 'tools', 'users'];
+const views = ['dashboard', 'overview', 'plan', 'progress', 'games', 'drills', 'task', 'opening', 'coach', 'tools', 'users'];
 
 function navigate(view) {
   if (!views.includes(view)) view = 'dashboard';
@@ -215,6 +225,7 @@ function renderUserbox() {
         gameId: null, gameData: null, task: null, taskKey: null, taskResult: null,
         taskRevealed: false, taskExplanation: null, planLlmJobId: null,
         planLlmGenerating: false, tool: 'repertoire', gamesFilter: 'all',
+        openingSession: null, openingFens: null, openingLastReply: null, openingJobId: null,
       });
       hideNav();
       renderUserbox();
@@ -250,6 +261,7 @@ async function render(view) {
       case 'games': await viewGames(app); break;
       case 'drills': await viewDrills(app); break;
       case 'task': await viewTask(app); break;
+      case 'opening': await viewOpening(app); break;
       case 'coach': await viewCoach(app); break;
       case 'tools': await viewTools(app); break;
       case 'users': await viewUsers(app); break;
@@ -1520,6 +1532,483 @@ function taskPollExplanation(app, jobId) {
   }, 700);
 }
 
+// --- Тренер дебютов ---
+
+const OPENING_START_FEN = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+const OPENING_KIND_RU = { good: 'хорошо', better: 'можно лучше', bad: 'плохо' };
+
+function openingStyleLabel(key) {
+  const s = (state.openingStyles || []).find(x => x.key === key);
+  return s ? s.label : (key || '—');
+}
+
+function openingHighlight() {
+  const fens = state.openingFens;
+  if (fens && fens.length >= 2) {
+    try { return lastMoveSquares(fens[fens.length - 2], fens[fens.length - 1]); } catch { return []; }
+  }
+  return [];
+}
+
+function openingMoveRowsHtml(moves) {
+  if (!moves.length) return '<p style="color:var(--c-text-muted)">Ходов пока нет.</p>';
+  const rows = {};
+  moves.forEach((san, i) => {
+    const num = Math.floor(i / 2) + 1;
+    if (!rows[num]) rows[num] = { num, w: null, b: null };
+    rows[num][i % 2 === 0 ? 'w' : 'b'] = san;
+  });
+  return Object.values(rows).map(r => `
+    <div class="move-row">
+      <span class="move-num">${r.num}.</span>
+      <span class="move-cell" style="cursor:default">${esc(r.w || '')}</span>
+      <span class="move-cell" style="cursor:default">${esc(r.b || '')}</span>
+    </div>`).join('');
+}
+
+async function viewOpening(app) {
+  if (!state.user) {
+    app.innerHTML = '<div class="onboarding card"><div class="empty-icon">♟</div><h1>Тренер дебютов</h1><p>Профиль не выбран — выбери его на странице Профили.</p><a href="#" class="btn btn-primary" data-view="users">Профили</a></div>';
+    bindLinks(app);
+    return;
+  }
+  if (state.openingSession && state.openingSession.id) {
+    await loadOpeningSession(app, state.openingSession.id);
+    return;
+  }
+  await drawOpeningSetup(app);
+}
+
+async function loadOpeningSession(app, id) {
+  const prevId = state.openingSession && state.openingSession.id;
+  let s;
+  try {
+    s = await api('/api/opening/' + encodeURIComponent(id));
+  } catch (err) {
+    state.openingSession = null;
+    state.openingFens = null;
+    state.openingLastReply = null;
+    if (isSessionError(err)) { handleSessionExpired(); return; }
+    await drawOpeningSetup(app, err.message);
+    return;
+  }
+  state.openingSession = s;
+  if (prevId !== s.id) state.openingFens = null;
+  drawOpening(app);
+  if (state.openingAnalyzing && !state.timers.opening && state.openingJobId) {
+    openingPoll(app, state.openingJobId);
+  }
+}
+
+async function drawOpeningSetup(app, errorMsg) {
+  if (state.timers.opening) { clearInterval(state.timers.opening); state.timers.opening = null; }
+  state.openingThinking = false;
+  if (!state.openingStyles) {
+    try {
+      const data = await api('/api/opening/styles');
+      state.openingStyles = data.styles || [];
+    } catch (err) {
+      if (isSessionError(err)) { handleSessionExpired(); return; }
+      state.openingStyles = [];
+    }
+  }
+  const styles = state.openingStyles;
+  if (!state.openingStyle && styles.length) state.openingStyle = styles[0].key;
+  const style = state.openingStyle;
+  const color = state.openingColor === 'black' ? 'black' : 'white';
+  const selected = styles.find(s => s.key === style) || styles[0] || {};
+
+  app.innerHTML = `
+    <div class="card-header"><h1>Тренер дебютов</h1><span class="badge badge-blue">${esc(state.user.nick)}</span></div>
+    ${errorMsg ? `<div class="alert alert-error">${esc(errorMsg)}</div>` : ''}
+    <div class="card">
+      <div class="card-header"><span class="card-title">Новая партия</span><span class="badge badge-neutral">${40} полуходов</span></div>
+      <form id="opening-form">
+        <div class="form-group">
+          <label>Стиль соперника</label>
+          <div class="games-filter" id="opening-styles">
+            ${styles.map(s => `<button type="button" class="btn btn-secondary ${s.key === style ? 'btn-active' : ''}" data-style="${esc(s.key)}">${esc(s.label)}</button>`).join('')}
+          </div>
+          <div class="opening-style-desc" id="opening-style-desc">${esc(selected.description || '')}</div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label>Твой рейтинг (необяз.)</label>
+            <input type="number" name="my_elo" id="opening-my-elo" min="100" max="3500" step="1" placeholder="по умолчанию">
+          </div>
+          <div class="form-group">
+            <label>Рейтинг соперника (необяз.)</label>
+            <input type="number" name="opp_elo" id="opening-opp-elo" min="100" max="3500" step="1" placeholder="по умолчанию">
+          </div>
+        </div>
+        <div class="form-group">
+          <label>Соперник</label>
+          <div class="games-filter">
+            <button type="button" class="btn btn-secondary" data-opp="equal">равный</button>
+            <button type="button" class="btn btn-secondary" data-opp="plus100">+100</button>
+            <button type="button" class="btn btn-secondary" data-opp="stronger">сильнее (+200)</button>
+          </div>
+        </div>
+        <div class="form-group">
+          <label>Твой цвет</label>
+          <div class="games-filter">
+            <button type="button" class="btn btn-secondary ${color === 'white' ? 'btn-active' : ''}" data-color="white">белые</button>
+            <button type="button" class="btn btn-secondary ${color === 'black' ? 'btn-active' : ''}" data-color="black">чёрные</button>
+          </div>
+        </div>
+        <div class="alert alert-error" id="opening-setup-err" style="display:none"></div>
+        <button type="submit" class="btn btn-primary" style="width:fit-content">Начать</button>
+      </form>
+    </div>
+    <div id="opening-recent"></div>`;
+
+  app.querySelectorAll('#opening-styles [data-style]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      state.openingStyle = btn.dataset.style;
+      app.querySelectorAll('#opening-styles [data-style]').forEach(b => b.classList.toggle('btn-active', b === btn));
+      const sel = (state.openingStyles || []).find(s => s.key === state.openingStyle);
+      const desc = document.getElementById('opening-style-desc');
+      if (desc) desc.textContent = (sel && sel.description) || '';
+    });
+  });
+  app.querySelectorAll('#opening-form [data-color]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      state.openingColor = btn.dataset.color;
+      app.querySelectorAll('#opening-form [data-color]').forEach(b => b.classList.toggle('btn-active', b === btn));
+    });
+  });
+  app.querySelectorAll('#opening-form [data-opp]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const my = document.getElementById('opening-my-elo');
+      const opp = document.getElementById('opening-opp-elo');
+      const base = Number(my && my.value) || 1500;
+      const mode = btn.dataset.opp;
+      if (mode === 'equal') opp.value = my && my.value ? my.value : '';
+      else if (mode === 'plus100') opp.value = String(base + 100);
+      else opp.value = String(base + 200);
+    });
+  });
+
+  const form = document.getElementById('opening-form');
+  form.addEventListener('submit', async e => {
+    e.preventDefault();
+    const err = document.getElementById('opening-setup-err');
+    if (err) err.style.display = 'none';
+    const fd = new FormData(form);
+    const body = { style: state.openingStyle, color: state.openingColor };
+    const my = String(fd.get('my_elo') || '').trim();
+    const opp = String(fd.get('opp_elo') || '').trim();
+    if (my) body.my_elo = Number(my);
+    if (opp) body.opp_elo = Number(opp);
+    const btn = form.querySelector('button[type="submit"]');
+    if (btn) btn.disabled = true;
+    try {
+      const res = await api('/api/opening/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      startOpeningSession(res);
+      drawOpening(app);
+    } catch (apiErr) {
+      if (isSessionError(apiErr)) { handleSessionExpired(); return; }
+      if (btn) btn.disabled = false;
+      if (err) { err.textContent = apiErr.message; err.style.display = 'block'; }
+    }
+  });
+
+  loadOpeningRecent(app);
+}
+
+function startOpeningSession(res) {
+  if (state.timers.opening) { clearInterval(state.timers.opening); state.timers.opening = null; }
+  state.openingSession = res;
+  state.openingLastReply = res.last_reply || null;
+  state.openingThinking = false;
+  state.openingAnalyzing = false;
+  state.openingJobId = null;
+  state.openingError = null;
+  state.openingFens = [OPENING_START_FEN];
+  if ((res.moves || []).length) state.openingFens.push(res.fen);
+}
+
+async function loadOpeningRecent(app) {
+  const box = document.getElementById('opening-recent');
+  if (!box) return;
+  let data;
+  try { data = await api('/api/opening?limit=10'); } catch { return; }
+  const sessions = (data && data.sessions) || [];
+  const rows = sessions.map(s => {
+    const st = s.status === 'analyzed' ? '<span class="badge badge-good">разобран</span>'
+      : s.status === 'done' ? '<span class="badge badge-blue">доигран</span>'
+        : '<span class="badge badge-neutral">в игре</span>';
+    return `<tr class="game-row" data-session="${esc(s.id)}">
+      <td>${st}</td>
+      <td>${esc(openingStyleLabel(s.style))}</td>
+      <td class="center">${s.color === 'black' ? '♚' : '♔'}</td>
+      <td class="num">${(s.moves || []).length} / ${s.plies}</td>
+      <td class="num">${s.my_elo != null ? s.my_elo : '—'} vs ${s.opp_elo != null ? s.opp_elo : '—'}</td>
+    </tr>`;
+  }).join('');
+  box.innerHTML = `
+    <div class="card">
+      <div class="card-header"><span class="card-title">Недавние партии</span></div>
+      ${sessions.length ? `<table class="table-wrap"><thead><tr><th>Статус</th><th>Стиль</th><th>Цвет</th><th class="num">Ходы</th><th class="num">Рейтинги</th></tr></thead><tbody>${rows}</tbody></table>` : '<p style="color:var(--c-text-muted);padding:8px">Пока нет партий — начни первую.</p>'}
+    </div>`;
+  box.querySelectorAll('.game-row').forEach(row => {
+    row.addEventListener('click', () => {
+      loadOpeningSession(app, row.dataset.session);
+    });
+  });
+}
+
+function drawOpening(app) {
+  const s = state.openingSession;
+  if (!s) { app.innerHTML = '<div class="card"><p>Загрузка...</p></div>'; return; }
+  const moves = s.moves || [];
+  const flip = s.color === 'black';
+  const finished = !!s.finished;
+  const yourTurn = !finished && s.turn === s.color;
+  const colorLabel = s.color === 'black' ? 'чёрные' : 'белые';
+  const report = s.report;
+
+  const engineNote = s.engine
+    ? `<span class="badge badge-neutral" title="движок соперника">движок: ${s.engine === 'maia2' ? 'Maia-2' : 'MaiaLite'}</span>`
+    : '';
+
+  let replyHtml = '';
+  const lr = state.openingLastReply;
+  if (lr && lr.san) {
+    replyHtml = `<div class="opening-reply">соперник: <span class="drill-san">${esc(lr.san)}</span>${lr.reason ? ` — <span style="color:var(--c-text-muted)">${esc(lr.reason)}</span>` : ''}</div>`;
+  }
+
+  let panel = '';
+  if (finished) {
+    if (s.status === 'analyzed' && report) {
+      panel = openingReportHtml(report);
+    } else {
+      const analyzing = state.openingAnalyzing;
+      panel = `
+        <div class="card">
+          <div class="card-header"><span class="card-title">Партия завершена</span><span class="badge badge-blue">${moves.length} / ${s.plies}</span></div>
+          <p style="color:var(--c-text-muted);font-size:13px;margin-top:0">Пройдено ${moves.length} полуходов. Запусти разбор — Stockfish + LLM соберут отчёт по дебюту.</p>
+          <button class="btn btn-primary" id="opening-analyze" ${analyzing ? 'disabled' : ''}>${analyzing ? 'Разбираю…' : 'Разобрать дебют'}</button>
+          <div id="opening-analysis-status" style="color:var(--c-text-muted);font-size:13px;margin-top:8px"></div>
+        </div>`;
+    }
+  } else {
+    panel = `
+      <div class="card">
+        <div class="card-header"><span class="card-title">Твой ход</span></div>
+        ${state.openingThinking
+          ? '<p style="color:var(--c-text-muted);font-size:13px;margin-top:0">соперник думает…</p>'
+          : yourTurn
+            ? '<p style="color:var(--c-text-muted);font-size:13px;margin-top:0">кликни фигуру, затем клетку — доска подсветит доступные поля</p>'
+            : '<p style="color:var(--c-text-muted);font-size:13px;margin-top:0">ждём соперника…</p>'}
+      </div>`;
+  }
+
+  app.innerHTML = `
+    <div class="card-header"><h1>Тренер дебютов</h1><span class="badge badge-blue">${esc(state.user.nick)}</span></div>
+    ${state.openingError ? `<div class="alert alert-error">${esc(state.openingError)}</div>` : ''}
+    <div class="grid game-layout">
+      <div class="card">
+        ${boardHtml(s.fen, openingHighlight(), flip)}
+        <div class="board-meta">
+          <span class="badge badge-neutral">${esc(openingStyleLabel(s.style))}</span>
+          <span class="badge badge-blue">ты: ${colorLabel}</span>
+          <span class="badge ${finished ? 'badge-good' : 'badge-neutral'}">${moves.length} / ${s.plies}</span>
+          ${engineNote}
+          ${state.openingThinking ? '<span class="badge badge-neutral">соперник думает…</span>' : ''}
+        </div>
+        ${replyHtml}
+        <div style="margin-top:12px"><button class="btn btn-secondary" id="opening-new">Новая партия</button></div>
+      </div>
+      <div class="game-side">
+        <div class="card">
+          <div class="card-header"><span class="card-title">Ходы</span></div>
+          <div class="moves-list">${openingMoveRowsHtml(moves)}</div>
+        </div>
+        ${panel}
+      </div>
+    </div>`;
+
+  const newBtn = document.getElementById('opening-new');
+  if (newBtn) newBtn.addEventListener('click', () => {
+    if (state.timers.opening) { clearInterval(state.timers.opening); state.timers.opening = null; }
+    state.openingSession = null;
+    state.openingFens = null;
+    state.openingLastReply = null;
+    state.openingError = null;
+    state.openingAnalyzing = false;
+    state.openingJobId = null;
+    viewOpening(app);
+  });
+  const analyzeBtn = document.getElementById('opening-analyze');
+  if (analyzeBtn) analyzeBtn.addEventListener('click', () => openingAnalyze(app));
+  if (state.openingAnalyzing && !state.timers.opening && state.openingJobId) {
+    openingPoll(app, state.openingJobId);
+  }
+  if (!finished && yourTurn && !state.openingThinking) {
+    bindOpeningBoard(app, s.id);
+  }
+}
+
+function bindOpeningBoard(app, sessionId) {
+  api('/api/opening/' + encodeURIComponent(sessionId) + '/legal').then(legal => {
+    const s = state.openingSession;
+    if (!s || s.id !== sessionId) return;
+    if (s.finished || s.turn !== s.color || state.openingThinking) return;
+    const moves = ((legal && legal.moves) || []).filter(m => m && m.from && m.to && m.san);
+    if (!moves.length) return;
+    const squares = app.querySelectorAll('.sq[data-square]');
+    if (!squares.length) return;
+    let selected = null;
+    const clearHl = () => squares.forEach(sq => sq.classList.remove('lm'));
+    squares.forEach(sq => {
+      sq.addEventListener('click', () => {
+        if (state.openingThinking || state.openingSession !== s || s.finished) return;
+        const sqName = sq.dataset.square;
+        if (selected) {
+          const cands = moves.filter(m => m.from === selected && m.to === sqName);
+          if (cands.length) {
+            const pick = cands.find(m => (m.san || '').includes('=Q')) || cands[0];
+            submitOpeningMove(app, pick.san);
+            return;
+          }
+        }
+        if (moves.some(m => m.from === sqName)) {
+          if (selected === sqName) { selected = null; clearHl(); return; }
+          selected = sqName;
+          clearHl();
+          const goals = new Set(moves.filter(m => m.from === sqName).map(m => m.to));
+          squares.forEach(el => {
+            if (el.dataset.square === sqName || goals.has(el.dataset.square)) el.classList.add('lm');
+          });
+          return;
+        }
+        selected = null;
+        clearHl();
+      });
+    });
+  }).catch(() => { /* доска недоступна — партию можно продолжить позже */ });
+}
+
+async function submitOpeningMove(app, san) {
+  const s = state.openingSession;
+  if (!s) return;
+  state.openingThinking = true;
+  state.openingError = null;
+  drawOpening(app);
+  try {
+    const res = await api('/api/opening/move', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: s.id, san }),
+    });
+    if (state.openingFens) state.openingFens.push(res.fen);
+    state.openingSession = res;
+    state.openingLastReply = res.last_reply || null;
+  } catch (err) {
+    if (isSessionError(err)) { handleSessionExpired(); return; }
+    state.openingError = err.message;
+  } finally {
+    state.openingThinking = false;
+    drawOpening(app);
+  }
+}
+
+async function openingAnalyze(app) {
+  const s = state.openingSession;
+  if (!s) return;
+  state.openingAnalyzing = true;
+  state.openingError = null;
+  drawOpening(app);
+  try {
+    const res = await api('/api/opening/analyze', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: s.id }),
+    });
+    state.openingJobId = res.job_id;
+    openingPoll(app, res.job_id);
+  } catch (err) {
+    if (isSessionError(err)) { handleSessionExpired(); return; }
+    state.openingAnalyzing = false;
+    state.openingJobId = null;
+    state.openingError = err.message;
+    drawOpening(app);
+  }
+}
+
+function openingPoll(app, jobId) {
+  if (state.timers.opening) clearInterval(state.timers.opening);
+  state.timers.opening = setInterval(async () => {
+    if (state.currentView !== 'opening') {
+      clearInterval(state.timers.opening);
+      state.timers.opening = null;
+      return;
+    }
+    let job;
+    try {
+      job = await api('/api/jobs/' + jobId);
+    } catch {
+      clearInterval(state.timers.opening);
+      state.timers.opening = null;
+      state.openingAnalyzing = false;
+      state.openingJobId = null;
+      state.openingError = 'Не удалось получить отчёт';
+      drawOpening(app);
+      return;
+    }
+    const status = document.getElementById('opening-analysis-status');
+    if (status) status.textContent = (job.phase || 'Анализ') + (job.total ? ` · ${job.done}/${job.total}` : '');
+    if (job.status === 'done') {
+      clearInterval(state.timers.opening);
+      state.timers.opening = null;
+      state.openingAnalyzing = false;
+      state.openingJobId = null;
+      await loadOpeningSession(app, state.openingSession.id);
+    } else if (job.status === 'error') {
+      clearInterval(state.timers.opening);
+      state.timers.opening = null;
+      state.openingAnalyzing = false;
+      state.openingJobId = null;
+      state.openingError = job.error || 'Не удалось получить отчёт';
+      drawOpening(app);
+    }
+  }, 800);
+}
+
+function openingReportHtml(report) {
+  const opening = report.opening || {};
+  const name = opening.name || '—';
+  const eco = opening.eco || '';
+  const moments = report.moments || [];
+  const kindBadge = k => k === 'good' ? 'badge-good' : k === 'bad' ? 'badge-bad' : 'badge-neutral';
+  const kindLabel = k => OPENING_KIND_RU[k] || (k ? esc(k) : '—');
+  const momentsHtml = moments.length ? moments.map(m => `
+    <div class="opening-report-moment">
+      <div>
+        <span class="drill-san">${esc(m.san || '—')}</span>
+        <span class="badge ${kindBadge(m.kind)}">${kindLabel(m.kind)}</span>
+        ${m.ply ? `<span style="color:var(--c-text-muted);font-size:12px">полуход ${esc(String(m.ply))}</span>` : ''}
+      </div>
+      ${m.text ? `<div style="margin-top:4px">${esc(m.text)}</div>` : ''}
+      ${m.better && m.better !== '—' ? `<div style="margin-top:2px;font-size:13px">лучше: <span class="drill-best">${esc(m.better)}</span></div>` : ''}
+    </div>`).join('') : '<p style="color:var(--c-text-muted)">Моментов нет.</p>';
+  return `
+    <div class="card">
+      <div class="card-header"><span class="card-title">Отчёт тренера</span><span class="badge badge-good">Stockfish + LLM</span></div>
+      <div style="font-size:15px;font-weight:600;margin-bottom:6px">${esc(name)}${eco ? ` <span class="badge badge-neutral">${esc(eco)}</span>` : ''}</div>
+      ${report.summary ? `<div class="mentor-reply">${esc(report.summary)}</div>` : ''}
+      <h3 style="font-size:14px;margin:12px 0 8px">Ключевые моменты</h3>
+      ${momentsHtml}
+      ${report.opponent ? `<h3 style="font-size:14px;margin:12px 0 6px">Соперник</h3><p style="margin:0">${esc(report.opponent)}</p>` : ''}
+      ${report.recommendation ? `<h3 style="font-size:14px;margin:12px 0 6px">Рекомендация</h3><p style="margin:0">${esc(report.recommendation)}</p>` : ''}
+    </div>`;
+}
+
 async function viewCoach(app) {
   if (!state.user) {
     app.innerHTML = '<div class="onboarding card"><div class="empty-icon">🔬</div><h1>Нет профиля</h1><p>Выбери профиль на странице Профили.</p></div>';
@@ -2418,6 +2907,7 @@ async function viewUsers(app) {
       gameId: null, gameData: null, task: null, taskKey: null, taskResult: null,
       taskRevealed: false, taskExplanation: null, planLlmJobId: null,
       planLlmGenerating: false, tool: 'repertoire', gamesFilter: 'all',
+      openingSession: null, openingFens: null, openingLastReply: null, openingJobId: null,
     });
     hideNav();
     renderUserbox();
