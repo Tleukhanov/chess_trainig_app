@@ -97,6 +97,25 @@ CREATE TABLE IF NOT EXISTS {table}(
 )
 """
 
+# Сессии «Тренера дебютов»: партия (до 40 полуходов) против Maia-2 плюс
+# отчёт LLM+Stockfish. moves/report — TEXT с JSON (как moves_json в games).
+_OPENING_SESSIONS_DDL = """
+CREATE TABLE IF NOT EXISTS {table}(
+    id TEXT PRIMARY KEY,
+    player TEXT NOT NULL,
+    my_elo INTEGER,
+    opp_elo INTEGER,
+    style TEXT,
+    color TEXT,
+    moves TEXT,
+    status TEXT,
+    result TEXT,
+    report TEXT,
+    created_at BIGINT,
+    updated_at BIGINT
+)
+"""
+
 _GAME_COLUMNS = (
     "id, player, rated, speed, created_at, status, winner, white, black, "
     "opening, eco, user_color, opponent, user_rating, user_rating_diff, "
@@ -152,6 +171,7 @@ _SCHEMA = f"""
 {_USERS_DDL.format(table="users")};
 {_META_DDL.format(table="meta")};
 {_TASK_EXPLANATIONS_DDL.format(table="task_explanations")};
+{_OPENING_SESSIONS_DDL.format(table="opening_sessions")};
 CREATE TABLE IF NOT EXISTS sessions(
     token TEXT PRIMARY KEY,
     nick TEXT,
@@ -160,6 +180,7 @@ CREATE TABLE IF NOT EXISTS sessions(
 );
 CREATE INDEX IF NOT EXISTS idx_games_player ON games(player);
 CREATE INDEX IF NOT EXISTS idx_task_explanations_player ON task_explanations(player);
+CREATE INDEX IF NOT EXISTS idx_opening_sessions_player ON opening_sessions(player, created_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_nick ON sessions(nick);
 """
 
@@ -268,6 +289,14 @@ def _row_to_game(row: Any) -> Game:
         result_for_user=row["result_for_user"] or "draw",
         link=link or None,
     )
+
+
+def _row_to_opening_session(row: Any) -> dict[str, Any]:
+    """Строка opening_sessions как dict с раскодированными moves/report."""
+    data = dict(row)
+    data["moves"] = _uj(data.get("moves")) or []
+    data["report"] = _uj(data.get("report"))
+    return data
 
 
 def _table_ddl(conn: Any, name: str) -> str:
@@ -917,6 +946,122 @@ class Database:
                 "explanation = excluded.explanation, "
                 "created_at = excluded.created_at",
                 (task_key, user, game_id, ply, explanation, int(time.time())),
+            )
+
+    # --- сессии «Тренера дебютов» ---
+
+    def save_opening_session(
+        self,
+        session_id: str,
+        player: str,
+        *,
+        my_elo: int | None = None,
+        opp_elo: int | None = None,
+        style: str | None = None,
+        color: str | None = None,
+        moves: list[str] | None = None,
+        status: str | None = None,
+        result: str | None = None,
+        report: dict[str, Any] | None = None,
+    ) -> None:
+        """Сохраняет (UPSERT по id) сессию тренажёра дебютов.
+
+        ``moves``/``report`` пишутся как JSON (совместимо с moves_json в games).
+        При обновлении ``created_at`` не затирается — двигается только
+        ``updated_at``.
+        """
+        now = int(time.time() * 1000)
+        with self._connection() as conn:
+            conn.execute(
+                "INSERT INTO opening_sessions"
+                "(id, player, my_elo, opp_elo, style, color, moves, status, "
+                "result, report, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET "
+                "player = excluded.player, "
+                "my_elo = excluded.my_elo, "
+                "opp_elo = excluded.opp_elo, "
+                "style = excluded.style, "
+                "color = excluded.color, "
+                "moves = excluded.moves, "
+                "status = excluded.status, "
+                "result = excluded.result, "
+                "report = excluded.report, "
+                "updated_at = excluded.updated_at",
+                (
+                    session_id,
+                    player,
+                    my_elo,
+                    opp_elo,
+                    style,
+                    color,
+                    _j(moves) if moves is not None else None,
+                    status,
+                    result,
+                    _j(report) if report is not None else None,
+                    now,
+                    now,
+                ),
+            )
+
+    def get_opening_session(self, session_id: str) -> dict[str, Any] | None:
+        """Сессия тренажёра дебютов по id (moves/report раскодированы) или None."""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM opening_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+        return _row_to_opening_session(row) if row else None
+
+    def get_opening_sessions(
+        self, player: str, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """Сессии игрока, самые новые первыми (по created_at DESC)."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM opening_sessions WHERE LOWER(player) = LOWER(?) "
+                "ORDER BY created_at DESC, id DESC LIMIT ?",
+                (player, limit),
+            ).fetchall()
+        return [_row_to_opening_session(row) for row in rows]
+
+    def update_opening_session(
+        self,
+        session_id: str,
+        *,
+        moves: list[str] | None = None,
+        status: str | None = None,
+        result: str | None = None,
+        report: dict[str, Any] | None = None,
+    ) -> None:
+        """Частичное обновление сессии: меняются только переданные поля.
+
+        Любое из ``moves``/``status``/``result``/``report`` равное None
+        означает «не трогать» (пустые список/словарь обновляют поле). Всегда
+        двигает ``updated_at``; отсутствующая сессия молча остаётся как есть.
+        """
+        fields: list[str] = []
+        values: list[Any] = []
+        if moves is not None:
+            fields.append("moves = ?")
+            values.append(_j(moves))
+        if status is not None:
+            fields.append("status = ?")
+            values.append(status)
+        if result is not None:
+            fields.append("result = ?")
+            values.append(result)
+        if report is not None:
+            fields.append("report = ?")
+            values.append(_j(report))
+        if not fields:
+            return
+        fields.append("updated_at = ?")
+        values.append(int(time.time() * 1000))
+        values.append(session_id)
+        with self._connection() as conn:
+            conn.execute(
+                f"UPDATE opening_sessions SET {', '.join(fields)} WHERE id = ?",
+                values,
             )
 
     def set_user_fide(self, nick: str, fide_id: str | None) -> None:
