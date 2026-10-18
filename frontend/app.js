@@ -1966,6 +1966,28 @@ async function openingAnalyze(app) {
   }
 }
 
+async function openingRecover(app, fallbackMessage) {
+  if (state.timers.opening) { clearInterval(state.timers.opening); state.timers.opening = null; }
+  state.openingAnalyzing = false;
+  state.openingJobId = null;
+  const s = state.openingSession;
+  if (s && s.id) {
+    try {
+      const fresh = await api('/api/opening/' + encodeURIComponent(s.id));
+      state.openingSession = fresh;
+      drawOpening(app);
+      if (fresh.report) return;
+      state.openingError = fallbackMessage;
+      drawOpening(app);
+      return;
+    } catch (err) {
+      if (isSessionError(err)) { handleSessionExpired(); return; }
+    }
+  }
+  state.openingError = 'Не удалось получить отчёт';
+  drawOpening(app);
+}
+
 function openingPoll(app, jobId) {
   if (state.timers.opening) clearInterval(state.timers.opening);
   state.timers.opening = setInterval(async () => {
@@ -1978,12 +2000,7 @@ function openingPoll(app, jobId) {
     try {
       job = await api('/api/jobs/' + jobId);
     } catch {
-      clearInterval(state.timers.opening);
-      state.timers.opening = null;
-      state.openingAnalyzing = false;
-      state.openingJobId = null;
-      state.openingError = 'Не удалось получить отчёт';
-      drawOpening(app);
+      await openingRecover(app, 'Анализ прерван — попробуй запустить разбор ещё раз');
       return;
     }
     const status = document.getElementById('opening-analysis-status');
@@ -1995,12 +2012,7 @@ function openingPoll(app, jobId) {
       state.openingJobId = null;
       await loadOpeningSession(app, state.openingSession.id);
     } else if (job.status === 'error') {
-      clearInterval(state.timers.opening);
-      state.timers.opening = null;
-      state.openingAnalyzing = false;
-      state.openingJobId = null;
-      state.openingError = job.error || 'Не удалось получить отчёт';
-      drawOpening(app);
+      await openingRecover(app, job.error || 'Анализ прерван — попробуй запустить разбор ещё раз');
     }
   }, 800);
 }
