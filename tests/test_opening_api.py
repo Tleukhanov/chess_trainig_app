@@ -19,7 +19,7 @@ from unittest.mock import MagicMock, patch
 import chess
 from fastapi.testclient import TestClient
 
-from app.api import _JOBS, create_api
+from app.api import _JOBS, _build_opening_report, create_api
 from app.db import Database
 from app.games import Game
 from app.openings import STYLES
@@ -620,6 +620,103 @@ class OpeningAnalyzeTests(OpeningApiTestBase):
             row = db.get_opening_session("s1")
         self.assertEqual(row["status"], "done")  # сессия не тронута
         self.assertIsNone(row["report"])
+
+    def test_analyze_retries_without_reasoning_on_empty(self):
+        """Пустой ответ reasoning-модели: повтор без reasoning даёт отчёт."""
+        self._register(self.client, "tester")
+        self._seed_session("s1", "tester", moves=_toggle_moves(40), status="done")
+        llm = MagicMock()
+        llm.chat.side_effect = [
+            RuntimeError(
+                "LLM: пустой ответ (finish_reason=length — модель потратила "
+                "лимит на размышление, увеличьте лимит токенов)"
+            ),
+            _REPORT_JSON,
+        ]
+        with patch("app.api.Engine", FakeEngine), \
+                patch("app.api._ensure_llm_key"), \
+                patch("app.api.LLMClient", return_value=llm):
+            job_id = self._analyze("s1")
+            job = self._wait_job(job_id)
+
+        self.assertEqual(job["status"], "done", job.get("error"))
+        report = job["result"]["report"]
+        self.assertEqual(report["summary"], "вышел из дебюта нормально")
+        self.assertEqual(llm.chat.call_count, 2)
+        first, second = llm.chat.call_args_list
+        self.assertTrue(first.kwargs.get("json_mode"))
+        self.assertIsNone(first.kwargs.get("reasoning_max_tokens"))
+        self.assertTrue(second.kwargs.get("json_mode"))
+        self.assertEqual(second.kwargs.get("reasoning_max_tokens"), 0)
+
+    def test_analyze_single_call_happy_path(self):
+        """Успешный ответ с первого раза: повтор не делается."""
+        self._register(self.client, "tester")
+        self._seed_session("s1", "tester", moves=_toggle_moves(40), status="done")
+        llm = MagicMock()
+        llm.chat.return_value = _REPORT_JSON
+        with patch("app.api.Engine", FakeEngine), \
+                patch("app.api._ensure_llm_key"), \
+                patch("app.api.LLMClient", return_value=llm):
+            job_id = self._analyze("s1")
+            job = self._wait_job(job_id)
+
+        self.assertEqual(job["status"], "done", job.get("error"))
+        self.assertEqual(llm.chat.call_count, 1)
+        self.assertEqual(
+            job["result"]["report"]["summary"], "вышел из дебюта нормально"
+        )
+
+    def test_analyze_both_attempts_fail_job_error(self):
+        """Оба вызова падают: job в error, сессия и отчёт не тронуты."""
+        self._register(self.client, "tester")
+        self._seed_session("s1", "tester", moves=_toggle_moves(40), status="done")
+        llm = MagicMock()
+        llm.chat.side_effect = RuntimeError(
+            "LLM: пустой ответ (finish_reason=length)"
+        )
+        with patch("app.api.Engine", FakeEngine), \
+                patch("app.api._ensure_llm_key"), \
+                patch("app.api.LLMClient", return_value=llm):
+            job_id = self._analyze("s1")
+            job = self._wait_job(job_id)
+
+        self.assertEqual(job["status"], "error")
+        self.assertEqual(llm.chat.call_count, 2)
+        with Database(self.db_path) as db:
+            db.init_db()
+            row = db.get_opening_session("s1")
+        self.assertEqual(row["status"], "done")
+        self.assertIsNone(row["report"])
+
+    def test_build_opening_report_retry_exhausted_raises(self):
+        """``_build_opening_report`` бросает RuntimeError, если повтор не помог."""
+        llm = MagicMock()
+        llm.chat.side_effect = RuntimeError("LLM: пустой ответ")
+        session = {
+            "color": "white",
+            "style": "universal",
+            "my_elo": 1500,
+            "opp_elo": 1600,
+        }
+        user_entries = [
+            {
+                "ply": 1,
+                "san": "e4",
+                "classification": "good",
+                "drop": 0.0,
+                "win_before": 50.0,
+                "win_after": 50.0,
+                "best": "e4",
+            }
+        ]
+        with patch("app.api._ensure_llm_key"), \
+                patch("app.api.LLMClient", return_value=llm):
+            with self.assertRaises(RuntimeError):
+                _build_opening_report(
+                    session, ["e4", "e5"], user_entries, ("Дебют", "C20"), {}
+                )
+        self.assertEqual(llm.chat.call_count, 2)
 
     def test_analyze_no_llm_key_job_error(self):
         self._register(self.client, "tester")

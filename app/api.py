@@ -839,6 +839,53 @@ def _normalize_opening_moments(
     return moments[:4]
 
 
+def _opening_report_llm(entry: dict[str, Any]) -> dict[str, Any]:
+    """LLM-отчёт по дебюту как JSON-словарь (с повтором без reasoning).
+
+    Reasoning-модели в ``json_mode`` могут истратить весь лимит токенов на
+    размышление и вернуть пустой ответ (``finish_reason=length``) — тогда
+    повторяем один раз с выключенным reasoning (``reasoning_max_tokens=0``)
+    и прямым запретом пошагового разбора. Если повтор не помог — ``RuntimeError``
+    (job уходит в error, частичный/мусорный отчёт в БД не пишется).
+    """
+    llm = LLMClient()
+    messages = _opening_analyze_messages(entry)
+    try:
+        text = clean_llm_text(llm.chat(messages, temperature=0.4, json_mode=True))
+        data = _extract_json(text) if isinstance(text, str) else None
+    except RuntimeError:
+        data = None
+    if isinstance(data, dict):
+        return data
+
+    retry = [
+        messages[0],
+        ChatMessage(
+            "user",
+            messages[1].content + "\nБез пошагового разбора. Сразу один JSON-объект.",
+        ),
+    ]
+    try:
+        second = clean_llm_text(
+            llm.chat(
+                retry,
+                temperature=0.4,
+                reasoning_max_tokens=0,
+                json_mode=True,
+            )
+        )
+        data = _extract_json(second) if isinstance(second, str) else None
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"LLM не вернул JSON-отчёт по дебюту (повтор без разбора не помог): {exc}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            "LLM не вернул JSON-отчёт по дебюту (повтор без разбора не помог)"
+        )
+    return data
+
+
 def _build_opening_report(
     session: dict[str, Any],
     moves: list[str],
@@ -867,13 +914,7 @@ def _build_opening_report(
         "user_entries": user_entries,
     }
     _ensure_llm_key()
-    llm = LLMClient()
-    text = llm.chat(
-        _opening_analyze_messages(entry), temperature=0.4, json_mode=True
-    )
-    data = _extract_json(text) if isinstance(text, str) else None
-    if not isinstance(data, dict):
-        raise RuntimeError("LLM не вернул JSON-отчёт по дебюту")
+    data = _opening_report_llm(entry)
     return {
         "opening": {"name": name or data.get("opening"), "eco": eco},
         "summary": data.get("summary"),
