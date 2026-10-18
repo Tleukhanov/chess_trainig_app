@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import secrets
 import threading
 import time
@@ -27,10 +28,11 @@ from typing import Any
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from . import data as shared_data
 from .analyzer import Engine
-from .coach import build_request, run_coach
+from .coach import _extract_json, build_request, run_coach
 from .config import settings
 from .db import Database, hash_password, verify_password
 from .drills import drills_to_json, drills_to_pgn
@@ -41,13 +43,26 @@ from .fide import (
     fetch_fide_player,
     fetch_fide_ratings,
 )
-from .games import fetch_lichess_rating, fetch_user_games
+from .games import Game, fetch_lichess_rating, fetch_user_games
 from .humanize import humanize_report
 from .llm import ChatMessage, LLMClient, _is_local_host, clean_llm_text, looks_like_refusal, looks_like_thinking
 from .maia import MaiaLitePolicy
 from .mentor import build_mentor_request, format_mentor_reply, run_mentor
 from .metrics import metric
 from .opponent import build_confrontations, build_opponent_profile
+from .openings import (
+    STYLE_DESCRIPTIONS_RU,
+    STYLE_LABELS_RU,
+    STYLES,
+    OpeningGame,
+    board_from_moves,
+    classify_opening,
+    is_finished,
+    new_game,
+    opponent_move,
+    result,
+    user_move,
+)
 from .paths import user_dir
 from .plan import build_plan
 from .progress import build_progress
@@ -564,6 +579,355 @@ def _run_task_explain_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -
         job.error = str(exc)
     finally:
         job.finished = time.time()
+
+# --- Тренер дебютов: сессии, соперник-политика, фоновый анализ --------------
+
+_OPENING_IN_PROGRESS = "in_progress"
+_OPENING_DONE = "done"
+_OPENING_ANALYZED = "analyzed"
+
+
+class OpeningStartBody(BaseModel):
+    """Тело POST /api/opening/start."""
+
+    style: str = ""
+    color: str = ""
+    opp_elo: int | None = None
+    my_elo: int | None = None
+
+
+class OpeningMoveBody(BaseModel):
+    """Тело POST /api/opening/move."""
+
+    session_id: str = ""
+    san: str = ""
+
+
+class OpeningAnalyzeBody(BaseModel):
+    """Тело POST /api/opening/analyze."""
+
+    session_id: str = ""
+
+
+def _opening_policy(opp_elo: int, my_elo: int) -> tuple[Any, str]:
+    """Политика соперника: Maia-2 ONNX, при отсутствии модели — MaiaLite.
+
+    Возвращает ``(policy, engine)``, где ``engine`` — ``"maia2"`` либо
+    ``"maia_lite"``. Отдельная функция — шов для тестов: они подменяют её
+    заглушкой и не поднимают ни модель, ни Stockfish.
+    """
+    try:
+        from .maia_onnx import get_policy
+
+        return get_policy(self_elo=opp_elo, opp_elo=my_elo), "maia2"
+    except RuntimeError:
+        policy = MaiaLitePolicy()
+        policy.__enter__()
+        return policy, "maia_lite"
+
+
+def _close_opening_policy(policy: Any, engine: str) -> None:
+    """Освобождает ресурсы фолбэка MaiaLite (у него свой процесс Stockfish).
+
+    Singleton Maia-2 не закрываем: его ONNX-сессия переиспользуется между
+    ходами, а память освобождает :func:`_unload_maia` перед анализом.
+    """
+    if engine != "maia_lite":
+        return
+    close = getattr(policy, "close", None)
+    if callable(close):
+        close()
+
+
+def _unload_maia() -> None:
+    """Memory guard: освобождает ONNX-сессию Maia перед запуском Stockfish.
+
+    В 512MB-контейнере (Heroku eco) Maia и Stockfish не должны жить вместе:
+    вызов идёт строго до создания :class:`Engine` в фоновом job'е.
+    """
+    try:
+        from . import maia_onnx
+
+        maia_onnx.unload()
+    except Exception:
+        pass
+
+
+def _opening_game_from_session(session: dict[str, Any]) -> OpeningGame:
+    """Восстанавливает :class:`OpeningGame` из строки ``opening_sessions``."""
+    return OpeningGame(
+        moves=list(session.get("moves") or []),
+        my_elo=int(session.get("my_elo") or settings.maia_default_elo),
+        opp_elo=int(session.get("opp_elo") or settings.maia_default_elo),
+        style=session.get("style") or "universal",
+        color=session.get("color") or "white",
+        plies=int(settings.opening_plies),
+    )
+
+
+def _opening_state(
+    session: dict[str, Any],
+    *,
+    engine: str | None = None,
+    last_reply: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Публичное состояние сессии для фронтенда (единый формат)."""
+    game = _opening_game_from_session(session)
+    board = board_from_moves(game.moves)
+    state: dict[str, Any] = {
+        "id": session.get("id"),
+        "status": session.get("status"),
+        "moves": list(game.moves),
+        "fen": board.fen(),
+        "turn": "white" if board.turn == chess.WHITE else "black",
+        "color": game.color,
+        "style": game.style,
+        "my_elo": game.my_elo,
+        "opp_elo": game.opp_elo,
+        "plies": game.plies,
+        "finished": is_finished(game),
+        "result": session.get("result"),
+        "report": session.get("report"),
+    }
+    if engine is not None:
+        state["engine"] = engine
+    if last_reply is not None:
+        state["last_reply"] = last_reply
+    return state
+
+
+def _opening_resolve_elos(
+    db: Database, nick: str, body: OpeningStartBody
+) -> tuple[int, int]:
+    """Резолвит ``(my_elo, opp_elo)``: явные значения или рейтинг игрока.
+
+    ``my_elo`` — живой рейтинг игрока (Lichess → последняя партия → 1500),
+    ``opp_elo`` — на 100 выше, если не задан явно.
+    """
+    level = _plan_player_level(db, nick)
+    rating = level.get("rating")
+    if not isinstance(rating, int) or isinstance(rating, bool) or rating <= 0:
+        rating = None
+    base = rating or settings.maia_default_elo
+    my_elo = body.my_elo if body.my_elo is not None else base
+    opp_elo = body.opp_elo if body.opp_elo is not None else base + 100
+    return int(my_elo), int(opp_elo)
+
+
+_OPENING_REPORT_SYSTEM = """Ты — шахматный тренер по дебюту для сильного любителя. Говори по-русски, коротко и конкретно.
+Опирайся ТОЛЬКО на переданные факты: ходы дебюта, оценки win%, классификации и лучшие ходы движка. НЕ выдумывай варианты, угрозы и оценки, которых нет в данных.
+Ответь строго одним JSON-объектом такой структуры:
+{
+  "summary": "краткий обзор: вышел ли ты из дебюта нормально (2-3 предложения)",
+  "opening": "название дебюта",
+  "moments": [
+    {"ply": <номер полухода>, "san": "<ход>", "kind": "good|better|bad", "text": "почему", "better": "<лучший ход или —>"}
+  ],
+  "opponent": "как играл соперник в заданном стиле (1-2 предложения)",
+  "recommendation": "что тренировать и по репертуару (1-2 предложения)"
+}
+В "moments" 2-4 хода: где ты сыграл хорошо, где мог сыграть лучше (и чем именно), где сыграл хуже. Только русский язык, без английского и без разбора по шагам."""
+
+
+def _opening_fmt_win(value: Any) -> str:
+    """Форматирует win% одним знаком или '—' для None/нечисла."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return "—"
+    return f"{float(value):.1f}"
+
+
+def _opening_user_entries(
+    analysis: dict[str, Any], user_color: str, plies: int
+) -> list[dict[str, Any]]:
+    """Ходы пользователя из анализа движка (в пределах дебюта ``plies``)."""
+    entries = (analysis.get("moves") or [])[:plies]
+    user_is_white = user_color == "white"
+    out: list[dict[str, Any]] = []
+    for ply, entry in enumerate(entries):
+        if (ply % 2 == 0) != user_is_white or not isinstance(entry, dict):
+            continue
+        out.append(
+            {
+                "ply": ply + 1,
+                "san": entry.get("san"),
+                "classification": entry.get("classification"),
+                "drop": entry.get("drop"),
+                "win_before": entry.get("win_before"),
+                "win_after": entry.get("win_after"),
+                "best": entry.get("best_move_san"),
+            }
+        )
+    return out
+
+
+def _opening_analyze_messages(entry: dict[str, Any]) -> list[ChatMessage]:
+    """Промпт LLM-отчёта по дебюту: факты построчно + требование JSON."""
+    lines = [
+        f"Дебют: {entry['opening_name'] or '—'} ({entry['eco'] or '—'}).",
+        f"Ты играл за {entry['color_ru']}; соперник — человеко-подобный стиль "
+        f"«{entry['style_label']}» ({entry['style_desc']}).",
+        f"Рейтинги: ты ~{entry['my_elo']}, соперник ~{entry['opp_elo']}. "
+        f"Сыграно полуходов: {entry['plies']}.",
+        "Ходы дебюта: " + (" ".join(entry["moves"]) or "—"),
+        "",
+        "Твои ходы (полуход, ход, win% до→после, потеря, классификация, лучший ход):",
+    ]
+    if entry["user_entries"]:
+        for item in entry["user_entries"]:
+            lines.append(
+                f"- {item['ply']}. {item['san']} — "
+                f"{_opening_fmt_win(item['win_before'])}→{_opening_fmt_win(item['win_after'])}, "
+                f"потеря {_opening_fmt_win(item['drop'])} ({item['classification'] or '—'}), "
+                f"лучше: {item['best'] or '—'}"
+            )
+    else:
+        lines.append("- (нет данных движка по ходам пользователя)")
+    lines.append("")
+    lines.append("Ответ — только JSON по заданной структуре.")
+    return [
+        ChatMessage("system", _OPENING_REPORT_SYSTEM),
+        ChatMessage("user", "\n".join(lines)),
+    ]
+
+
+def _normalize_opening_moments(
+    raw: Any, fallback_entries: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Нормализует моменты от LLM; без них — детерминированно из ошибок."""
+    moments: list[dict[str, Any]] = []
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            moments.append(
+                {
+                    "ply": item.get("ply"),
+                    "san": item.get("san"),
+                    "kind": item.get("kind"),
+                    "text": item.get("text"),
+                    "better": item.get("better"),
+                }
+            )
+    if not moments:
+        for item in fallback_entries:
+            if item["classification"] in ("blunder", "mistake", "inaccuracy"):
+                moments.append(
+                    {
+                        "ply": item["ply"],
+                        "san": item["san"],
+                        "kind": "bad" if item["classification"] == "blunder" else "better",
+                        "text": None,
+                        "better": item["best"],
+                    }
+                )
+    return moments[:4]
+
+
+def _build_opening_report(
+    session: dict[str, Any],
+    moves: list[str],
+    user_entries: list[dict[str, Any]],
+    opening: tuple[str | None, str | None],
+    analysis: dict[str, Any],
+) -> dict[str, Any]:
+    """Stockfish-анализ + LLM-отчёт в одном JSON (русский, как coach.py).
+
+    Бросает ``RuntimeError`` при сбое LLM — job уходит в error, сессия не
+    меняется (report в БД не пишется).
+    """
+    name, eco = opening
+    color = session.get("color") or "white"
+    style = session.get("style") or "universal"
+    entry = {
+        "opening_name": name,
+        "eco": eco,
+        "color_ru": "белые" if color == "white" else "чёрные",
+        "style_label": STYLE_LABELS_RU.get(style, style),
+        "style_desc": STYLE_DESCRIPTIONS_RU.get(style, ""),
+        "my_elo": session.get("my_elo"),
+        "opp_elo": session.get("opp_elo"),
+        "plies": len(moves),
+        "moves": moves,
+        "user_entries": user_entries,
+    }
+    _ensure_llm_key()
+    llm = LLMClient()
+    text = llm.chat(
+        _opening_analyze_messages(entry), temperature=0.4, json_mode=True
+    )
+    data = _extract_json(text) if isinstance(text, str) else None
+    if not isinstance(data, dict):
+        raise RuntimeError("LLM не вернул JSON-отчёт по дебюту")
+    return {
+        "opening": {"name": name or data.get("opening"), "eco": eco},
+        "summary": data.get("summary"),
+        "moments": _normalize_opening_moments(data.get("moments"), user_entries),
+        "opponent": data.get("opponent"),
+        "recommendation": data.get("recommendation"),
+        "style": style,
+        "my_elo": session.get("my_elo"),
+        "opp_elo": session.get("opp_elo"),
+        "engine": "stockfish",
+    }
+
+
+def _run_opening_analyze_job(
+    app: FastAPI, job: CoachJob, session_id: str
+) -> None:
+    """Фоновый поток: Maia off → Stockfish-анализ дебюта → LLM-отчёт (JSON)."""
+    try:
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            session = db.get_opening_session(session_id)
+        if session is None:
+            raise RuntimeError("Сессия тренажёра дебютов не найдена")
+        moves = list(session.get("moves") or [])
+        if not moves:
+            raise RuntimeError("Сессия пуста — анализировать нечего")
+
+        # Память на Eco не резиновая: Maia (ONNX ~179MB) и Stockfish вместе
+        # не помещаются, поэтому до подъёма движка освобождаем сессию Maia.
+        job.phase = "Освобождение Maia"
+        _unload_maia()
+
+        job.phase = "Анализ движком"
+        game = Game(
+            id=f"opening-{session_id}",
+            moves=moves,
+            user_color=session.get("color") or "white",
+            opponent="Maia",
+            result_for_user="draw",
+            status="normal",
+        )
+        with Engine(
+            depth=settings.stockfish_depth, multipv=settings.stockfish_multipv
+        ) as engine:
+            analysis = engine.analyze_game(game).summary()
+
+        user_entries = _opening_user_entries(
+            analysis, session.get("color") or "white", int(settings.opening_plies)
+        )
+        opening = classify_opening(moves)
+
+        job.phase = "Отчёт тренера"
+        report = _build_opening_report(
+            session, moves, user_entries, opening, analysis
+        )
+
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            db.update_opening_session(
+                session_id, report=report, status=_OPENING_ANALYZED
+            )
+        job.result = {"report": report}
+        job.summary = f"Отчёт по дебюту готов ({len(moves)} полуходов)"
+        job.status = "done"
+    except Exception as exc:
+        job.status = "error"
+        job.error = str(exc)
+    finally:
+        job.finished = time.time()
+
 
 # --- helpers ---------------------------------------------------------------
 
@@ -2559,6 +2923,172 @@ def create_api(
             "total_sec": int(site_sec + lichess_sec + manual_sec),
             "games_today": games_today,
         }
+
+    # --- Тренер дебютов: сессии и фоновая аналитика ---
+    def _opening_owned(db: Database, nick: str, session_id: str) -> dict | None:
+        """Сессия по id, только если она принадлежит ``nick`` (иначе None)."""
+        session = db.get_opening_session(session_id)
+        if session is None:
+            return None
+        if (session.get("player") or "").lower() != nick.lower():
+            return None
+        return session
+
+    @app.get("/api/opening/styles")
+    def api_opening_styles(request: Request):
+        user = _current_user(app.state.db_path, request)
+        if not user:
+            raise HTTPException(404, "No current user")
+        return {
+            "styles": [
+                {
+                    "key": key,
+                    "label": STYLE_LABELS_RU.get(key, key),
+                    "description": STYLE_DESCRIPTIONS_RU.get(key, ""),
+                }
+                for key in STYLES
+            ]
+        }
+
+    @app.post("/api/opening/start")
+    def api_opening_start(request: Request, body: OpeningStartBody):
+        user = _current_user(app.state.db_path, request)
+        if not user:
+            raise HTTPException(404, "No current user")
+        style = (body.style or "").strip()
+        if style not in STYLES:
+            raise HTTPException(400, f"Стиль: один из {', '.join(STYLES)}")
+        color = (body.color or "").strip()
+        if color not in ("white", "black"):
+            raise HTTPException(400, "Цвет: white или black")
+        for value in (body.opp_elo, body.my_elo):
+            if value is not None and value <= 0:
+                raise HTTPException(400, "Рейтинг: положительное число")
+
+        nick = user["nick"]
+        session_id = uuid.uuid4().hex
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            my_elo, opp_elo = _opening_resolve_elos(db, nick, body)
+            game = new_game(my_elo, opp_elo, style, color)
+            db.save_opening_session(
+                session_id,
+                nick,
+                my_elo=my_elo,
+                opp_elo=opp_elo,
+                style=style,
+                color=color,
+                moves=[],
+                status=_OPENING_IN_PROGRESS,
+            )
+
+        engine_name: str | None = None
+        last_reply: dict[str, Any] | None = None
+        if game.color == "black":
+            # Соперник — белые: его первый ход считаем сразу и сохраняем.
+            policy, engine_name = _opening_policy(opp_elo, my_elo)
+            try:
+                san, reason = opponent_move(game, policy, rng=random.Random())
+            finally:
+                _close_opening_policy(policy, engine_name)
+            last_reply = {"san": san, "reason": reason}
+            with Database(app.state.db_path) as db:
+                db.init_db()
+                db.update_opening_session(session_id, moves=game.moves)
+
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            session = db.get_opening_session(session_id)
+        return _opening_state(session, engine=engine_name, last_reply=last_reply)
+
+    @app.post("/api/opening/move")
+    def api_opening_move(request: Request, body: OpeningMoveBody):
+        user = _current_user(app.state.db_path, request)
+        if not user:
+            raise HTTPException(404, "No current user")
+        nick = user["nick"]
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            session = _opening_owned(db, nick, body.session_id)
+        if session is None:
+            raise HTTPException(404, "Сессия не найдена")
+        if session.get("status") != _OPENING_IN_PROGRESS:
+            raise HTTPException(400, "Партия уже завершена")
+
+        game = _opening_game_from_session(session)
+        try:
+            user_move(game, (body.san or "").strip())
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+        # Ответ соперника считаем синхронно: Maia ~17мс, фоновый job не нужен.
+        last_reply: dict[str, Any] | None = None
+        engine_name: str | None = None
+        if not is_finished(game):
+            policy, engine_name = _opening_policy(game.opp_elo, game.my_elo)
+            try:
+                san, reason = opponent_move(game, policy, rng=random.Random())
+            finally:
+                _close_opening_policy(policy, engine_name)
+            last_reply = {"san": san, "reason": reason}
+
+        finished = is_finished(game)
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            kwargs: dict[str, Any] = {
+                "moves": game.moves,
+                "status": _OPENING_DONE if finished else _OPENING_IN_PROGRESS,
+            }
+            if finished:
+                kwargs["result"] = result(game)
+            db.update_opening_session(body.session_id, **kwargs)
+            session = db.get_opening_session(body.session_id)
+        return _opening_state(session, engine=engine_name, last_reply=last_reply)
+
+    @app.post("/api/opening/analyze")
+    def api_opening_analyze(request: Request, body: OpeningAnalyzeBody):
+        user = _current_user(app.state.db_path, request)
+        if not user:
+            raise HTTPException(404, "No current user")
+        nick = user["nick"]
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            session = _opening_owned(db, nick, body.session_id)
+        if session is None:
+            raise HTTPException(404, "Сессия не найдена")
+        if session.get("status") not in (_OPENING_DONE, _OPENING_ANALYZED):
+            raise HTTPException(400, "Сначала доиграй партию")
+        _check_job_limits(nick)
+        job = CoachJob(id=uuid.uuid4().hex, user=nick, phase="Анализ дебюта")
+        _register_job(job)
+        threading.Thread(
+            target=_run_opening_analyze_job,
+            args=(app, job, body.session_id),
+            daemon=True,
+        ).start()
+        return {"job_id": job.id, "status": "started"}
+
+    @app.get("/api/opening")
+    def api_opening_list(request: Request, limit: int = 20):
+        user = _current_user(app.state.db_path, request)
+        if not user:
+            raise HTTPException(404, "No current user")
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            sessions = db.get_opening_sessions(user["nick"], limit)
+        return {"sessions": [_opening_state(s) for s in sessions]}
+
+    @app.get("/api/opening/{session_id}")
+    def api_opening_get(session_id: str, request: Request):
+        user = _current_user(app.state.db_path, request)
+        if not user:
+            raise HTTPException(404, "No current user")
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            session = _opening_owned(db, user["nick"], session_id)
+        if session is None:
+            raise HTTPException(404, "Сессия не найдена")
+        return _opening_state(session)
 
     # --- Auth: регистрация и вход (логин+пароль+lichess) ---
     @app.post("/api/auth/register")
