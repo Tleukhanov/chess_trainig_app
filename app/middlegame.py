@@ -514,7 +514,8 @@ def build_report_prompt(
         "- summary: почему план хорош или плох и что игрок доказал ходами.",
         "- plan_comment: разбор плана по пунктам — что верно, что и как "
         "скорректировать.",
-        "- moments: 3–5 ключевых моментов; ply — номер полухода с 1, "
+        "- moments: 1–5 ключевых моментов; ply — ОБЯЗАТЕЛЬНО номер "
+        "сыгранного полухода из списка выше (не выдумывай несыгранные ходы); "
         "move_san — ход в SAN, alt_san — лучшая альтернатива или null.",
         "- lesson: один практический вывод, который можно применить в "
         "следующей партии.",
@@ -606,6 +607,46 @@ def normalize_report(raw: dict[str, Any]) -> dict[str, Any]:
             data.get("lesson"), "Практический вывод не сформирован."
         ),
     }
+
+
+def ground_report(
+    report: dict[str, Any], engine_facts: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Привязывает моменты отчёта к реальным ходам и оценкам Stockfish.
+
+    LLM иногда добавляет «моменты» для несыгранных полуходов или придумывает
+    оценки. Факты движка — источник истины: момент без факта отбрасывается,
+    SAN и ``eval_before``/``eval_after`` подставляются из фактов.
+    """
+    data = report if isinstance(report, dict) else {}
+    facts = _facts_by_ply(engine_facts)
+    moments: list[dict[str, Any]] = []
+    for item in data.get("moments") or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            ply = int(item.get("ply"))
+        except (TypeError, ValueError):
+            continue
+        fact = facts.get(ply)
+        if fact is None:
+            continue
+        before = fact.get("eval_before", fact.get("before"))
+        after = fact.get("eval_after", fact.get("after"))
+        moments.append(
+            {
+                "ply": ply,
+                "move_san": _clean_text(fact.get("san")),
+                "title": _clean_text(item.get("title")),
+                "comment": _clean_text(item.get("comment")),
+                "alt_san": _optional_text(item.get("alt_san")),
+                "eval_before": _format_eval(before) if before is not None else None,
+                "eval_after": _format_eval(after) if after is not None else None,
+            }
+        )
+    grounded = dict(data)
+    grounded["moments"] = moments
+    return grounded
 
 
 def new_session_id() -> str:

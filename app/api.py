@@ -915,51 +915,61 @@ def _normalize_opening_moments(
     return moments[:4]
 
 
-def _opening_report_llm(entry: dict[str, Any]) -> dict[str, Any]:
-    """LLM-отчёт по дебюту как JSON-словарь (с повтором без reasoning).
+def _llm_json_with_retries(
+    messages: list[ChatMessage], *, error_prefix: str
+) -> dict[str, Any]:
+    """JSON-ответ LLM с тремя попытками.
 
-    Reasoning-модели в ``json_mode`` могут истратить весь лимит токенов на
-    размышление и вернуть пустой ответ (``finish_reason=length``) — тогда
-    повторяем один раз с выключенным reasoning (``reasoning_max_tokens=0``)
-    и прямым запретом пошагового разбора. Если повтор не помог — ``RuntimeError``
-    (job уходит в error, частичный/мусорный отчёт в БД не пишется).
+    Free-модели в ``json_mode`` иногда истрачивают весь лимит на reasoning и
+    возвращают пустоту (``finish_reason=length``), а отключение reasoning у
+    провайдера тоже может не сработать. Порядок: обычный запрос → без reasoning
+    → снова обычный с жёстким запретом текста вокруг JSON.
     """
     llm = LLMClient()
-    messages = _opening_analyze_messages(entry)
-    try:
-        text = clean_llm_text(llm.chat(messages, temperature=0.4, json_mode=True))
-        data = _extract_json(text) if isinstance(text, str) else None
-    except RuntimeError:
-        data = None
-    if isinstance(data, dict):
-        return data
-
-    retry = [
-        messages[0],
-        ChatMessage(
-            "user",
-            messages[1].content + "\nБез пошагового разбора. Сразу один JSON-объект.",
+    user_hint = "\nБез пошагового разбора. Сразу один JSON-объект."
+    strict_hint = (
+        "\nОтветь ТОЛЬКО валидным JSON-объектом: без markdown, "
+        "без текста до и после."
+    )
+    last = messages[-1]
+    attempts: list[tuple[list[ChatMessage], dict[str, Any]]] = [
+        (messages, {}),
+        (
+            messages[:-1] + [ChatMessage("user", last.content + user_hint)],
+            {"reasoning_max_tokens": 0},
+        ),
+        (
+            messages[:-1] + [ChatMessage("user", last.content + strict_hint)],
+            {},
         ),
     ]
-    try:
-        second = clean_llm_text(
-            llm.chat(
-                retry,
-                temperature=0.4,
-                reasoning_max_tokens=0,
-                json_mode=True,
+    last_error: RuntimeError | None = None
+    for attempt_messages, kwargs in attempts:
+        try:
+            text = clean_llm_text(
+                llm.chat(
+                    attempt_messages,
+                    temperature=0.4,
+                    json_mode=True,
+                    **kwargs,
+                )
             )
-        )
-        data = _extract_json(second) if isinstance(second, str) else None
-    except RuntimeError as exc:
-        raise RuntimeError(
-            f"LLM не вернул JSON-отчёт по дебюту (повтор без разбора не помог): {exc}"
-        ) from exc
-    if not isinstance(data, dict):
-        raise RuntimeError(
-            "LLM не вернул JSON-отчёт по дебюту (повтор без разбора не помог)"
-        )
-    return data
+            data = _extract_json(text) if isinstance(text, str) else None
+        except RuntimeError as exc:
+            last_error = exc
+            continue
+        if isinstance(data, dict):
+            return data
+    detail = f" (последняя ошибка: {last_error})" if last_error else ""
+    raise RuntimeError(f"{error_prefix}: 3 попытки не дали JSON{detail}")
+
+
+def _opening_report_llm(entry: dict[str, Any]) -> dict[str, Any]:
+    """LLM-отчёт по дебюту как JSON-словарь (3 попытки, см. хелпер)."""
+    return _llm_json_with_retries(
+        _opening_analyze_messages(entry),
+        error_prefix="LLM не вернул JSON-отчёт по дебюту",
+    )
 
 
 def _build_opening_report(
@@ -1189,45 +1199,12 @@ def _middlegame_engine_facts(session: mg.MiddlegameSession) -> list[dict[str, An
 
 
 def _middlegame_report_llm(prompt: str) -> dict[str, Any]:
-    """LLM-отчёт по миттельшпилю (с повтором без reasoning, как у дебютов)."""
+    """LLM-отчёт по миттельшпилю (3 попытки, см. хелпер)."""
     _ensure_llm_key()
-    llm = LLMClient()
-    messages = [ChatMessage("user", prompt)]
-    try:
-        text = clean_llm_text(llm.chat(messages, temperature=0.4, json_mode=True))
-        data = _extract_json(text) if isinstance(text, str) else None
-    except RuntimeError:
-        data = None
-    if isinstance(data, dict):
-        return data
-
-    retry = [
-        ChatMessage(
-            "user",
-            prompt + "\nБез пошагового разбора. Сразу один JSON-объект.",
-        )
-    ]
-    try:
-        second = clean_llm_text(
-            llm.chat(
-                retry,
-                temperature=0.4,
-                reasoning_max_tokens=0,
-                json_mode=True,
-            )
-        )
-        data = _extract_json(second) if isinstance(second, str) else None
-    except RuntimeError as exc:
-        raise RuntimeError(
-            "LLM не вернул JSON-отчёт по миттельшпилю "
-            f"(повтор без разбора не помог): {exc}"
-        ) from exc
-    if not isinstance(data, dict):
-        raise RuntimeError(
-            "LLM не вернул JSON-отчёт по миттельшпилю "
-            "(повтор без разбора не помог)"
-        )
-    return data
+    return _llm_json_with_retries(
+        [ChatMessage("user", prompt)],
+        error_prefix="LLM не вернул JSON-отчёт по миттельшпилю",
+    )
 
 
 def _run_middlegame_analyze_job(
@@ -1259,7 +1236,9 @@ def _run_middlegame_analyze_job(
             engine_facts=engine_facts,
             position=mg.POSITION_BY_KEY.get(session.position_key),
         )
-        report = mg.normalize_report(_middlegame_report_llm(prompt))
+        report = mg.ground_report(
+            mg.normalize_report(_middlegame_report_llm(prompt)), engine_facts
+        )
 
         with Database(app.state.db_path) as db:
             db.init_db()

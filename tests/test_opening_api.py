@@ -652,6 +652,29 @@ class OpeningAnalyzeTests(OpeningApiTestBase):
         self.assertTrue(second.kwargs.get("json_mode"))
         self.assertEqual(second.kwargs.get("reasoning_max_tokens"), 0)
 
+    def test_analyze_third_attempt_without_hints_succeeds(self):
+        """Повтор без reasoning тоже пустой: третья обычная попытка спасает."""
+        self._register(self.client, "tester")
+        self._seed_session("s1", "tester", moves=_toggle_moves(40), status="done")
+        llm = MagicMock()
+        llm.chat.side_effect = [
+            RuntimeError("LLM: пустой ответ (finish_reason=length)"),
+            RuntimeError("LLM: пустой ответ (finish_reason=length)"),
+            _REPORT_JSON,
+        ]
+        with patch("app.api.Engine", FakeEngine), \
+                patch("app.api._ensure_llm_key"), \
+                patch("app.api.LLMClient", return_value=llm):
+            job_id = self._analyze("s1")
+            job = self._wait_job(job_id)
+
+        self.assertEqual(job["status"], "done", job.get("error"))
+        self.assertEqual(job["result"]["report"]["summary"],
+                         "вышел из дебюта нормально")
+        self.assertEqual(llm.chat.call_count, 3)
+        third = llm.chat.call_args_list[2]
+        self.assertIsNone(third.kwargs.get("reasoning_max_tokens"))
+
     def test_analyze_single_call_happy_path(self):
         """Успешный ответ с первого раза: повтор не делается."""
         self._register(self.client, "tester")
@@ -670,8 +693,8 @@ class OpeningAnalyzeTests(OpeningApiTestBase):
             job["result"]["report"]["summary"], "вышел из дебюта нормально"
         )
 
-    def test_analyze_both_attempts_fail_job_error(self):
-        """Оба вызова падают: job в error, сессия и отчёт не тронуты."""
+    def test_analyze_all_attempts_fail_job_error(self):
+        """Все три вызова падают: job в error, сессия и отчёт не тронуты."""
         self._register(self.client, "tester")
         self._seed_session("s1", "tester", moves=_toggle_moves(40), status="done")
         llm = MagicMock()
@@ -685,7 +708,7 @@ class OpeningAnalyzeTests(OpeningApiTestBase):
             job = self._wait_job(job_id)
 
         self.assertEqual(job["status"], "error")
-        self.assertEqual(llm.chat.call_count, 2)
+        self.assertEqual(llm.chat.call_count, 3)
         with Database(self.db_path) as db:
             db.init_db()
             row = db.get_opening_session("s1")
@@ -693,7 +716,7 @@ class OpeningAnalyzeTests(OpeningApiTestBase):
         self.assertIsNone(row["report"])
 
     def test_build_opening_report_retry_exhausted_raises(self):
-        """``_build_opening_report`` бросает RuntimeError, если повтор не помог."""
+        """``_build_opening_report`` бросает RuntimeError, если все попытки пусты."""
         llm = MagicMock()
         llm.chat.side_effect = RuntimeError("LLM: пустой ответ")
         session = {
@@ -719,7 +742,7 @@ class OpeningAnalyzeTests(OpeningApiTestBase):
                 _build_opening_report(
                     session, ["e4", "e5"], user_entries, ("Дебют", "C20"), {}
                 )
-        self.assertEqual(llm.chat.call_count, 2)
+        self.assertEqual(llm.chat.call_count, 3)
 
     def test_analyze_no_llm_key_job_error(self):
         self._register(self.client, "tester")

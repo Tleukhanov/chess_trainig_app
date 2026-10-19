@@ -23,6 +23,7 @@ from app.middlegame import (
     apply_user_move,
     board_of,
     build_report_prompt,
+    ground_report,
     legal_moves,
     need_reply,
     new_session_id,
@@ -279,6 +280,66 @@ class ReportTests(unittest.TestCase):
         self.assertIsNone(first["eval_after"])
         self.assertEqual(report["moments"][1]["ply"], 0)
         self.assertEqual(report["moments"][1]["move_san"], "e4")
+
+    def test_ground_report_keeps_played_moves_and_uses_facts(self) -> None:
+        report = normalize_report(
+            {
+                "verdict": "partial",
+                "moments": [
+                    {
+                        "ply": 1,
+                        "move_san": "Qxc2",
+                        "title": "Точный ход",
+                        "comment": "комментарий",
+                        "alt_san": "Ba3",
+                        "eval_before": "+9.99",
+                        "eval_after": "+9.99",
+                    },
+                    {
+                        "ply": 3,
+                        "move_san": "Ba3",
+                        "title": "Несыгранный ход",
+                        "comment": "должен исчезнуть",
+                    },
+                ],
+                "lesson": "вывод",
+            }
+        )
+        facts = [
+            {
+                "ply": 1,
+                "san": "Qxc2",
+                "uci": "d1c2",
+                "eval_before": {"cp": -107.0, "mate": None},
+                "eval_after": {"cp": -129.0, "mate": None},
+                "delta": 1.93,
+                "best_san": "Qxc2",
+            }
+        ]
+        grounded = ground_report(report, facts)
+        self.assertEqual(len(grounded["moments"]), 1)
+        moment = grounded["moments"][0]
+        self.assertEqual(moment["ply"], 1)
+        self.assertEqual(moment["move_san"], "Qxc2")
+        self.assertEqual(moment["eval_before"], "-1.07")
+        self.assertEqual(moment["eval_after"], "-1.29")
+        self.assertEqual(moment["alt_san"], "Ba3")
+        self.assertEqual(grounded["lesson"], "вывод")
+        self.assertEqual(report["moments"][1]["title"], "Несыгранный ход")
+
+    def test_ground_report_maps_eval_mate(self) -> None:
+        report = normalize_report({"moments": [{"ply": 1, "move_san": "Qh6#"}]})
+        facts = [
+            {
+                "ply": 1,
+                "san": "Qh6#",
+                "eval_before": {"cp": 500, "mate": None},
+                "eval_after": {"cp": None, "mate": 1},
+            }
+        ]
+        moment = ground_report(report, facts)["moments"][0]
+        self.assertEqual(moment["eval_before"], "+5.00")
+        self.assertEqual(moment["eval_after"], "#+1")
 
     def test_build_report_prompt_contains_context_and_schema(self) -> None:
         session = _session()

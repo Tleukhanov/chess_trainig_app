@@ -517,7 +517,9 @@ class MiddlegameAnalyzeTests(MiddlegameApiTestBase):
         report = job["result"]["report"]
         self.assertEqual(report["verdict"], "good")
         self.assertEqual(report["summary"], "План был верным, линия c вскрыта.")
-        self.assertEqual(report["moments"][0]["move_san"], "Nf3")
+        self.assertEqual(report["moments"][0]["move_san"], facts[0]["san"])
+        self.assertEqual(report["moments"][0]["eval_before"], "+0.20")
+        self.assertEqual(report["moments"][0]["eval_after"], "-0.20")
         self.assertEqual(len(facts), 6)
         for fact in facts:
             self.assertEqual(
@@ -552,6 +554,25 @@ class MiddlegameAnalyzeTests(MiddlegameApiTestBase):
         self.assertEqual(snapshot.json()["status"], "done")
         self.assertEqual(snapshot.json()["result"]["report"]["verdict"], "good")
 
+    def test_analyze_drops_moments_for_unplayed_moves(self):
+        self._register(self.client, "tester")
+        self._seed_session("s1", "tester", plies=4)
+        data = json.loads(_REPORT_JSON)
+        data["moments"].append(
+            {"ply": 99, "move_san": "Qh8#", "title": "фантом", "comment": "нет"}
+        )
+        llm = MagicMock()
+        llm.chat.return_value = json.dumps(data, ensure_ascii=False)
+        with patch("app.api.Engine", FakeEngine), \
+                patch("app.api.LLMClient", return_value=llm), \
+                patch("app.api._unload_maia"):
+            job = self._wait_job(self._analyze("s1"))
+
+        self.assertEqual(job["status"], "done", job.get("error"))
+        moments = job["result"]["report"]["moments"]
+        self.assertEqual(len(moments), 1)
+        self.assertEqual(moments[0]["ply"], 1)
+
     def test_analyze_retries_without_reasoning(self):
         self._register(self.client, "tester")
         self._seed_session("s1", "tester", plies=4)
@@ -572,6 +593,27 @@ class MiddlegameAnalyzeTests(MiddlegameApiTestBase):
         self.assertIsNone(first.kwargs.get("reasoning_max_tokens"))
         self.assertTrue(second.kwargs.get("json_mode"))
         self.assertEqual(second.kwargs.get("reasoning_max_tokens"), 0)
+
+    def test_analyze_third_attempt_without_hints_succeeds(self):
+        """Повтор без reasoning тоже пустой: третья обычная попытка спасает."""
+        self._register(self.client, "tester")
+        self._seed_session("s1", "tester", plies=4)
+        llm = MagicMock()
+        llm.chat.side_effect = [
+            RuntimeError("LLM: пустой ответ (finish_reason=length)"),
+            RuntimeError("LLM: пустой ответ (finish_reason=length)"),
+            _REPORT_JSON,
+        ]
+        with patch("app.api.Engine", FakeEngine), \
+                patch("app.api.LLMClient", return_value=llm), \
+                patch("app.api._unload_maia"):
+            job = self._wait_job(self._analyze("s1"))
+
+        self.assertEqual(job["status"], "done", job.get("error"))
+        self.assertEqual(job["result"]["report"]["verdict"], "good")
+        self.assertEqual(llm.chat.call_count, 3)
+        third = llm.chat.call_args_list[2]
+        self.assertIsNone(third.kwargs.get("reasoning_max_tokens"))
 
     def test_analyze_llm_failure_keeps_session(self):
         self._register(self.client, "tester")
