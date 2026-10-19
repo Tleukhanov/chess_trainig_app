@@ -255,9 +255,10 @@ h3 { font-size: 15px; font-weight: 600; margin-top: 16px; }
   cursor: pointer;
   text-decoration: none;
   white-space: nowrap;
-  transition: background 0.15s, color 0.15s, border-color 0.15s;
+  transition: background 0.15s, color 0.15s, border-color 0.15s, transform 0.06s, box-shadow 0.15s;
 }
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn:active:not(:disabled) { transform: translateY(1px) scale(0.99); filter: brightness(0.95); }
 .btn-primary { background: var(--c-btn-primary); color: var(--c-btn-primary-text); }
 .btn-primary:hover:not(:disabled) { background: var(--c-btn-primary-hover); color: var(--c-btn-primary-text); text-decoration: none; }
 .btn-secondary { background: var(--c-btn-secondary-bg); color: var(--c-btn-secondary-text); border: 1px solid var(--c-border); }
@@ -390,7 +391,14 @@ td.center { text-align: center; }
 
 /* Games (просмотр партий) */
 .games-filter { display: flex; gap: 8px; flex-wrap: wrap; }
-.btn-active { outline: 2px solid var(--c-link); outline-offset: 1px; }
+.btn.btn-active,
+.btn.btn-active:hover:not(:disabled),
+.btn.btn-active:focus {
+  background: var(--c-btn-primary);
+  color: var(--c-btn-primary-text);
+  border-color: var(--c-btn-primary);
+  box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.25);
+}
 .game-row { cursor: pointer; }
 
 .game-layout { grid-template-columns: repeat(auto-fit, minmax(320px, 460px)); }

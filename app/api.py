@@ -2143,7 +2143,7 @@ def create_api(
     db_path: Path | None = None,
     data_dir: Path | None = None,
 ) -> FastAPI:
-    app = FastAPI(title="Chess Trainer API", version="0.4.6", docs_url="/api/docs", redoc_url=None)
+    app = FastAPI(title="Chess Trainer API", version="0.4.7", docs_url="/api/docs", redoc_url=None)
     app.state.db_path = Path(db_path) if db_path else settings.db_path
     app.state.data_dir = Path(data_dir) if data_dir else settings.data_dir
 

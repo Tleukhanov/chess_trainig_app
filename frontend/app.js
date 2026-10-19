@@ -1679,6 +1679,7 @@ async function drawOpeningSetup(app, errorMsg) {
   });
   app.querySelectorAll('#opening-form [data-opp]').forEach(btn => {
     btn.addEventListener('click', () => {
+      app.querySelectorAll('#opening-form [data-opp]').forEach(b => b.classList.toggle('btn-active', b === btn));
       const my = document.getElementById('opening-my-elo');
       const opp = document.getElementById('opening-opp-elo');
       const base = Number(my && my.value) || 1500;
