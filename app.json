@@ -21,16 +21,24 @@
       "value": "/usr/games/stockfish"
     },
     "STOCKFISH_HASH_MB": {
-      "description": "Stockfish hash size in MB (free dyno has 512MB RAM).",
-      "value": "128"
+      "description": "Stockfish hash size in MB (eco dyno has 512MB RAM).",
+      "value": "32"
     },
     "STOCKFISH_THREADS": {
-      "description": "Stockfish threads (free dyno is CPU-limited).",
-      "value": "2"
+      "description": "Stockfish threads (eco dyno is CPU/memory-limited).",
+      "value": "1"
     },
     "STOCKFISH_TIME_MS": {
       "description": "Stockfish time limit per position in ms.",
-      "value": "1500"
+      "value": "800"
+    },
+    "STOCKFISH_DEPTH": {
+      "description": "Stockfish analysis depth (kept low for the 512MB eco dyno).",
+      "value": "12"
+    },
+    "STOCKFISH_MULTIPV": {
+      "description": "Stockfish MultiPV lines (1 keeps memory/latency low on eco).",
+      "value": "1"
     },
     "MAIA_AUTO_FETCH": {
       "description": "Auto-download the Maia-2 ONNX model + vocab on first opening-trainer use (Heroku eco has an ephemeral disk).",

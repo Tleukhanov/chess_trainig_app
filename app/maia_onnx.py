@@ -49,6 +49,7 @@ __all__ = [
     "rank_moves",
     "get_policy",
     "unload",
+    "release_memory",
 ]
 
 CHANNELS = 18
@@ -68,6 +69,26 @@ _PIECE_CHANNEL = {
 }
 
 _PROVIDERS = ["CPUExecutionProvider"]
+
+
+def release_memory() -> None:
+    """Best-effort возврат памяти ОС: сборка мусора + ``malloc_trim`` на Linux.
+
+    На Heroku (glibc) освобождённая ONNX-сессия не сразу отдаётся ОС, поэтому
+    после сброса сессии зовём ``libc.malloc_trim(0)`` через ``ctypes``. Любая
+    ошибка (в т.ч. отсутствие ``libc.so.6`` на Windows/musl) молча
+    игнорируется — функция не должна падать.
+    """
+    try:
+        gc.collect()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import ctypes
+
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -303,7 +324,7 @@ class MaiaOnnxPolicy:
         """Освобождает ONNX-сессию (RAM возвращается ОС)."""
         with self._lock:
             self._session = None
-        gc.collect()
+        release_memory()
 
     # -- кодирование позиции --------------------------------------------- #
     def _legal_moves(self, board: chess.Board) -> list[tuple[int, chess.Move]]:
@@ -460,7 +481,11 @@ def get_policy(
 
 
 def unload() -> None:
-    """Сбрасывает singleton и освобождает ONNX-сессию (guard перед Stockfish)."""
+    """Сбрасывает singleton и освобождает ONNX-сессию (guard перед Stockfish).
+
+    После сброса дополнительно зовём :func:`release_memory`
+    (``gc.collect`` + ``malloc_trim``), чтобы реально отдать память ОС.
+    """
     global _POLICY, _POLICY_KEY
     with _POLICY_LOCK:
         policy = _POLICY
@@ -468,3 +493,4 @@ def unload() -> None:
         _POLICY_KEY = None
     if policy is not None:
         policy.close()
+    release_memory()

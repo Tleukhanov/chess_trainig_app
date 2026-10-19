@@ -32,6 +32,51 @@ def _cfg(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
+def _is_heroku() -> bool:
+    """True, если процесс запущен на Heroku (есть DYNO в окружении, напр. web.1)."""
+    return bool(os.environ.get("DYNO"))
+
+
+def _clamp_stockfish(
+    *,
+    heroku: bool,
+    hash_mb: int,
+    threads: int,
+    time_ms: int,
+    depth: int,
+    multipv: int,
+) -> tuple[int, int, int, int, int]:
+    """Зажимает профиль Stockfish под 512MB на Heroku; локально — без изменений.
+
+    На Heroku (eco, 512MB RAM) большие значения роняют процесс R14, поэтому
+    потолки: ``hash_mb<=32``, ``threads<=1``, ``time_ms<=800``, ``depth<=12``,
+    ``multipv<=1``. Семантика — ``min``: маленькие входные значения НЕ растут.
+    Локально (``heroku=False``) аргументы возвращаются как есть — полная сила.
+
+    Чистая функция: не читает окружение, тестируется напрямую с
+    ``heroku=True/False``.
+    """
+    if not heroku:
+        return hash_mb, threads, time_ms, depth, multipv
+    return (
+        min(hash_mb, 32),
+        min(threads, 1),
+        min(time_ms, 800),
+        min(depth, 12),
+        min(multipv, 1),
+    )
+
+
+_SF_HASH_MB, _SF_THREADS, _SF_TIME_MS, _SF_DEPTH, _SF_MULTIPV = _clamp_stockfish(
+    heroku=_is_heroku(),
+    hash_mb=int(_cfg("STOCKFISH_HASH_MB", "512")),
+    threads=int(_cfg("STOCKFISH_THREADS", "4")),
+    time_ms=int(_cfg("STOCKFISH_TIME_MS", "3000")),
+    depth=int(_cfg("STOCKFISH_DEPTH", "14")),
+    multipv=int(_cfg("STOCKFISH_MULTIPV", "3")),
+)
+
+
 def _resolve_stockfish_path() -> str:
     """Путь к бинарю Stockfish: env STOCKFISH_PATH → системный PATH → как есть.
 
@@ -55,11 +100,13 @@ def _resolve_stockfish_path() -> str:
 class Settings:
     # --- аналитика ---
     stockfish_path: str = _resolve_stockfish_path()
-    stockfish_depth: int = int(_cfg("STOCKFISH_DEPTH", "14"))
-    stockfish_multipv: int = int(_cfg("STOCKFISH_MULTIPV", "3"))
-    stockfish_threads: int = int(_cfg("STOCKFISH_THREADS", "4"))
-    stockfish_hash_mb: int = int(_cfg("STOCKFISH_HASH_MB", "512"))
-    stockfish_time_ms: int = int(_cfg("STOCKFISH_TIME_MS", "3000"))
+    # На Heroku значения уже урезаны _clamp_stockfish (см. выше); локально —
+    # это конфиг как есть (полная сила).
+    stockfish_depth: int = _SF_DEPTH
+    stockfish_multipv: int = _SF_MULTIPV
+    stockfish_threads: int = _SF_THREADS
+    stockfish_hash_mb: int = _SF_HASH_MB
+    stockfish_time_ms: int = _SF_TIME_MS
 
     # --- lichess ---
     lichess_base_url: str = _cfg("LICHESS_BASE_URL", "https://lichess.org")

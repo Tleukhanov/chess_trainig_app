@@ -332,9 +332,11 @@ class DeployFilesTest(unittest.TestCase):
         self.assertTrue(any("postgres" in p for p in plans), plans)
         env = manifest["env"]
         self.assertEqual(env["STOCKFISH_PATH"]["value"], "/usr/games/stockfish")
-        self.assertEqual(env["STOCKFISH_HASH_MB"]["value"], "128")
-        self.assertEqual(env["STOCKFISH_THREADS"]["value"], "2")
-        self.assertEqual(env["STOCKFISH_TIME_MS"]["value"], "1500")
+        self.assertEqual(env["STOCKFISH_HASH_MB"]["value"], "32")
+        self.assertEqual(env["STOCKFISH_THREADS"]["value"], "1")
+        self.assertEqual(env["STOCKFISH_TIME_MS"]["value"], "800")
+        self.assertEqual(env["STOCKFISH_DEPTH"]["value"], "12")
+        self.assertEqual(env["STOCKFISH_MULTIPV"]["value"], "1")
         for key in ("LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL"):
             self.assertIn(key, env)
         formation = manifest["formation"]["web"]

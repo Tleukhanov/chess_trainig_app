@@ -160,7 +160,9 @@ def _load_job_meta(db_path: Path, job_id: str) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
-JOBS_GLOBAL_LIMIT = 3
+# На Heroku eco (512MB) два движка/задачи одновременно не помещаются:
+# держим ровно одну глобальную фоновую задачу, чтобы не ловить R14.
+JOBS_GLOBAL_LIMIT = 1
 JOBS_PER_USER_LIMIT = 1
 
 
@@ -693,12 +695,24 @@ def _unload_maia() -> None:
     """Memory guard: освобождает ONNX-сессию Maia перед запуском Stockfish.
 
     В 512MB-контейнере (Heroku eco) Maia и Stockfish не должны жить вместе:
-    вызов идёт строго до создания :class:`Engine` в фоновом job'е.
+    вызов идёт строго до создания :class:`Engine` в фоновом job'е. После
+    сброса сессии дополнительно зовём ``gc.collect()`` и (на Linux)
+    ``malloc_trim(0)``, чтобы вернуть память ОС — best-effort, ошибки глотаем.
     """
     try:
         from . import maia_onnx
 
         maia_onnx.unload()
+    except Exception:
+        pass
+    try:
+        gc.collect()
+    except Exception:
+        pass
+    try:
+        from .maia_onnx import release_memory
+
+        release_memory()
     except Exception:
         pass
 
