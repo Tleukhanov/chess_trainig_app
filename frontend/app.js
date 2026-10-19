@@ -3,7 +3,7 @@
 const state = {
   user: null,
   currentView: 'dashboard',
-  timers: { coach: null, task: null, llm: null, tool: null, opening: null },
+  timers: { coach: null, task: null, llm: null, tool: null, opening: null, middlegame: null },
   gamesFilter: 'all',
   gameId: null,
   gameData: null,
@@ -32,6 +32,14 @@ const state = {
   openingJobId: null,
   openingError: null,
   openingLastReply: null,
+  middlegameSession: null,
+  middlegameMeta: null,
+  middlegameStrength: 'equal',
+  middlegamePlanDraft: '',
+  middlegameThinking: false,
+  middlegameAnalyzing: false,
+  middlegameJobId: null,
+  middlegameError: null,
   authMode: 'login',
   trackStarted: false,
 };
@@ -42,7 +50,9 @@ async function api(path, options = {}) {
   const resp = await fetch(path, options);
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({ detail: resp.statusText }));
-    throw new Error(err.detail || `HTTP ${resp.status}`);
+    const error = new Error(err.detail || `HTTP ${resp.status}`);
+    error.status = resp.status;
+    throw error;
   }
   return resp.json();
 }
@@ -51,7 +61,9 @@ async function apiPost(path, formData) {
   const resp = await fetch(path, { method: 'POST', body: formData });
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({ detail: resp.statusText }));
-    throw new Error(err.detail || `HTTP ${resp.status}`);
+    const error = new Error(err.detail || `HTTP ${resp.status}`);
+    error.status = resp.status;
+    throw error;
   }
   return resp.json();
 }
@@ -85,7 +97,7 @@ function setupTheme() {
 
 // --- Navigation ---
 
-const views = ['dashboard', 'overview', 'plan', 'progress', 'games', 'drills', 'task', 'opening', 'coach', 'tools', 'users'];
+const views = ['dashboard', 'overview', 'plan', 'progress', 'games', 'drills', 'task', 'opening', 'middlegame', 'coach', 'tools', 'users'];
 
 function navigate(view) {
   if (!views.includes(view)) view = 'dashboard';
@@ -226,7 +238,11 @@ function renderUserbox() {
         taskRevealed: false, taskExplanation: null, planLlmJobId: null,
         planLlmGenerating: false, tool: 'repertoire', gamesFilter: 'all',
         openingSession: null, openingFens: null, openingLastReply: null, openingJobId: null,
+        middlegameSession: null, middlegameMeta: null, middlegameJobId: null,
+        middlegameThinking: false, middlegameAnalyzing: false, middlegameError: null,
+        middlegamePlanDraft: '', middlegameStrength: 'equal',
       });
+      clearMiddlegameSessionId();
       hideNav();
       renderUserbox();
       render(state.currentView);
@@ -262,6 +278,7 @@ async function render(view) {
       case 'drills': await viewDrills(app); break;
       case 'task': await viewTask(app); break;
       case 'opening': await viewOpening(app); break;
+      case 'middlegame': await viewMiddlegame(app); break;
       case 'coach': await viewCoach(app); break;
       case 'tools': await viewTools(app); break;
       case 'users': await viewUsers(app); break;
@@ -2047,6 +2064,914 @@ function openingReportHtml(report) {
     </div>`;
 }
 
+const MIDDLEGAME_STORAGE_KEY = 'middlegameSessionId';
+const MIDDLEGAME_JOB_KEY = 'middlegameAnalysisJob';
+const MIDDLEGAME_MIN_PLAN = 20;
+const MIDDLEGAME_MAX_PLIES = 60;
+const MIDDLEGAME_STRENGTH_LABELS = { equal: 'равный', plus100: '+100', plus200: '+200' };
+const MIDDLEGAME_VERDICTS = {
+  good: { label: 'План доказан', badge: 'badge-good' },
+  partial: { label: 'Частично', badge: 'badge-neutral' },
+  wrong: { label: 'План не сработал', badge: 'badge-bad' },
+};
+const MIDDLEGAME_FILES = 'abcdefgh';
+const MIDDLEGAME_KNIGHT_DELTAS = [[1, 2], [2, 1], [2, -1], [1, -2], [-1, -2], [-2, -1], [-2, 1], [-1, 2]];
+const MIDDLEGAME_KING_DELTAS = [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]];
+const MIDDLEGAME_ROOK_DIRS = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+const MIDDLEGAME_BISHOP_DIRS = [[1, 1], [1, -1], [-1, 1], [-1, -1]];
+
+function mgSquare(index) {
+  return MIDDLEGAME_FILES[index % 8] + (8 - Math.floor(index / 8));
+}
+
+function mgIndex(square) {
+  if (!square || square.length < 2) return -1;
+  const file = MIDDLEGAME_FILES.indexOf(square[0]);
+  const rank = Number(square[1]);
+  if (file < 0 || !rank || rank < 1 || rank > 8) return -1;
+  return (8 - rank) * 8 + file;
+}
+
+function mgColor(piece) {
+  if (!piece) return null;
+  return piece === piece.toUpperCase() ? 'w' : 'b';
+}
+
+function mgParseFen(fen) {
+  const parts = String(fen || '').trim().split(/\s+/);
+  const board = new Array(64).fill('');
+  let index = 0;
+  for (const ch of (parts[0] || '')) {
+    if (ch === '/') continue;
+    if (ch >= '1' && ch <= '8') { index += Number(ch); continue; }
+    if (index < 64) board[index++] = ch;
+  }
+  return {
+    board,
+    turn: parts[1] === 'b' ? 'b' : 'w',
+    castling: parts[2] && parts[2] !== '-' ? parts[2] : '',
+    ep: parts[3] && parts[3] !== '-' ? parts[3] : '',
+    half: Number(parts[4]) || 0,
+    full: Number(parts[5]) || 1,
+  };
+}
+
+function mgFen(state) {
+  let placement = '';
+  for (let row = 0; row < 8; row++) {
+    let empty = 0;
+    for (let file = 0; file < 8; file++) {
+      const piece = state.board[row * 8 + file];
+      if (!piece) { empty++; continue; }
+      if (empty) { placement += String(empty); empty = 0; }
+      placement += piece;
+    }
+    if (empty) placement += String(empty);
+    if (row < 7) placement += '/';
+  }
+  return `${placement} ${state.turn} ${state.castling || '-'} ${state.ep || '-'} ${state.half || 0} ${state.full || 1}`;
+}
+
+function mgAttacked(state, target, by) {
+  const board = state.board;
+  const targetFile = target % 8;
+  const targetRow = Math.floor(target / 8);
+  const pawnRow = targetRow + (by === 'w' ? 1 : -1);
+  if (pawnRow >= 0 && pawnRow < 8) {
+    const pawn = by === 'w' ? 'P' : 'p';
+    for (const delta of [-1, 1]) {
+      const file = targetFile + delta;
+      if (file < 0 || file > 7) continue;
+      if (board[pawnRow * 8 + file] === pawn) return true;
+    }
+  }
+  const knight = by === 'w' ? 'N' : 'n';
+  for (const [df, dr] of MIDDLEGAME_KNIGHT_DELTAS) {
+    const file = targetFile + df;
+    const row = targetRow + dr;
+    if (file < 0 || file > 7 || row < 0 || row > 7) continue;
+    if (board[row * 8 + file] === knight) return true;
+  }
+  const king = by === 'w' ? 'K' : 'k';
+  for (const [df, dr] of MIDDLEGAME_KING_DELTAS) {
+    const file = targetFile + df;
+    const row = targetRow + dr;
+    if (file < 0 || file > 7 || row < 0 || row > 7) continue;
+    if (board[row * 8 + file] === king) return true;
+  }
+  const ray = (directions, pieces) => {
+    for (const [df, dr] of directions) {
+      let file = targetFile + df;
+      let row = targetRow + dr;
+      while (file >= 0 && file <= 7 && row >= 0 && row <= 7) {
+        const piece = board[row * 8 + file];
+        if (piece) {
+          if (mgColor(piece) === by && pieces.includes(piece.toLowerCase())) return true;
+          break;
+        }
+        file += df;
+        row += dr;
+      }
+    }
+    return false;
+  };
+  if (ray(MIDDLEGAME_ROOK_DIRS, 'rq')) return true;
+  return ray(MIDDLEGAME_BISHOP_DIRS, 'bq');
+}
+
+function mgInCheck(state, color) {
+  const king = state.board.indexOf(color === 'w' ? 'K' : 'k');
+  if (king < 0) return false;
+  return mgAttacked(state, king, color === 'w' ? 'b' : 'w');
+}
+
+function mgPseudoMoves(state) {
+  const moves = [];
+  const add = (from, to, extra) => {
+    moves.push(Object.assign({ from, to, promotion: null, castle: null, ep: false }, extra || {}));
+  };
+  for (let from = 0; from < 64; from++) {
+    const piece = state.board[from];
+    if (!piece || mgColor(piece) !== state.turn) continue;
+    const kind = piece.toLowerCase();
+    const file = from % 8;
+    const row = Math.floor(from / 8);
+    if (kind === 'p') {
+      const direction = state.turn === 'w' ? -8 : 8;
+      const startRow = state.turn === 'w' ? 6 : 1;
+      const promoRow = state.turn === 'w' ? 0 : 7;
+      const one = from + direction;
+      if (one >= 0 && one < 64 && !state.board[one]) {
+        if (Math.floor(one / 8) === promoRow) {
+          for (const promotion of ['q', 'r', 'b', 'n']) add(from, one, { promotion });
+        } else {
+          add(from, one);
+        }
+        const two = from + direction * 2;
+        if (row === startRow && !state.board[two]) add(from, two);
+      }
+      for (const delta of [-1, 1]) {
+        const targetFile = file + delta;
+        if (targetFile < 0 || targetFile > 7) continue;
+        const to = from + direction + delta;
+        if (to < 0 || to >= 64) continue;
+        const target = state.board[to];
+        if (target && mgColor(target) !== state.turn) {
+          if (Math.floor(to / 8) === promoRow) {
+            for (const promotion of ['q', 'r', 'b', 'n']) add(from, to, { promotion });
+          } else {
+            add(from, to);
+          }
+        } else if (!target && state.ep && mgSquare(to) === state.ep) {
+          add(from, to, { ep: true });
+        }
+      }
+    } else if (kind === 'n' || kind === 'k') {
+      const deltas = kind === 'n' ? MIDDLEGAME_KNIGHT_DELTAS : MIDDLEGAME_KING_DELTAS;
+      for (const [df, dr] of deltas) {
+        const targetFile = file + df;
+        const targetRow = row + dr;
+        if (targetFile < 0 || targetFile > 7 || targetRow < 0 || targetRow > 7) continue;
+        const to = targetRow * 8 + targetFile;
+        const target = state.board[to];
+        if (!target || mgColor(target) !== state.turn) add(from, to);
+      }
+    } else {
+      const directions = kind === 'r'
+        ? MIDDLEGAME_ROOK_DIRS
+        : kind === 'b'
+          ? MIDDLEGAME_BISHOP_DIRS
+          : MIDDLEGAME_ROOK_DIRS.concat(MIDDLEGAME_BISHOP_DIRS);
+      for (const [df, dr] of directions) {
+        let targetFile = file + df;
+        let targetRow = row + dr;
+        while (targetFile >= 0 && targetFile <= 7 && targetRow >= 0 && targetRow <= 7) {
+          const to = targetRow * 8 + targetFile;
+          const target = state.board[to];
+          if (!target) {
+            add(from, to);
+          } else {
+            if (mgColor(target) !== state.turn) add(from, to);
+            break;
+          }
+          targetFile += df;
+          targetRow += dr;
+        }
+      }
+    }
+  }
+  const homeRow = state.turn === 'w' ? 7 : 0;
+  const kingFrom = homeRow * 8 + 4;
+  const kingPiece = state.turn === 'w' ? 'K' : 'k';
+  if (state.board[kingFrom] === kingPiece) {
+    const enemy = state.turn === 'w' ? 'b' : 'w';
+    const kingSide = state.turn === 'w' ? 'K' : 'k';
+    const queenSide = state.turn === 'w' ? 'Q' : 'q';
+    const rookPiece = state.turn === 'w' ? 'R' : 'r';
+    if (state.castling.includes(kingSide) && state.board[homeRow * 8 + 7] === rookPiece &&
+        !state.board[homeRow * 8 + 5] && !state.board[homeRow * 8 + 6] &&
+        !mgAttacked(state, kingFrom, enemy) && !mgAttacked(state, homeRow * 8 + 5, enemy) &&
+        !mgAttacked(state, homeRow * 8 + 6, enemy)) {
+      add(kingFrom, homeRow * 8 + 6, { castle: 'K' });
+    }
+    if (state.castling.includes(queenSide) && state.board[homeRow * 8] === rookPiece &&
+        !state.board[homeRow * 8 + 1] && !state.board[homeRow * 8 + 2] && !state.board[homeRow * 8 + 3] &&
+        !mgAttacked(state, kingFrom, enemy) && !mgAttacked(state, homeRow * 8 + 3, enemy) &&
+        !mgAttacked(state, homeRow * 8 + 2, enemy)) {
+      add(kingFrom, homeRow * 8 + 2, { castle: 'Q' });
+    }
+  }
+  return moves;
+}
+
+function mgApply(state, move) {
+  const next = {
+    board: state.board.slice(),
+    turn: state.turn === 'w' ? 'b' : 'w',
+    castling: state.castling || '',
+    ep: '',
+    half: state.half || 0,
+    full: state.full || 1,
+  };
+  const piece = next.board[move.from];
+  const color = mgColor(piece);
+  const kind = piece.toLowerCase();
+  const captured = !!(next.board[move.to] || move.ep);
+  next.board[move.from] = '';
+  if (move.ep) {
+    const capturedSquare = move.to + (color === 'w' ? 8 : -8);
+    next.board[capturedSquare] = '';
+  }
+  if (move.castle) {
+    const row = color === 'w' ? 7 : 0;
+    if (move.castle === 'K') {
+      next.board[row * 8 + 5] = next.board[row * 8 + 7];
+      next.board[row * 8 + 7] = '';
+    } else {
+      next.board[row * 8 + 3] = next.board[row * 8];
+      next.board[row * 8] = '';
+    }
+  }
+  next.board[move.to] = move.promotion
+    ? (color === 'w' ? move.promotion.toUpperCase() : move.promotion)
+    : piece;
+  let rights = next.castling;
+  for (const square of [mgSquare(move.from), mgSquare(move.to)]) {
+    if (square === 'e1') rights = rights.replace(/[KQ]/g, '');
+    else if (square === 'e8') rights = rights.replace(/[kq]/g, '');
+    else if (square === 'a1') rights = rights.replace(/Q/g, '');
+    else if (square === 'h1') rights = rights.replace(/K/g, '');
+    else if (square === 'a8') rights = rights.replace(/q/g, '');
+    else if (square === 'h8') rights = rights.replace(/k/g, '');
+  }
+  next.castling = rights;
+  if (kind === 'p' && Math.abs(move.to - move.from) === 16) {
+    next.ep = mgSquare((move.from + move.to) / 2);
+  }
+  next.half = (kind === 'p' || captured) ? 0 : next.half + 1;
+  next.full = state.turn === 'b' ? (state.full || 1) + 1 : (state.full || 1);
+  return next;
+}
+
+function mgLegalMoves(state) {
+  const legal = [];
+  for (const move of mgPseudoMoves(state)) {
+    const next = mgApply(state, move);
+    if (!mgInCheck(next, state.turn)) legal.push(move);
+  }
+  return legal;
+}
+
+function mgFindMove(legal, uci) {
+  if (!uci || uci.length < 4) return null;
+  const from = mgIndex(uci.slice(0, 2));
+  const to = mgIndex(uci.slice(2, 4));
+  const promotion = uci.length > 4 ? uci[4].toLowerCase() : null;
+  return legal.find(m => m.from === from && m.to === to && (m.promotion || null) === promotion) ||
+    legal.find(m => m.from === from && m.to === to) || null;
+}
+
+function mgMoveUci(move) {
+  return mgSquare(move.from) + mgSquare(move.to) + (move.promotion || '');
+}
+
+function mgSan(state, move, legal) {
+  const piece = state.board[move.from];
+  const kind = piece.toLowerCase();
+  let san;
+  if (move.castle) {
+    san = move.castle === 'K' ? 'O-O' : 'O-O-O';
+  } else if (kind === 'p') {
+    san = '';
+    if (state.board[move.to] || move.ep) san += MIDDLEGAME_FILES[move.from % 8] + 'x';
+    san += mgSquare(move.to);
+    if (move.promotion) san += '=' + move.promotion.toUpperCase();
+  } else {
+    san = kind.toUpperCase();
+    const otherFroms = legal.filter(m =>
+      m.to === move.to && m.from !== move.from &&
+      state.board[m.from] && state.board[m.from].toLowerCase() === kind &&
+      mgColor(state.board[m.from]) === state.turn
+    ).map(m => m.from);
+    if (otherFroms.length) {
+      const sameFile = otherFroms.some(from => from % 8 === move.from % 8);
+      const sameRow = otherFroms.some(from => Math.floor(from / 8) === Math.floor(move.from / 8));
+      if (!sameFile) san += MIDDLEGAME_FILES[move.from % 8];
+      else if (!sameRow) san += String(8 - Math.floor(move.from / 8));
+      else san += mgSquare(move.from);
+    }
+    if (state.board[move.to]) san += 'x';
+    san += mgSquare(move.to);
+  }
+  const after = mgApply(state, move);
+  if (mgInCheck(after, after.turn)) {
+    san += mgLegalMoves(after).length ? '+' : '#';
+  }
+  return san;
+}
+
+function mgReplayMoves(fen, moves) {
+  let state = mgParseFen(fen);
+  const fens = [mgFen(state)];
+  const sans = [];
+  for (const uci of moves || []) {
+    const legal = mgLegalMoves(state);
+    const move = mgFindMove(legal, uci);
+    if (!move) break;
+    sans.push(mgSan(state, move, legal));
+    state = mgApply(state, move);
+    fens.push(mgFen(state));
+  }
+  const legal = mgLegalMoves(state);
+  return { state, fens, sans, legal, fen: mgFen(state) };
+}
+
+function middlegameMoveRowsHtml(moves, sans) {
+  return openingMoveRowsHtml((moves || []).map((uci, index) => (sans && sans[index]) || uci));
+}
+
+function readMiddlegameSessionId() {
+  try { return localStorage.getItem(MIDDLEGAME_STORAGE_KEY); } catch { return null; }
+}
+
+function storeMiddlegameSessionId(id) {
+  if (!id) return;
+  try { localStorage.setItem(MIDDLEGAME_STORAGE_KEY, id); } catch {}
+}
+
+function clearMiddlegameSessionId() {
+  try { localStorage.removeItem(MIDDLEGAME_STORAGE_KEY); } catch {}
+}
+
+function readMiddlegameJob() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(MIDDLEGAME_JOB_KEY) || 'null');
+    if (saved && saved.sessionId && saved.jobId) return saved;
+  } catch {}
+  return null;
+}
+
+function storeMiddlegameJob(sessionId, jobId) {
+  if (!sessionId || !jobId) return;
+  try { localStorage.setItem(MIDDLEGAME_JOB_KEY, JSON.stringify({ sessionId, jobId })); } catch {}
+}
+
+function clearMiddlegameJob() {
+  try { localStorage.removeItem(MIDDLEGAME_JOB_KEY); } catch {}
+}
+
+function middlegameTotal() {
+  return (state.middlegameMeta && state.middlegameMeta.total) || 64;
+}
+
+function middlegameSourceTitle(session) {
+  return (session && session.source && session.source.title) || 'Curacao Candidates 1962';
+}
+
+function middlegameResultLabel(result) {
+  if (result === '1-0') return '1-0 — победа белых';
+  if (result === '0-1') return '0-1 — победа чёрных';
+  if (result === '1/2-1/2') return '1/2-1/2 — ничья';
+  if (result === '*') return '* — лимит полуходов';
+  return result || '';
+}
+
+function middlegamePlanHtml(plan) {
+  if (!plan) return '';
+  return `<details class="middlegame-plan"><summary>Мой план</summary><div class="middlegame-plan-text">${esc(plan)}</div></details>`;
+}
+
+async function viewMiddlegame(app) {
+  if (!state.user) {
+    app.innerHTML = '<div class="onboarding card"><div class="empty-icon">♞</div><h1>Миттельшпиль</h1><p>Профиль не выбран — выбери его на странице Профили.</p><a href="#" class="btn btn-primary" data-view="users">Профили</a></div>';
+    bindLinks(app);
+    return;
+  }
+  if (state.middlegameSession && state.middlegameSession.id) {
+    await loadMiddlegameSession(app, state.middlegameSession.id);
+    return;
+  }
+  const stored = readMiddlegameSessionId();
+  if (stored) {
+    await loadMiddlegameSession(app, stored);
+    return;
+  }
+  await createMiddlegameSession(app);
+}
+
+async function createMiddlegameSession(app) {
+  if (state.timers.middlegame) { clearInterval(state.timers.middlegame); state.timers.middlegame = null; }
+  clearMiddlegameJob();
+  state.middlegameSession = null;
+  state.middlegameThinking = false;
+  state.middlegameAnalyzing = false;
+  state.middlegameJobId = null;
+  state.middlegameError = null;
+  state.middlegamePlanDraft = '';
+  state.middlegameStrength = 'equal';
+  app.innerHTML = '<div class="card"><p>Выбираю позицию миттельшпиля...</p></div>';
+  try {
+    const [res, meta] = await Promise.all([
+      api('/api/middlegame/session', { method: 'POST' }),
+      api('/api/middlegame/meta').catch(() => null),
+    ]);
+    if (!res || !res.session) throw new Error('Сервер не вернул позицию');
+    state.middlegameSession = res.session;
+    state.middlegameMeta = meta;
+    storeMiddlegameSessionId(res.session.id);
+    drawMiddlegame(app);
+  } catch (err) {
+    if (isSessionError(err)) { handleSessionExpired(); return; }
+    if (state.currentView !== 'middlegame') return;
+    app.innerHTML = `
+      <div class="card-header"><h1>Миттельшпиль</h1></div>
+      <div class="alert alert-error">${esc(err.message)}</div>
+      <button class="btn btn-primary" id="middlegame-retry">Попробовать ещё раз</button>`;
+    const retry = document.getElementById('middlegame-retry');
+    if (retry) retry.addEventListener('click', () => createMiddlegameSession(app));
+  }
+}
+
+async function loadMiddlegameSession(app, id) {
+  let session;
+  try {
+    const res = await api('/api/middlegame/session/' + encodeURIComponent(id));
+    session = res && res.session;
+    if (!session || !session.id) throw new Error('Сервер не вернул сессию');
+  } catch (err) {
+    if (isSessionError(err)) { handleSessionExpired(); return; }
+    if (err.status === 404) {
+      clearMiddlegameSessionId();
+      state.middlegameSession = null;
+      await createMiddlegameSession(app);
+      return;
+    }
+    if (state.currentView !== 'middlegame') return;
+    app.innerHTML = `
+      <div class="card-header"><h1>Миттельшпиль</h1></div>
+      <div class="alert alert-error">${esc(err.message)}</div>
+      <div class="games-filter">
+        <button class="btn btn-primary" id="middlegame-retry-load">Повторить загрузку</button>
+        <button class="btn btn-secondary" id="middlegame-new-from-error">Новая позиция</button>
+      </div>`;
+    const retry = document.getElementById('middlegame-retry-load');
+    if (retry) retry.addEventListener('click', () => loadMiddlegameSession(app, id));
+    const fresh = document.getElementById('middlegame-new-from-error');
+    if (fresh) fresh.addEventListener('click', () => {
+      clearMiddlegameSessionId();
+      state.middlegameSession = null;
+      createMiddlegameSession(app);
+    });
+    return;
+  }
+  state.middlegameSession = session;
+  state.middlegameError = null;
+  storeMiddlegameSessionId(session.id);
+  const savedJob = readMiddlegameJob();
+  if (savedJob && savedJob.sessionId !== session.id) clearMiddlegameJob();
+  if (savedJob && savedJob.sessionId === session.id && !session.report && session.status !== 'plan') {
+    state.middlegameAnalyzing = true;
+    state.middlegameJobId = savedJob.jobId;
+  } else {
+    if (session.report || session.status === 'plan') clearMiddlegameJob();
+    state.middlegameAnalyzing = false;
+    state.middlegameJobId = null;
+  }
+  drawMiddlegame(app);
+  if (state.middlegameAnalyzing && !state.timers.middlegame && state.middlegameJobId) {
+    middlegamePoll(app, state.middlegameJobId);
+    return;
+  }
+  if (state.currentView === 'middlegame' && !session.report && session.status === 'playing' && !session.result) {
+    const replay = mgReplayMoves(session.fen, session.moves || []);
+    if (replay.state.turn === 'b' && replay.legal.length && !state.middlegameThinking) {
+      middlegameReply(app);
+    }
+  }
+}
+
+function drawMiddlegame(app) {
+  if (state.currentView !== 'middlegame') return;
+  const session = state.middlegameSession;
+  if (!session) { app.innerHTML = '<div class="card"><p>Загрузка...</p></div>'; return; }
+  if (session.status === 'plan') { drawMiddlegameSetup(app); return; }
+  drawMiddlegameGame(app);
+}
+
+function drawMiddlegameSetup(app) {
+  if (state.timers.middlegame) { clearInterval(state.timers.middlegame); state.timers.middlegame = null; }
+  state.middlegameThinking = false;
+  const session = state.middlegameSession;
+  if (!session) return;
+  const replay = mgReplayMoves(session.fen, session.moves || []);
+  const plan = state.middlegamePlanDraft || session.plan || '';
+  const strength = MIDDLEGAME_STRENGTH_LABELS[state.middlegameStrength] ? state.middlegameStrength : 'equal';
+  const total = middlegameTotal();
+  const title = middlegameSourceTitle(session);
+  const ready = plan.trim().length >= MIDDLEGAME_MIN_PLAN;
+  const played = state.middlegameMeta && state.middlegameMeta.played;
+
+  app.innerHTML = `
+    <div class="card-header"><h1>Миттельшпиль</h1><span class="badge badge-blue">${esc(state.user.nick)}</span></div>
+    ${state.middlegameError ? `<div class="alert alert-error">${esc(state.middlegameError)}</div>` : ''}
+    <div class="grid game-layout">
+      <div class="card">
+        ${boardHtml(replay.fen, [], false)}
+        <div class="middlegame-position-line">${esc(title)} • позиция ${esc(String(session.n || 0))} из ${total}</div>
+        <div class="board-meta">
+          <span class="badge badge-blue">ты: белые</span>
+          <span class="badge badge-neutral">соперник: Maia</span>
+          ${played != null ? `<span class="badge badge-neutral">пройдено: ${esc(String(played))} / ${total}</span>` : ''}
+        </div>
+      </div>
+      <div class="game-side">
+        <div class="card">
+          <div class="card-header"><span class="card-title">План на позицию</span><span class="badge badge-neutral" id="middlegame-plan-count">${plan.trim().length} / ${MIDDLEGAME_MIN_PLAN}+</span></div>
+          <form id="middlegame-plan-form">
+            <div class="form-group">
+              <label>Твой план</label>
+              <textarea class="middlegame-plan-input" id="middlegame-plan-input" name="plan" maxlength="4000" placeholder="Опиши план: за счёт чего позиция лучше/хуже и конкретные ходы-идеи (напр. Ne5, Qh3)">${esc(plan)}</textarea>
+            </div>
+            <div class="form-group">
+              <label>Соперник</label>
+              <div class="games-filter" id="middlegame-strength">
+                ${Object.keys(MIDDLEGAME_STRENGTH_LABELS).map(key => `<button type="button" class="btn btn-secondary ${key === strength ? 'btn-active' : ''}" data-strength="${esc(key)}">${esc(MIDDLEGAME_STRENGTH_LABELS[key])}</button>`).join('')}
+              </div>
+            </div>
+            <div class="alert alert-error" id="middlegame-setup-err" style="display:none"></div>
+            <button type="submit" class="btn btn-primary" id="middlegame-start" ${ready ? '' : 'disabled'}>Начать партию</button>
+          </form>
+        </div>
+      </div>
+    </div>`;
+
+  const input = document.getElementById('middlegame-plan-input');
+  const start = document.getElementById('middlegame-start');
+  const counter = document.getElementById('middlegame-plan-count');
+  if (input) {
+    input.addEventListener('input', () => {
+      state.middlegamePlanDraft = input.value;
+      const length = input.value.trim().length;
+      if (counter) counter.textContent = `${length} / ${MIDDLEGAME_MIN_PLAN}+`;
+      if (start) start.disabled = length < MIDDLEGAME_MIN_PLAN;
+    });
+  }
+  app.querySelectorAll('#middlegame-strength [data-strength]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      state.middlegameStrength = btn.dataset.strength;
+      app.querySelectorAll('#middlegame-strength [data-strength]').forEach(b => b.classList.toggle('btn-active', b === btn));
+    });
+  });
+
+  const form = document.getElementById('middlegame-plan-form');
+  if (form) form.addEventListener('submit', async e => {
+    e.preventDefault();
+    const errBox = document.getElementById('middlegame-setup-err');
+    if (errBox) errBox.style.display = 'none';
+    const text = input ? input.value.trim() : '';
+    if (text.length < MIDDLEGAME_MIN_PLAN) {
+      if (input) state.middlegamePlanDraft = input.value;
+      return;
+    }
+    if (start) start.disabled = true;
+    try {
+      const res = await api('/api/middlegame/session/' + encodeURIComponent(session.id) + '/plan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ plan: text, strength: state.middlegameStrength }),
+      });
+      state.middlegameSession = res.session;
+      state.middlegamePlanDraft = text;
+      state.middlegameError = null;
+      state.middlegameThinking = false;
+      storeMiddlegameSessionId(res.session.id);
+      drawMiddlegame(app);
+    } catch (err) {
+      if (isSessionError(err)) { handleSessionExpired(); return; }
+      if (start) start.disabled = false;
+      if (errBox) {
+        errBox.textContent = err.message;
+        errBox.style.display = 'block';
+      }
+    }
+  });
+}
+
+function drawMiddlegameGame(app) {
+  const session = state.middlegameSession;
+  if (!session) { app.innerHTML = '<div class="card"><p>Загрузка...</p></div>'; return; }
+  const moves = session.moves || [];
+  const replay = mgReplayMoves(session.fen, moves);
+  const total = middlegameTotal();
+  const title = middlegameSourceTitle(session);
+  const report = session.report;
+  const finished = !!session.result || replay.legal.length === 0 || moves.length >= MIDDLEGAME_MAX_PLIES;
+  const yourTurn = !finished && session.status === 'playing' && replay.state.turn === 'w';
+  const lastMove = replay.fens.length > 1
+    ? lastMoveSquares(replay.fens[replay.fens.length - 2], replay.fens[replay.fens.length - 1])
+    : [];
+  const errorMsg = state.middlegameError || (session.status === 'error' ? session.error : null);
+  const resultBadge = session.result === '1-0' ? 'badge-good' : session.result === '0-1' ? 'badge-bad' : 'badge-neutral';
+
+  let panel;
+  if (report) {
+    panel = middlegameReportHtml(report, session.source || {}, session.plan);
+  } else if (finished) {
+    panel = `
+      <div class="card">
+        <div class="card-header"><span class="card-title">Партия завершена</span><span class="badge badge-neutral">${moves.length} / ${MIDDLEGAME_MAX_PLIES}</span></div>
+        <p style="color:var(--c-text-muted);font-size:13px;margin-top:0">${esc(middlegameResultLabel(session.result) || 'Позиция доиграна.')} Запусти разбор — Stockfish + LLM проверят твой план.</p>
+        <button class="btn btn-primary" id="middlegame-analyze" ${state.middlegameAnalyzing ? 'disabled' : ''}>${state.middlegameAnalyzing ? 'Анализирую…' : 'Анализировать'}</button>
+        <div id="middlegame-analysis-status" style="color:var(--c-text-muted);font-size:13px;margin-top:8px">${state.middlegameAnalyzing ? 'Анализ…' : ''}</div>
+      </div>`;
+  } else {
+    panel = `
+      <div class="card">
+        <div class="card-header"><span class="card-title">Твой ход</span></div>
+        ${state.middlegameThinking
+          ? '<p style="color:var(--c-text-muted);font-size:13px;margin-top:0">соперник думает…</p>'
+          : yourTurn
+            ? '<p style="color:var(--c-text-muted);font-size:13px;margin-top:0">кликни фигуру, затем клетку — доска подсветит доступные поля</p>'
+            : '<p style="color:var(--c-text-muted);font-size:13px;margin-top:0">ждём соперника…</p>'}
+        ${!yourTurn && !state.middlegameThinking ? '<button class="btn btn-primary" id="middlegame-resume">Продолжить</button>' : ''}
+      </div>`;
+  }
+
+  app.innerHTML = `
+    <div class="card-header"><h1>Миттельшпиль</h1><span class="badge badge-blue">${esc(state.user.nick)}</span></div>
+    ${errorMsg ? `<div class="alert alert-error">${esc(errorMsg)}</div>` : ''}
+    <div class="grid game-layout">
+      <div class="card">
+        ${boardHtml(replay.fen, lastMove, false)}
+        <div class="board-meta">
+          <span class="badge badge-neutral">${esc(title)}</span>
+          <span class="badge badge-blue">позиция ${esc(String(session.n || 0))} из ${total}</span>
+          <span class="badge badge-blue">ты: белые</span>
+          <span class="badge badge-neutral">${moves.length} / ${MIDDLEGAME_MAX_PLIES}</span>
+          ${session.result ? `<span class="badge ${resultBadge}">${esc(middlegameResultLabel(session.result))}</span>` : ''}
+          ${state.middlegameThinking ? '<span class="badge badge-neutral">соперник думает…</span>' : ''}
+        </div>
+        ${middlegamePlanHtml(session.plan)}
+        <div style="margin-top:12px"><button class="btn btn-secondary" id="middlegame-new">Новая позиция</button></div>
+      </div>
+      <div class="game-side">
+        <div class="card">
+          <div class="card-header"><span class="card-title">Ходы</span></div>
+          <div class="moves-list">${middlegameMoveRowsHtml(moves, replay.sans)}</div>
+        </div>
+        ${panel}
+      </div>
+    </div>`;
+
+  const newBtn = document.getElementById('middlegame-new');
+  if (newBtn) newBtn.addEventListener('click', () => {
+    if (state.timers.middlegame) { clearInterval(state.timers.middlegame); state.timers.middlegame = null; }
+    state.middlegameSession = null;
+    state.middlegameThinking = false;
+    state.middlegameAnalyzing = false;
+    state.middlegameJobId = null;
+    state.middlegameError = null;
+    state.middlegamePlanDraft = '';
+    state.middlegameStrength = 'equal';
+    clearMiddlegameSessionId();
+    createMiddlegameSession(app);
+  });
+  const analyzeBtn = document.getElementById('middlegame-analyze');
+  if (analyzeBtn) analyzeBtn.addEventListener('click', () => middlegameAnalyze(app));
+  const resumeBtn = document.getElementById('middlegame-resume');
+  if (resumeBtn) resumeBtn.addEventListener('click', () => middlegameReply(app));
+  if (state.middlegameAnalyzing && !state.timers.middlegame && state.middlegameJobId) {
+    middlegamePoll(app, state.middlegameJobId);
+  }
+  if (!finished && !report && yourTurn && !state.middlegameThinking) {
+    bindMiddlegameBoard(app, session.id, replay.legal);
+  }
+}
+
+function bindMiddlegameBoard(app, sessionId, legalMoves) {
+  const session = state.middlegameSession;
+  if (!session || session.id !== sessionId || !legalMoves.length) return;
+  const squares = app.querySelectorAll('.sq[data-square]');
+  if (!squares.length) return;
+  let selected = null;
+  const clearHl = () => squares.forEach(sq => sq.classList.remove('lm'));
+  squares.forEach(sq => {
+    sq.addEventListener('click', () => {
+      const current = state.middlegameSession;
+      if (state.middlegameThinking || !current || current.id !== sessionId || current.result) return;
+      const square = sq.dataset.square;
+      if (selected) {
+        const candidates = legalMoves.filter(m => mgSquare(m.from) === selected && mgSquare(m.to) === square);
+        if (candidates.length) {
+          const pick = candidates.find(m => m.promotion === 'q') || candidates[0];
+          submitMiddlegameMove(app, mgMoveUci(pick));
+          return;
+        }
+      }
+      if (legalMoves.some(m => mgSquare(m.from) === square)) {
+        if (selected === square) { selected = null; clearHl(); return; }
+        selected = square;
+        clearHl();
+        const goals = new Set(legalMoves.filter(m => mgSquare(m.from) === square).map(m => mgSquare(m.to)));
+        squares.forEach(el => {
+          if (el.dataset.square === square || goals.has(el.dataset.square)) el.classList.add('lm');
+        });
+        return;
+      }
+      selected = null;
+      clearHl();
+    });
+  });
+}
+
+async function submitMiddlegameMove(app, uci) {
+  const session = state.middlegameSession;
+  if (!session) return;
+  state.middlegameThinking = true;
+  state.middlegameError = null;
+  drawMiddlegame(app);
+  let result;
+  try {
+    result = await api('/api/middlegame/session/' + encodeURIComponent(session.id) + '/move', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ move: uci }),
+    });
+  } catch (err) {
+    state.middlegameThinking = false;
+    if (isSessionError(err)) { handleSessionExpired(); return; }
+    state.middlegameError = err.message;
+    drawMiddlegame(app);
+    return;
+  }
+  state.middlegameSession = result.session;
+  state.middlegameThinking = false;
+  storeMiddlegameSessionId(result.session.id);
+  drawMiddlegame(app);
+  if (result.need_reply) await middlegameReply(app);
+}
+
+async function middlegameReply(app) {
+  const session = state.middlegameSession;
+  if (!session) return;
+  state.middlegameThinking = true;
+  state.middlegameError = null;
+  drawMiddlegame(app);
+  let result;
+  try {
+    result = await api('/api/middlegame/session/' + encodeURIComponent(session.id) + '/reply', { method: 'POST' });
+  } catch (err) {
+    state.middlegameThinking = false;
+    if (isSessionError(err)) { handleSessionExpired(); return; }
+    state.middlegameError = err.message;
+    try {
+      const fresh = await api('/api/middlegame/session/' + encodeURIComponent(session.id));
+      state.middlegameSession = fresh;
+      storeMiddlegameSessionId(fresh.id);
+    } catch {}
+    drawMiddlegame(app);
+    return;
+  }
+  state.middlegameSession = result.session;
+  state.middlegameThinking = false;
+  storeMiddlegameSessionId(result.session.id);
+  drawMiddlegame(app);
+}
+
+async function middlegameAnalyze(app) {
+  const session = state.middlegameSession;
+  if (!session) return;
+  state.middlegameAnalyzing = true;
+  state.middlegameError = null;
+  drawMiddlegame(app);
+  try {
+    const res = await api('/api/middlegame/session/' + encodeURIComponent(session.id) + '/analyze', { method: 'POST' });
+    if (!res || !res.job_id) throw new Error('Сервер не вернул задачу анализа');
+    state.middlegameJobId = res.job_id;
+    storeMiddlegameJob(session.id, res.job_id);
+    middlegamePoll(app, res.job_id);
+  } catch (err) {
+    if (isSessionError()) { handleSessionExpired(); return; }
+    state.middlegameAnalyzing = false;
+    state.middlegameJobId = null;
+    clearMiddlegameJob();
+    state.middlegameError = err.status === 503 ? 'Сервер занят, попробуйте ещё раз' : err.message;
+    drawMiddlegame(app);
+  }
+}
+
+async function middlegameRecover(app, fallbackMessage) {
+  if (state.timers.middlegame) { clearInterval(state.timers.middlegame); state.timers.middlegame = null; }
+  state.middlegameAnalyzing = false;
+  state.middlegameJobId = null;
+  const session = state.middlegameSession;
+  if (session && session.id) {
+    try {
+      const res = await api('/api/middlegame/session/' + encodeURIComponent(session.id));
+      const fresh = res && res.session;
+      if (!fresh || !fresh.id) throw new Error('Сервер не вернул сессию');
+      state.middlegameSession = fresh;
+      storeMiddlegameSessionId(fresh.id);
+      drawMiddlegame(app);
+      if (fresh.report) return;
+      state.middlegameError = fallbackMessage;
+      drawMiddlegame(app);
+      return;
+    } catch (err) {
+      if (isSessionError(err)) { handleSessionExpired(); return; }
+    }
+  }
+  state.middlegameError = 'Не удалось получить отчёт';
+  drawMiddlegame(app);
+}
+
+function middlegamePoll(app, jobId) {
+  if (state.timers.middlegame) clearInterval(state.timers.middlegame);
+  state.timers.middlegame = setInterval(async () => {
+    if (state.currentView !== 'middlegame') {
+      clearInterval(state.timers.middlegame);
+      state.timers.middlegame = null;
+      return;
+    }
+    let job;
+    try {
+      job = await api('/api/jobs/' + jobId);
+    } catch {
+      await middlegameRecover(app, 'Анализ прерван — попробуй запустить разбор ещё раз');
+      return;
+    }
+    const status = document.getElementById('middlegame-analysis-status');
+    if (status) status.textContent = (job.phase || 'Анализ') + (job.total ? ` · ${job.done}/${job.total}` : '');
+    if (job.status === 'done') {
+      clearInterval(state.timers.middlegame);
+      state.timers.middlegame = null;
+      state.middlegameAnalyzing = false;
+      state.middlegameJobId = null;
+      const current = state.middlegameSession;
+      if (current && current.id) await loadMiddlegameSession(app, current.id);
+    } else if (job.status === 'error') {
+      await middlegameRecover(app, job.error || 'Анализ прерван — попробуй запустить разбор ещё раз');
+    }
+  }, 800);
+}
+
+function middlegameReportHtml(report, source, plan) {
+  const verdict = MIDDLEGAME_VERDICTS[report.verdict] || MIDDLEGAME_VERDICTS.partial;
+  const moments = report.moments || [];
+  const players = [source.white, source.black].filter(Boolean).join(' vs ');
+  const sourceTitle = source.title || 'Curacao Candidates 1962';
+  const sourceLine = players ? `${sourceTitle}: ${players}` : sourceTitle;
+  const momentsHtml = moments.length ? moments.map(m => {
+    const evalLine = (m.eval_before || m.eval_after)
+      ? `<span>оценка: ${esc(m.eval_before || '—')} → ${esc(m.eval_after || '—')}</span>`
+      : '';
+    return `
+      <div class="middlegame-moment">
+        <div class="middlegame-moment-head">
+          ${m.ply ? `<span class="badge badge-neutral">полуход ${esc(String(m.ply))}</span>` : ''}
+          ${m.move_san ? `<span class="drill-san">${esc(m.move_san)}</span>` : ''}
+          ${m.title ? `<span class="middlegame-moment-title">${esc(m.title)}</span>` : ''}
+        </div>
+        ${m.comment ? `<div>${esc(m.comment)}</div>` : ''}
+        <div class="middlegame-moment-extra">
+          ${m.alt_san ? `<span>лучше: <span class="drill-best">${esc(m.alt_san)}</span></span>` : ''}
+          ${evalLine}
+        </div>
+      </div>`;
+  }).join('') : '<p style="color:var(--c-text-muted)">Моментов нет.</p>';
+  return `
+    <div class="card">
+      <div class="card-header"><span class="card-title">Отчёт тренера</span><span class="badge ${verdict.badge}">${esc(verdict.label)}</span></div>
+      ${report.summary ? `<div class="mentor-reply">${esc(report.summary)}</div>` : ''}
+      ${report.plan_comment ? `<h3 style="font-size:14px;margin:12px 0 6px">Разбор плана</h3><div class="mentor-reply">${esc(report.plan_comment)}</div>` : ''}
+      <h3 style="font-size:14px;margin:12px 0 8px">Ключевые моменты</h3>
+      ${momentsHtml}
+      ${report.lesson ? `<h3 style="font-size:14px;margin:12px 0 6px">Урок</h3><div class="mentor-reply">${esc(report.lesson)}</div>` : ''}
+      <div class="middlegame-report-source">${esc(sourceLine)}${source.chapter_url ? ` · <a href="${esc(safeHttp(source.chapter_url))}" target="_blank" rel="noopener">открыть главу источника</a>` : ''}</div>
+      ${middlegamePlanHtml(plan)}
+    </div>`;
+}
+
 async function viewCoach(app) {
   if (!state.user) {
     app.innerHTML = '<div class="onboarding card"><div class="empty-icon">🔬</div><h1>Нет профиля</h1><p>Выбери профиль на странице Профили.</p></div>';
@@ -2946,7 +3871,11 @@ async function viewUsers(app) {
       taskRevealed: false, taskExplanation: null, planLlmJobId: null,
       planLlmGenerating: false, tool: 'repertoire', gamesFilter: 'all',
       openingSession: null, openingFens: null, openingLastReply: null, openingJobId: null,
+      middlegameSession: null, middlegameMeta: null, middlegameJobId: null,
+      middlegameThinking: false, middlegameAnalyzing: false, middlegameError: null,
+      middlegamePlanDraft: '', middlegameStrength: 'equal',
     });
+    clearMiddlegameSessionId();
     hideNav();
     renderUserbox();
     render(state.currentView);
