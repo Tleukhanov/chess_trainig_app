@@ -17,12 +17,14 @@ import os
 import sqlite3
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
 from . import pgdb
 from .config import settings
 from .games import Game
+from .middlegame import MiddlegameSession
 from .openings import classify_opening
 
 # DDL пересобираемых таблиц. ``{table}`` подставляется и в обычное создание,
@@ -116,6 +118,26 @@ CREATE TABLE IF NOT EXISTS {table}(
 )
 """
 
+# Сессии «Тренера миттельшпиля»: стартовый FEN + план + партия до 60 полуходов
+# и отчёт LLM. moves/report — TEXT с JSON (как в opening_sessions).
+_MIDDLEGAME_SESSIONS_DDL = """
+CREATE TABLE IF NOT EXISTS {table}(
+    id TEXT PRIMARY KEY,
+    player TEXT NOT NULL,
+    position_key TEXT NOT NULL,
+    fen TEXT NOT NULL,
+    side TEXT,
+    plan TEXT,
+    moves TEXT,
+    status TEXT,
+    result TEXT,
+    report TEXT,
+    error TEXT,
+    created_at BIGINT,
+    updated_at BIGINT
+)
+"""
+
 _GAME_COLUMNS = (
     "id, player, rated, speed, created_at, status, winner, white, black, "
     "opening, eco, user_color, opponent, user_rating, user_rating_diff, "
@@ -147,6 +169,8 @@ _BIGINT_COLUMNS = (
     ("sessions", "created_at"),
     ("sessions", "expires_at"),
     ("task_explanations", "created_at"),
+    ("middlegame_sessions", "created_at"),
+    ("middlegame_sessions", "updated_at"),
 )
 
 
@@ -172,6 +196,7 @@ _SCHEMA = f"""
 {_META_DDL.format(table="meta")};
 {_TASK_EXPLANATIONS_DDL.format(table="task_explanations")};
 {_OPENING_SESSIONS_DDL.format(table="opening_sessions")};
+{_MIDDLEGAME_SESSIONS_DDL.format(table="middlegame_sessions")};
 CREATE TABLE IF NOT EXISTS sessions(
     token TEXT PRIMARY KEY,
     nick TEXT,
@@ -181,6 +206,7 @@ CREATE TABLE IF NOT EXISTS sessions(
 CREATE INDEX IF NOT EXISTS idx_games_player ON games(player);
 CREATE INDEX IF NOT EXISTS idx_task_explanations_player ON task_explanations(player);
 CREATE INDEX IF NOT EXISTS idx_opening_sessions_player ON opening_sessions(player, created_at);
+CREATE INDEX IF NOT EXISTS idx_middlegame_sessions_player ON middlegame_sessions(player, created_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_nick ON sessions(nick);
 """
 
@@ -257,6 +283,37 @@ def _uj(raw: str | None) -> Any:
     return json.loads(raw)
 
 
+def _iso_to_ms(value: Any, fallback: int | None = None) -> int | None:
+    """Переводит ISO-время (или уже готовые мс) в миллисекунды эпохи."""
+    if value is None or value == "":
+        return fallback
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return int(value)
+    try:
+        parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return fallback
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp() * 1000)
+
+
+def _ms_to_iso(value: Any) -> str:
+    """Переводит миллисекунды эпохи в ISO-8601 UTC.
+
+    Секундная точность сохраняется, если доля секунды нулевая: так
+    ``created_at``, заданный без миллисекунд, читается обратно без ``.000``.
+    """
+    try:
+        ms = int(value)
+    except (TypeError, ValueError):
+        return ""
+    timespec = "seconds" if ms % 1000 == 0 else "milliseconds"
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat(
+        timespec=timespec
+    )
+
+
 def _row_to_game(row: Any) -> Game:
     """Восстанавливает объект Game из строки БД (в порядке полей dataclass).
 
@@ -297,6 +354,26 @@ def _row_to_opening_session(row: Any) -> dict[str, Any]:
     data["moves"] = _uj(data.get("moves")) or []
     data["report"] = _uj(data.get("report"))
     return data
+
+
+def _row_to_middlegame_session(row: Any) -> MiddlegameSession:
+    """Строка middlegame_sessions как :class:`MiddlegameSession`."""
+    data = dict(row)
+    return MiddlegameSession(
+        id=str(data.get("id") or ""),
+        user=str(data.get("player") or ""),
+        position_key=str(data.get("position_key") or ""),
+        fen=str(data.get("fen") or ""),
+        side=str(data.get("side") or "white"),
+        plan=data.get("plan"),
+        moves=_uj(data.get("moves")) or [],
+        status=str(data.get("status") or "plan"),
+        result=data.get("result"),
+        report=_uj(data.get("report")),
+        error=data.get("error"),
+        created_at=_ms_to_iso(data.get("created_at")),
+        updated_at=_ms_to_iso(data.get("updated_at")),
+    )
 
 
 def _table_ddl(conn: Any, name: str) -> str:
@@ -1063,6 +1140,108 @@ class Database:
                 f"UPDATE opening_sessions SET {', '.join(fields)} WHERE id = ?",
                 values,
             )
+
+    # --- сессии «Тренера миттельшпиля» ---
+
+    def create_middlegame_session(self, session: MiddlegameSession) -> None:
+        """Создаёт (UPSERT по id) сессию миттельшпиля.
+
+        Идемпотентно: повторная запись того же id обновляет поля, но не
+        создаёт дубликат и не затирает ``created_at``. ``moves``/``report``
+        пишутся как JSON, как в ``opening_sessions``.
+        """
+        now = int(time.time() * 1000)
+        created_at = _iso_to_ms(session.created_at, now) or now
+        updated_at = _iso_to_ms(session.updated_at, now) or now
+        with self._connection() as conn:
+            conn.execute(
+                "INSERT INTO middlegame_sessions"
+                "(id, player, position_key, fen, side, plan, moves, status, "
+                "result, report, error, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET "
+                "player = excluded.player, "
+                "position_key = excluded.position_key, "
+                "fen = excluded.fen, "
+                "side = excluded.side, "
+                "plan = excluded.plan, "
+                "moves = excluded.moves, "
+                "status = excluded.status, "
+                "result = excluded.result, "
+                "report = excluded.report, "
+                "error = excluded.error, "
+                "updated_at = excluded.updated_at",
+                (
+                    session.id,
+                    session.user,
+                    session.position_key,
+                    session.fen,
+                    session.side,
+                    session.plan,
+                    _j(session.moves),
+                    session.status,
+                    session.result,
+                    _j(session.report) if session.report is not None else None,
+                    session.error,
+                    created_at,
+                    updated_at,
+                ),
+            )
+
+    def get_middlegame_session(self, session_id: str) -> MiddlegameSession | None:
+        """Сессия миттельшпиля по id (moves/report раскодированы) или None."""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM middlegame_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+        return _row_to_middlegame_session(row) if row else None
+
+    def update_middlegame_session(self, session: MiddlegameSession) -> None:
+        """Сохраняет изменяемые поля сессии и двигает ``updated_at``.
+
+        ``created_at`` не меняется; отсутствующая сессия молча остаётся как
+        есть (как у ``update_opening_session``).
+        """
+        now = int(time.time() * 1000)
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE middlegame_sessions SET "
+                "player = ?, position_key = ?, fen = ?, side = ?, plan = ?, "
+                "moves = ?, status = ?, result = ?, report = ?, error = ?, "
+                "updated_at = ? WHERE id = ?",
+                (
+                    session.user,
+                    session.position_key,
+                    session.fen,
+                    session.side,
+                    session.plan,
+                    _j(session.moves),
+                    session.status,
+                    session.result,
+                    _j(session.report) if session.report is not None else None,
+                    session.error,
+                    now,
+                    session.id,
+                ),
+            )
+        session.updated_at = _ms_to_iso(now)
+
+    def recent_middlegame_keys(self, user: str, limit: int = 16) -> list[str]:
+        """Ключи последних позиций игрока, самые новые первыми."""
+        try:
+            resolved_limit = int(limit)
+        except (TypeError, ValueError):
+            resolved_limit = 0
+        if resolved_limit <= 0:
+            return []
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT position_key FROM middlegame_sessions "
+                "WHERE LOWER(player) = LOWER(?) "
+                "ORDER BY created_at DESC, id DESC LIMIT ?",
+                (user, resolved_limit),
+            ).fetchall()
+        return [str(row["position_key"]) for row in rows]
 
     def set_user_fide(self, nick: str, fide_id: str | None) -> None:
         """Записывает FIDE ID в профиль игрока; None — очищает поле.
