@@ -196,6 +196,7 @@ class MiddlegameSession:
     position_key: str = ""
     fen: str = ""
     side: str = "white"
+    opp_elo: int | None = None
     plan: str | None = None
     moves: list[str] = field(default_factory=list)
     status: str = "plan"
@@ -241,7 +242,7 @@ class MiddlegameSession:
                 "white": "",
                 "black": "",
             }
-        return {
+        data = {
             "id": self.id,
             "position_key": self.position_key,
             "n": n,
@@ -255,6 +256,9 @@ class MiddlegameSession:
             "report": self.report,
             "error": self.error,
         }
+        if self.opp_elo is not None:
+            data["opp_elo"] = self.opp_elo
+        return data
 
 
 def board_of(session: MiddlegameSession) -> chess.Board:

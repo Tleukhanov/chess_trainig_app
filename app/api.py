@@ -31,7 +31,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import data as shared_data
-from .analyzer import Engine
+from . import middlegame as mg
+from .analyzer import Engine, win_percent
 from .coach import _extract_json, build_request, run_coach
 from .config import settings
 from .db import Database, hash_password, verify_password
@@ -107,6 +108,11 @@ class CoachJob:
 
 _JOBS: dict[str, CoachJob] = {}
 _JOBS_LOCK = threading.Lock()
+
+# Запущенные фоновые разборы миттельшпиля: session_id -> job_id. Нужен, чтобы
+# повторный /analyze для той же сессии отвечал 409, а не упирался в лимит 503.
+_MIDDLEGAME_JOBS: dict[str, str] = {}
+_MIDDLEGAME_JOBS_LOCK = threading.Lock()
 
 def _register_job(job: CoachJob) -> None:
     with _JOBS_LOCK:
@@ -661,6 +667,19 @@ class OpeningReplyBody(BaseModel):
     session_id: str = ""
 
 
+class MiddlegamePlanBody(BaseModel):
+    """Тело POST /api/middlegame/session/{id}/plan."""
+
+    plan: str = ""
+    strength: str = "equal"
+
+
+class MiddlegameMoveBody(BaseModel):
+    """Тело POST /api/middlegame/session/{id}/move."""
+
+    move: str = ""
+
+
 def _opening_policy(opp_elo: int, my_elo: int) -> tuple[Any, str]:
     """Политика соперника: Maia-2 ONNX, при отсутствии модели — MaiaLite.
 
@@ -1046,6 +1065,221 @@ def _run_opening_analyze_job(
         _persist_job(app.state.db_path, job, session_id=session_id)
     finally:
         job.finished = time.time()
+
+
+# --- Тренер миттельшпиля: сессии, Maia и фоновый разбор ---------------------
+
+_MIDDLEGAME_STRENGTHS = {"equal": 0, "plus100": 100, "plus200": 200}
+_MIDDLEGAME_ELO_MIN = 100
+_MIDDLEGAME_ELO_MAX = 3500
+
+
+def _middlegame_base_elo(db: Database, nick: str) -> int:
+    """Рейтинг игрока для силы соперника: тот же источник, что у дебютов."""
+    level = _plan_player_level(db, nick)
+    rating = level.get("rating")
+    if not isinstance(rating, int) or isinstance(rating, bool) or rating <= 0:
+        rating = settings.maia_default_elo
+    return max(_MIDDLEGAME_ELO_MIN, min(_MIDDLEGAME_ELO_MAX, int(rating)))
+
+
+def _middlegame_opp_elo(base: int, strength: str) -> int:
+    """Elo соперника по выбранной силе: equal / +100 / +200 (с зажимом)."""
+    delta = _MIDDLEGAME_STRENGTHS[strength]
+    return max(_MIDDLEGAME_ELO_MIN, min(_MIDDLEGAME_ELO_MAX, int(base) + delta))
+
+
+def _middlegame_payload(session: mg.MiddlegameSession) -> dict[str, Any]:
+    """JSON сессии для API: opp_elo всегда есть, даже до выбора силы."""
+    data = session.to_dict()
+    data.setdefault("opp_elo", None)
+    return data
+
+
+def _middlegame_pick_san(candidates: list[tuple[str, float]]) -> str | None:
+    """Сэмплирует SAN по вероятностям Maia (как ход соперника в дебютах)."""
+    cleaned: list[tuple[str, float]] = []
+    for san, prob in candidates or []:
+        try:
+            weight = float(prob)
+        except (TypeError, ValueError):
+            continue
+        if not san or weight <= 0:
+            continue
+        cleaned.append((str(san), weight))
+    if not cleaned:
+        return None
+    threshold = random.random() * sum(weight for _, weight in cleaned)
+    acc = 0.0
+    for san, weight in cleaned:
+        acc += weight
+        if threshold <= acc:
+            return san
+    return cleaned[-1][0]
+
+
+def _middlegame_side_win(eval_white: dict[str, Any], white_side: bool) -> float:
+    """Win% стороны по оценке из перспективы белых (cp/mate)."""
+    mate = eval_white.get("mate")
+    cp = eval_white.get("cp")
+    try:
+        mate_value = int(mate) if mate is not None else None
+    except (TypeError, ValueError):
+        mate_value = None
+    cp_value: float | None
+    try:
+        cp_value = float(cp) if cp is not None else None
+    except (TypeError, ValueError):
+        cp_value = None
+    win_white = win_percent(cp_value, mate_value)
+    return win_white if white_side else 100.0 - win_white
+
+
+def _middlegame_engine_facts(session: mg.MiddlegameSession) -> list[dict[str, Any]]:
+    """Факты Stockfish по каждому полуходу от стартового FEN сессии."""
+    facts: list[dict[str, Any]] = []
+    board = chess.Board(session.fen)
+    moves = list(session.moves[: mg.MAX_PLIES])
+    with Engine(
+        depth=settings.stockfish_depth, multipv=settings.stockfish_multipv
+    ) as engine:
+        lines = engine.analyze_position(board)
+        for ply, uci in enumerate(moves, start=1):
+            if not lines or board.is_game_over(claim_draw=False):
+                break
+            mover_white = board.turn == chess.WHITE
+            top = lines[0]
+            eval_before = dict(top.get("eval") or {})
+            best_san = (top.get("pv") or [None])[0]
+            win_before = _middlegame_side_win(eval_before, mover_white)
+            try:
+                move = chess.Move.from_uci(uci)
+                san = board.san(move)
+            except ValueError:
+                break
+            board.push(move)
+            if board.is_game_over(claim_draw=False):
+                if board.is_checkmate():
+                    eval_after = {
+                        "cp": None,
+                        "mate": 1 if mover_white else -1,
+                    }
+                else:
+                    eval_after = {"cp": 0.0, "mate": None}
+                lines = []
+            else:
+                next_lines = engine.analyze_position(board)
+                if not next_lines:
+                    break
+                eval_after = dict(next_lines[0].get("eval") or {})
+                lines = next_lines
+            win_after = _middlegame_side_win(eval_after, mover_white)
+            facts.append(
+                {
+                    "ply": ply,
+                    "san": san,
+                    "uci": move.uci(),
+                    "eval_before": eval_before,
+                    "eval_after": eval_after,
+                    "delta": round(max(0.0, win_before - win_after), 2),
+                    "best_san": best_san,
+                }
+            )
+    return facts
+
+
+def _middlegame_report_llm(prompt: str) -> dict[str, Any]:
+    """LLM-отчёт по миттельшпилю (с повтором без reasoning, как у дебютов)."""
+    _ensure_llm_key()
+    llm = LLMClient()
+    messages = [ChatMessage("user", prompt)]
+    try:
+        text = clean_llm_text(llm.chat(messages, temperature=0.4, json_mode=True))
+        data = _extract_json(text) if isinstance(text, str) else None
+    except RuntimeError:
+        data = None
+    if isinstance(data, dict):
+        return data
+
+    retry = [
+        ChatMessage(
+            "user",
+            prompt + "\nБез пошагового разбора. Сразу один JSON-объект.",
+        )
+    ]
+    try:
+        second = clean_llm_text(
+            llm.chat(
+                retry,
+                temperature=0.4,
+                reasoning_max_tokens=0,
+                json_mode=True,
+            )
+        )
+        data = _extract_json(second) if isinstance(second, str) else None
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "LLM не вернул JSON-отчёт по миттельшпилю "
+            f"(повтор без разбора не помог): {exc}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            "LLM не вернул JSON-отчёт по миттельшпилю "
+            "(повтор без разбора не помог)"
+        )
+    return data
+
+
+def _run_middlegame_analyze_job(
+    app: FastAPI, job: CoachJob, session_id: str
+) -> None:
+    """Фоновый поток: Maia off → Stockfish-факты → LLM-отчёт (JSON)."""
+    try:
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            session = db.get_middlegame_session(session_id)
+        if session is None:
+            raise RuntimeError("Сессия тренажёра миттельшпиля не найдена")
+        moves = list(session.moves[: mg.MAX_PLIES])
+        if not moves:
+            raise RuntimeError("Сессия пуста — анализировать нечего")
+
+        job.phase = "Освобождение Maia"
+        _persist_job(app.state.db_path, job, session_id=session_id)
+        _unload_maia()
+
+        job.phase = "Анализ движком"
+        _persist_job(app.state.db_path, job, session_id=session_id)
+        engine_facts = _middlegame_engine_facts(session)
+
+        job.phase = "Отчёт тренера"
+        _persist_job(app.state.db_path, job, session_id=session_id)
+        prompt = mg.build_report_prompt(
+            session,
+            engine_facts=engine_facts,
+            position=mg.POSITION_BY_KEY.get(session.position_key),
+        )
+        report = mg.normalize_report(_middlegame_report_llm(prompt))
+
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            fresh = db.get_middlegame_session(session_id) or session
+            fresh.report = report
+            fresh.status = "analyzed"
+            db.update_middlegame_session(fresh)
+        job.result = {"report": report}
+        job.summary = f"Отчёт по миттельшпилю готов ({len(moves)} полуходов)"
+        job.status = "done"
+        _persist_job(app.state.db_path, job, session_id=session_id)
+    except Exception as exc:
+        job.status = "error"
+        job.error = str(exc)
+        _persist_job(app.state.db_path, job, session_id=session_id)
+    finally:
+        job.finished = time.time()
+        with _MIDDLEGAME_JOBS_LOCK:
+            if _MIDDLEGAME_JOBS.get(session_id) == job.id:
+                _MIDDLEGAME_JOBS.pop(session_id, None)
 
 
 # --- helpers ---------------------------------------------------------------
@@ -2157,7 +2391,7 @@ def create_api(
     db_path: Path | None = None,
     data_dir: Path | None = None,
 ) -> FastAPI:
-    app = FastAPI(title="Chess Trainer API", version="0.4.7", docs_url="/api/docs", redoc_url=None)
+    app = FastAPI(title="Chess Trainer API", version="0.4.8", docs_url="/api/docs", redoc_url=None)
     app.state.db_path = Path(db_path) if db_path else settings.db_path
     app.state.data_dir = Path(data_dir) if data_dir else settings.data_dir
 
@@ -3296,6 +3530,223 @@ def create_api(
             "your_turn": your_turn,
             "moves": moves,
         }
+
+    # --- Тренер миттельшпиля: сессии, Maia и фоновый разбор ---
+    def _require_user(request: Request) -> dict[str, Any]:
+        user = _current_user(app.state.db_path, request)
+        if not user:
+            raise HTTPException(401, "Нужен вход")
+        return user
+
+    def _middlegame_owned(
+        db: Database, nick: str, session_id: str
+    ) -> mg.MiddlegameSession | None:
+        session = db.get_middlegame_session(session_id)
+        if session is None:
+            return None
+        if session.user.lower() != nick.lower():
+            return None
+        return session
+
+    @app.get("/api/middlegame/meta")
+    def api_middlegame_meta(request: Request):
+        user = _require_user(request)
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            played = len(
+                db.recent_middlegame_keys(user["nick"], limit=1_000_000)
+            )
+        return {
+            "total": len(mg.POSITIONS),
+            "sources": [
+                {
+                    "id": source["id"],
+                    "title": source["title"],
+                    "count": source["count"],
+                }
+                for source in mg.SOURCES
+            ],
+            "played": played,
+        }
+
+    @app.post("/api/middlegame/session")
+    def api_middlegame_create(request: Request):
+        user = _require_user(request)
+        nick = user["nick"]
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            avoid = db.recent_middlegame_keys(nick, limit=16)
+            position = mg.pick_position(nick, avoid_keys=avoid)
+            session = mg.MiddlegameSession(
+                user=nick,
+                position_key=position.key,
+                fen=position.fen,
+            )
+            db.create_middlegame_session(session)
+        return {"session": _middlegame_payload(session)}
+
+    @app.post("/api/middlegame/session/{session_id}/plan")
+    def api_middlegame_plan(
+        session_id: str, request: Request, body: MiddlegamePlanBody
+    ):
+        user = _require_user(request)
+        nick = user["nick"]
+        strength = (body.strength or "equal").strip()
+        if strength not in _MIDDLEGAME_STRENGTHS:
+            raise HTTPException(
+                400,
+                "Сила соперника: equal, plus100 или plus200",
+            )
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            session = _middlegame_owned(db, nick, session_id)
+        if session is None:
+            raise HTTPException(404, "Сессия не найдена")
+        if session.status != "plan":
+            raise HTTPException(409, "План уже отправлен")
+        try:
+            plan = mg.validate_plan(body.plan)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            base = _middlegame_base_elo(db, nick)
+            session.plan = plan
+            session.opp_elo = _middlegame_opp_elo(base, strength)
+            session.status = "playing"
+            db.update_middlegame_session(session)
+        return {"session": _middlegame_payload(session)}
+
+    @app.post("/api/middlegame/session/{session_id}/move")
+    def api_middlegame_move(
+        session_id: str, request: Request, body: MiddlegameMoveBody
+    ):
+        user = _require_user(request)
+        nick = user["nick"]
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            session = _middlegame_owned(db, nick, session_id)
+        if session is None:
+            raise HTTPException(404, "Сессия не найдена")
+        if session.status != "playing":
+            detail = (
+                "Сначала сформулируйте план"
+                if session.status == "plan"
+                else "Партия уже разобрана"
+            )
+            raise HTTPException(409, detail)
+        try:
+            mg.apply_user_move(session, (body.move or "").strip())
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            db.update_middlegame_session(session)
+        return {
+            "session": _middlegame_payload(session),
+            "need_reply": mg.need_reply(session),
+        }
+
+    @app.post("/api/middlegame/session/{session_id}/reply")
+    def api_middlegame_reply(session_id: str, request: Request):
+        user = _require_user(request)
+        nick = user["nick"]
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            session = _middlegame_owned(db, nick, session_id)
+        if session is None:
+            raise HTTPException(404, "Сессия не найдена")
+        if not mg.need_reply(session):
+            return {"session": _middlegame_payload(session)}
+
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            base = _middlegame_base_elo(db, nick)
+        opp_elo = int(session.opp_elo or settings.maia_default_elo)
+        policy, engine_name = _opening_policy(opp_elo, base)
+        try:
+            board = mg.board_of(session)
+            try:
+                candidates = policy.probs(board, k=8)
+            except Exception as exc:
+                raise HTTPException(
+                    503, "Не удалось получить ход соперника"
+                ) from exc
+            san = _middlegame_pick_san(candidates)
+            if not san:
+                raise HTTPException(503, "Не удалось получить ход соперника")
+            try:
+                uci = board.parse_san(san).uci()
+            except ValueError:
+                try:
+                    uci = chess.Move.from_uci(san).uci()
+                except ValueError as exc:
+                    raise HTTPException(
+                        503, "Соперник предложил недопустимый ход"
+                    ) from exc
+        finally:
+            _close_opening_policy(policy, engine_name)
+
+        try:
+            mg.apply_opponent_move(session, uci)
+        except ValueError as exc:
+            raise HTTPException(503, str(exc)) from exc
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            db.update_middlegame_session(session)
+        return {"session": _middlegame_payload(session)}
+
+    @app.post("/api/middlegame/session/{session_id}/analyze")
+    def api_middlegame_analyze(session_id: str, request: Request):
+        user = _require_user(request)
+        nick = user["nick"]
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            session = _middlegame_owned(db, nick, session_id)
+        if session is None:
+            raise HTTPException(404, "Сессия не найдена")
+        if session.status == "analyzed":
+            raise HTTPException(409, "Эта партия уже разобрана")
+        if not session.moves:
+            raise HTTPException(409, "В партии ещё нет ходов")
+
+        with _MIDDLEGAME_JOBS_LOCK:
+            running_id = _MIDDLEGAME_JOBS.get(session_id)
+        if running_id:
+            existing = _get_job(running_id)
+            if existing is not None and existing.status == "running":
+                raise HTTPException(409, "Разбор этой партии уже выполняется")
+            with _MIDDLEGAME_JOBS_LOCK:
+                if _MIDDLEGAME_JOBS.get(session_id) == running_id:
+                    _MIDDLEGAME_JOBS.pop(session_id, None)
+
+        _check_job_limits(nick)
+        job = CoachJob(
+            id=uuid.uuid4().hex,
+            user=nick,
+            phase="Анализ миттельшпиля",
+        )
+        _register_job(job)
+        with _MIDDLEGAME_JOBS_LOCK:
+            _MIDDLEGAME_JOBS[session_id] = job.id
+        _persist_job(app.state.db_path, job, session_id=session_id)
+        threading.Thread(
+            target=_run_middlegame_analyze_job,
+            args=(app, job, session_id),
+            daemon=True,
+        ).start()
+        return {"job_id": job.id}
+
+    @app.get("/api/middlegame/session/{session_id}")
+    def api_middlegame_get(session_id: str, request: Request):
+        user = _require_user(request)
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            session = _middlegame_owned(db, user["nick"], session_id)
+        if session is None:
+            raise HTTPException(404, "Сессия не найдена")
+        return {"session": _middlegame_payload(session)}
 
     # --- Auth: регистрация и вход (логин+пароль+lichess) ---
     @app.post("/api/auth/register")

@@ -127,6 +127,7 @@ CREATE TABLE IF NOT EXISTS {table}(
     position_key TEXT NOT NULL,
     fen TEXT NOT NULL,
     side TEXT,
+    opp_elo INTEGER,
     plan TEXT,
     moves TEXT,
     status TEXT,
@@ -219,6 +220,9 @@ _USERS_AUTH_COLUMNS = (
     "created_at BIGINT",
 )
 
+# Новые колонки middlegame_sessions (идемпотентный ALTER — см. init_db).
+_MIDDLEGAME_EXTRA_COLUMNS = ("opp_elo INTEGER",)
+
 
 def _pg_dsn() -> str | None:
     """DSN Postgres из окружения (Heroku) или None (локаль → SQLite).
@@ -281,6 +285,16 @@ def _uj(raw: str | None) -> Any:
     if not raw:
         return None
     return json.loads(raw)
+
+
+def _optional_int(value: Any) -> int | None:
+    """Целое из БД/JSON или None (пустое/мусорное значение)."""
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _iso_to_ms(value: Any, fallback: int | None = None) -> int | None:
@@ -365,6 +379,7 @@ def _row_to_middlegame_session(row: Any) -> MiddlegameSession:
         position_key=str(data.get("position_key") or ""),
         fen=str(data.get("fen") or ""),
         side=str(data.get("side") or "white"),
+        opp_elo=_optional_int(data.get("opp_elo")),
         plan=data.get("plan"),
         moves=_uj(data.get("moves")) or [],
         status=str(data.get("status") or "plan"),
@@ -573,6 +588,19 @@ class Database:
                     conn.execute(f"ALTER TABLE users ADD COLUMN {coldef}")
             conn.execute("UPDATE users SET role = 'user' WHERE role IS NULL")
             conn.execute("UPDATE users SET is_active = 1 WHERE is_active IS NULL")
+            # Миграция middlegame_sessions.opp_elo без потери данных: старые
+            # сессии получают NULL и после отправки плана пишутся заново.
+            middlegame_cols = {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(middlegame_sessions)"
+                ).fetchall()
+            }
+            for coldef in _MIDDLEGAME_EXTRA_COLUMNS:
+                if coldef.split()[0] not in middlegame_cols:
+                    conn.execute(
+                        f"ALTER TABLE middlegame_sessions ADD COLUMN {coldef}"
+                    )
             # Миграция games.link без потери данных (образец — users выше):
             # старые строки без колонки получают её, затем backfill одним
             # UPDATE ставит lichess-ссылку только тем id, что выглядят как
@@ -607,6 +635,20 @@ class Database:
                     conn.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {coldef}")
             conn.execute("UPDATE users SET role = 'user' WHERE role IS NULL")
             conn.execute("UPDATE users SET is_active = 1 WHERE is_active IS NULL")
+            middlegame_cols = {
+                row["column_name"]
+                for row in conn.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = 'middlegame_sessions' "
+                    "AND table_schema = 'public'"
+                ).fetchall()
+            }
+            for coldef in _MIDDLEGAME_EXTRA_COLUMNS:
+                if coldef.split()[0] not in middlegame_cols:
+                    conn.execute(
+                        "ALTER TABLE middlegame_sessions ADD COLUMN IF NOT EXISTS "
+                        f"{coldef}"
+                    )
             games_cols = {
                 row["column_name"]
                 for row in conn.execute(
@@ -1156,14 +1198,15 @@ class Database:
         with self._connection() as conn:
             conn.execute(
                 "INSERT INTO middlegame_sessions"
-                "(id, player, position_key, fen, side, plan, moves, status, "
+                "(id, player, position_key, fen, side, opp_elo, plan, moves, status, "
                 "result, report, error, created_at, updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(id) DO UPDATE SET "
                 "player = excluded.player, "
                 "position_key = excluded.position_key, "
                 "fen = excluded.fen, "
                 "side = excluded.side, "
+                "opp_elo = excluded.opp_elo, "
                 "plan = excluded.plan, "
                 "moves = excluded.moves, "
                 "status = excluded.status, "
@@ -1177,6 +1220,7 @@ class Database:
                     session.position_key,
                     session.fen,
                     session.side,
+                    session.opp_elo,
                     session.plan,
                     _j(session.moves),
                     session.status,
@@ -1206,14 +1250,15 @@ class Database:
         with self._connection() as conn:
             conn.execute(
                 "UPDATE middlegame_sessions SET "
-                "player = ?, position_key = ?, fen = ?, side = ?, plan = ?, "
-                "moves = ?, status = ?, result = ?, report = ?, error = ?, "
-                "updated_at = ? WHERE id = ?",
+                "player = ?, position_key = ?, fen = ?, side = ?, opp_elo = ?, "
+                "plan = ?, moves = ?, status = ?, result = ?, report = ?, "
+                "error = ?, updated_at = ? WHERE id = ?",
                 (
                     session.user,
                     session.position_key,
                     session.fen,
                     session.side,
+                    session.opp_elo,
                     session.plan,
                     _j(session.moves),
                     session.status,
