@@ -225,6 +225,38 @@ class LLMClientTests(unittest.TestCase):
         )
         self.assertEqual(body["max_tokens"], settings.llm_max_tokens)
 
+    def test_reasoning_disabled_sends_enabled_false(self) -> None:
+        """reasoning_max_tokens=0 — явное отключение reasoning для openrouter."""
+        import urllib.request as urlrequest
+        from unittest.mock import patch
+
+        captured: dict[str, str] = {}
+
+        class _FakeResp:
+            def __enter__(self) -> "_FakeResp":
+                return self
+
+            def __exit__(self, *args: object) -> bool:
+                return False
+
+            def read(self) -> bytes:
+                return _OK_BODY
+
+        def _fake_urlopen(request: object, timeout: object = None) -> _FakeResp:
+            captured["body"] = request.data.decode("utf-8")  # type: ignore[union-attr]
+            return _FakeResp()
+
+        client = LLMClient(
+            api_key="test-key", base_url="https://openrouter.ai/api/v1"
+        )
+        with patch.object(urlrequest, "urlopen", side_effect=_fake_urlopen):
+            result = client.chat(
+                [ChatMessage("user", "hi")], reasoning_max_tokens=0
+            )
+        self.assertEqual(result, "OK")
+        body = json.loads(captured["body"])
+        self.assertEqual(body["reasoning"], {"enabled": False})
+
     def test_invalid_role_rejected(self) -> None:
         with self.assertRaises(ValueError):
             ChatMessage("king", "hi")

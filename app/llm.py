@@ -129,12 +129,12 @@ class LLMClient:
         api_key: str | None = None,
         base_url: str | None = None,
         model: str | None = None,
-        timeout: float = 60.0,
+        timeout: float | None = None,
     ) -> None:
         self.api_key = settings.llm_api_key if api_key is None else api_key
         self.base_url = settings.llm_base_url if base_url is None else base_url
         self.model = settings.llm_model if model is None else model
-        self.timeout = timeout
+        self.timeout = float(settings.llm_timeout if timeout is None else timeout)
         if not self.model:
             raise ValueError("model не может быть пустым")
         self._completion_url = build_completion_url(self.base_url)
@@ -169,13 +169,15 @@ class LLMClient:
             body["max_tokens"] = max_tokens
         if (
             reasoning_max_tokens is not None
-            and reasoning_max_tokens > 0
             and "openrouter" in (self.base_url or "").lower()
         ):
-            body["reasoning"] = {
-                "max_tokens": reasoning_max_tokens,
-                "exclude": True,
-            }
+            if reasoning_max_tokens <= 0:
+                body["reasoning"] = {"enabled": False}
+            else:
+                body["reasoning"] = {
+                    "max_tokens": reasoning_max_tokens,
+                    "exclude": True,
+                }
         if json_mode:
             body["response_format"] = {"type": "json_object"}
 

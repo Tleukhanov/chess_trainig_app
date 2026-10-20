@@ -144,6 +144,7 @@ class Settings:
     llm_model: str = _cfg("LLM_MODEL", "openai/gpt-4o-mini")
     llm_max_tokens: int = int(_cfg("LLM_MAX_TOKENS", "4000"))
     llm_reasoning_budget: int = int(_cfg("LLM_REASONING_BUDGET", "1024"))
+    llm_timeout: int = int(_cfg("LLM_TIMEOUT", "120"))
 
 
 settings = Settings()

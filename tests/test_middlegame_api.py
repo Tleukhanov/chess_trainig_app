@@ -532,6 +532,9 @@ class MiddlegameAnalyzeTests(MiddlegameApiTestBase):
                     "eval_after",
                     "delta",
                     "best_san",
+                    "second_san",
+                    "pv",
+                    "pv_after",
                 },
             )
 
@@ -591,8 +594,10 @@ class MiddlegameAnalyzeTests(MiddlegameApiTestBase):
         first, second = llm.chat.call_args_list
         self.assertTrue(first.kwargs.get("json_mode"))
         self.assertIsNone(first.kwargs.get("reasoning_max_tokens"))
+        self.assertEqual(first.kwargs.get("max_tokens"), 7000)
         self.assertTrue(second.kwargs.get("json_mode"))
         self.assertEqual(second.kwargs.get("reasoning_max_tokens"), 0)
+        self.assertEqual(second.kwargs.get("max_tokens"), 7000)
 
     def test_analyze_third_attempt_without_hints_succeeds(self):
         """Повтор без reasoning тоже пустой: третья обычная попытка спасает."""

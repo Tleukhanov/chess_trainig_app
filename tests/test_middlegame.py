@@ -23,6 +23,7 @@ from app.middlegame import (
     apply_user_move,
     board_of,
     build_report_prompt,
+    describe_position,
     ground_report,
     legal_moves,
     need_reply,
@@ -355,12 +356,20 @@ class ReportTests(unittest.TestCase):
                     "eval_before": {"cp": 20},
                     "eval_after": {"cp": 15},
                     "best_move_san": "Nxe6",
+                    "second_san": "d5",
+                    "pv": ["Nxe6", "fxe6", "d5"],
+                    "pv_after": ["fxe6", "Qd3"],
+                    "delta": 2.39,
                 }
             ],
             position=POSITION_BY_KEY["curacao1962:12"],
         )
         self.assertIn("человеческий шахматный тренер", prompt)
         self.assertIn(session.fen, prompt)
+        self.assertIn("ПРОФИЛЬ СТАРТОВОЙ ПОЗИЦИИ", prompt)
+        self.assertIn("ПРОФИЛЬ ПОЗИЦИИ ПОСЛЕ ВСЕХ ХОДОВ", prompt)
+        self.assertIn("Материал:", prompt)
+        self.assertIn("Пешечные слабости:", prompt)
         self.assertIn("Pal Benko", prompt)
         self.assertIn("Mikhail Tal", prompt)
         self.assertIn("Curacao Candidates 1962", prompt)
@@ -369,9 +378,75 @@ class ReportTests(unittest.TestCase):
         self.assertIn(san, prompt)
         self.assertIn("+0.20", prompt)
         self.assertIn("+0.15", prompt)
+        self.assertIn("оценка до: +0.20 (лучше белым)", prompt)
+        self.assertIn("верь фактам", prompt)
+        self.assertIn("линия движка: Nxe6 fxe6 d5", prompt)
+        self.assertIn("линия после хода: fxe6 Qd3", prompt)
+        self.assertIn("с точки зрения белых", prompt)
+        self.assertIn("запасной ход движка: d5", prompt)
+        self.assertIn("потеря win.%: 2.39 (хороший)", prompt)
+        self.assertIn("ЗАПРЕЩЕНЫ общие фразы", prompt)
+        self.assertIn("не выдумывай цели", prompt)
+        self.assertIn("обязана быть легальной", prompt)
         self.assertIn("СТРОГО", prompt)
         self.assertIn("JSON", prompt)
         self.assertIn("форточк", prompt)
+
+    def test_describe_position_lists_material_pawns_and_kings(self) -> None:
+        text = describe_position(
+            "r1r3k1/p2nB1bp/4p1p1/8/3p4/6P1/2qNPP1P/1R1Q1RK1 w - - 4 20"
+        )
+        self.assertIn("Ход белых", text)
+        self.assertIn("перевес чёрных +1", text)
+        self.assertIn("белые — Ф Л2 С К п4", text)
+        self.assertIn("чёрные — Ф Л2 С К п5", text)
+        self.assertIn(
+            "Фигуры (кроме пешек): белые — Кр g1; Ф d1; Л b1, f1; "
+            "С e7; К d2; чёрные — Кр g8; Ф c2; Л a8, c8; С g7; К d7.",
+            text,
+        )
+        self.assertIn("Пешки: белые — e2, f2, h2, g3", text)
+        self.assertIn("Рокировки: прав ни у кого нет.", text)
+        self.assertIn("Открытые линии: b, c", text)
+        self.assertIn("Полуоткрытые для белых: a, d", text)
+        self.assertIn("Полуоткрытые для чёрных: f", text)
+        self.assertIn("изолированные на a", text)
+        self.assertIn("проходные a7", text)
+        self.assertIn("Король белых: g1", text)
+        self.assertIn("Король чёрных: g8", text)
+
+    def test_ground_report_drops_illegal_alt_san(self) -> None:
+        report = normalize_report(
+            {
+                "moments": [
+                    {
+                        "ply": 1,
+                        "title": "Первый",
+                        "comment": "комментарий",
+                        "alt_san": "Qh5",
+                    },
+                    {
+                        "ply": 2,
+                        "title": "Второй",
+                        "comment": "комментарий",
+                        "alt_san": "c5",
+                    },
+                ]
+            }
+        )
+        facts = [
+            {"ply": 1, "san": "e4", "uci": "e2e4"},
+            {"ply": 2, "san": "e5", "uci": "e7e5"},
+        ]
+        grounded = ground_report(
+            report,
+            facts,
+            fen=chess.STARTING_FEN,
+            moves=["e2e4", "e7e5"],
+        )
+        self.assertEqual(len(grounded["moments"]), 2)
+        self.assertIsNone(grounded["moments"][0]["alt_san"])
+        self.assertEqual(grounded["moments"][1]["alt_san"], "c5")
 
 
 class MiddlegameDbTests(unittest.TestCase):

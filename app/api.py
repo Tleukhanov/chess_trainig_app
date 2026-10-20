@@ -915,8 +915,16 @@ def _normalize_opening_moments(
     return moments[:4]
 
 
+#: Лимит completion для JSON-отчётов: reasoning-модели иначе съедают весь бюджет.
+_REPORT_MAX_TOKENS = 7000
+
+
 def _llm_json_with_retries(
-    messages: list[ChatMessage], *, error_prefix: str
+    messages: list[ChatMessage],
+    *,
+    error_prefix: str,
+    temperature: float = 0.4,
+    max_tokens: int | None = None,
 ) -> dict[str, Any]:
     """JSON-ответ LLM с тремя попытками.
 
@@ -949,7 +957,8 @@ def _llm_json_with_retries(
             text = clean_llm_text(
                 llm.chat(
                     attempt_messages,
-                    temperature=0.4,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
                     json_mode=True,
                     **kwargs,
                 )
@@ -969,6 +978,7 @@ def _opening_report_llm(entry: dict[str, Any]) -> dict[str, Any]:
     return _llm_json_with_retries(
         _opening_analyze_messages(entry),
         error_prefix="LLM не вернул JSON-отчёт по дебюту",
+        max_tokens=_REPORT_MAX_TOKENS,
     )
 
 
@@ -1160,7 +1170,12 @@ def _middlegame_engine_facts(session: mg.MiddlegameSession) -> list[dict[str, An
             mover_white = board.turn == chess.WHITE
             top = lines[0]
             eval_before = dict(top.get("eval") or {})
-            best_san = (top.get("pv") or [None])[0]
+            pv_before = [str(move) for move in (top.get("pv") or [])][:4]
+            best_san = pv_before[0] if pv_before else None
+            second_san = None
+            if len(lines) > 1:
+                second_pv = lines[1].get("pv") or []
+                second_san = second_pv[0] if second_pv else None
             win_before = _middlegame_side_win(eval_before, mover_white)
             try:
                 move = chess.Move.from_uci(uci)
@@ -1176,12 +1191,17 @@ def _middlegame_engine_facts(session: mg.MiddlegameSession) -> list[dict[str, An
                     }
                 else:
                     eval_after = {"cp": 0.0, "mate": None}
+                pv_after: list[str] = []
                 lines = []
             else:
                 next_lines = engine.analyze_position(board)
                 if not next_lines:
                     break
                 eval_after = dict(next_lines[0].get("eval") or {})
+                pv_after = [
+                    str(chess_move)
+                    for chess_move in (next_lines[0].get("pv") or [])
+                ][:4]
                 lines = next_lines
             win_after = _middlegame_side_win(eval_after, mover_white)
             facts.append(
@@ -1193,6 +1213,9 @@ def _middlegame_engine_facts(session: mg.MiddlegameSession) -> list[dict[str, An
                     "eval_after": eval_after,
                     "delta": round(max(0.0, win_before - win_after), 2),
                     "best_san": best_san,
+                    "second_san": second_san,
+                    "pv": pv_before,
+                    "pv_after": pv_after,
                 }
             )
     return facts
@@ -1204,6 +1227,8 @@ def _middlegame_report_llm(prompt: str) -> dict[str, Any]:
     return _llm_json_with_retries(
         [ChatMessage("user", prompt)],
         error_prefix="LLM не вернул JSON-отчёт по миттельшпилю",
+        temperature=0.3,
+        max_tokens=_REPORT_MAX_TOKENS,
     )
 
 
@@ -1237,7 +1262,10 @@ def _run_middlegame_analyze_job(
             position=mg.POSITION_BY_KEY.get(session.position_key),
         )
         report = mg.ground_report(
-            mg.normalize_report(_middlegame_report_llm(prompt)), engine_facts
+            mg.normalize_report(_middlegame_report_llm(prompt)),
+            engine_facts,
+            fen=session.fen,
+            moves=list(session.moves),
         )
 
         with Database(app.state.db_path) as db:
