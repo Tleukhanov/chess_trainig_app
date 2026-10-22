@@ -1,11 +1,11 @@
 // Chess Trainer Frontend — SPA на vanilla JS, потребляет /api/* эндпоинты.
 
-import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.5.3';
+import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.5.4';
 
 const state = {
   user: null,
   currentView: 'dashboard',
-  timers: { coach: null, task: null, llm: null, tool: null, opening: null, middlegame: null },
+  timers: { coach: null, task: null, llm: null, tool: null, opening: null, middlegame: null, quote: null },
   gamesFilter: 'all',
   gameId: null,
   gameData: null,
@@ -71,6 +71,18 @@ async function apiPost(path, formData) {
   return resp.json();
 }
 
+function showToast(msg, kind) {
+  const toast = document.createElement('div');
+  toast.className = kind === 'error' ? 'alert alert-error' : 'alert alert-info';
+  toast.textContent = msg;
+  Object.assign(toast.style, {
+    position: 'fixed', bottom: '16px', right: '16px', zIndex: '9999',
+    maxWidth: '360px', boxShadow: '0 4px 12px rgba(0,0,0,0.25)',
+  });
+  document.body.appendChild(toast);
+  setTimeout(() => { if (toast.parentNode) toast.parentNode.removeChild(toast); }, kind === 'error' ? 4000 : 2500);
+}
+
 // --- Тема (светлая/тёмная) ---
 
 function readStoredTheme() {
@@ -101,6 +113,15 @@ function setupTheme() {
 // --- Navigation ---
 
 const views = ['dashboard', 'overview', 'plan', 'progress', 'games', 'drills', 'task', 'opening', 'middlegame', 'coach', 'tools', 'users'];
+
+function clearAllTimers() {
+  Object.keys(state.timers).forEach(key => {
+    if (state.timers[key]) {
+      clearInterval(state.timers[key]);
+      state.timers[key] = null;
+    }
+  });
+}
 
 function navigate(view) {
   if (!views.includes(view)) view = 'dashboard';
@@ -260,6 +281,7 @@ function renderUserbox() {
 async function render(view) {
   const app = document.getElementById('app');
   clearGameKeyboard();
+  clearAllTimers();
   const auth = await authStatus();
   if (!auth.logged_in) {
     state.user = null;
@@ -790,6 +812,7 @@ async function planLlmGenerate(app, regenerate) {
     state.planLlmGenerating = false;
     state.planLlmJobId = null;
     state.planLlmError = err.message;
+    showToast(err.message, 'error');
     await viewPlan(app);
   }
 }
@@ -797,6 +820,7 @@ async function planLlmGenerate(app, regenerate) {
 function planLlmPoll(app, jobId) {
   if (state.timers.llm) clearInterval(state.timers.llm);
   state.timers.llm = setInterval(async () => {
+    if (state.currentView !== 'plan') { clearInterval(state.timers.llm); state.timers.llm = null; return; }
     let job;
     try {
       job = await api('/api/jobs/' + jobId);
@@ -1391,6 +1415,7 @@ async function submitTaskAnswer(app, san) {
     state.task.done = !!res.correct;
   } catch (err) {
     state.taskError = err.message;
+    showToast(err.message, 'error');
   }
   drawTask(app);
 }
@@ -1413,6 +1438,7 @@ async function taskExplain(app) {
     state.taskExplaining = false;
     state.taskJobId = null;
     state.taskError = err.message;
+    showToast(err.message, 'error');
     drawTask(app);
     return;
   }
@@ -1430,6 +1456,7 @@ async function taskExplain(app) {
 function taskPollExplanation(app, jobId) {
   if (state.timers.task) clearInterval(state.timers.task);
   state.timers.task = setInterval(async () => {
+    if (state.currentView !== 'task') { clearInterval(state.timers.task); state.timers.task = null; return; }
     let job;
     try {
       job = await api('/api/jobs/' + jobId);
@@ -1824,6 +1851,7 @@ async function submitOpeningMove(app, san) {
   } catch (err) {
     if (isSessionError(err)) { handleSessionExpired(); return; }
     state.openingError = err.message;
+    showToast(err.message, 'error');
     state.openingThinking = false;
     drawOpening(app);
     return;
@@ -1851,6 +1879,7 @@ async function submitOpeningMove(app, san) {
   } catch (err) {
     if (isSessionError(err)) { handleSessionExpired(); return; }
     state.openingError = err.message;
+    showToast(err.message, 'error');
   } finally {
     state.openingThinking = false;
     drawOpening(app);
@@ -1876,6 +1905,7 @@ async function openingAnalyze(app) {
     state.openingAnalyzing = false;
     state.openingJobId = null;
     state.openingError = err.message;
+    showToast(err.message, 'error');
     drawOpening(app);
   }
 }
@@ -2734,6 +2764,7 @@ async function submitMiddlegameMove(app, uci, opts = {}) {
     state.middlegameOptimistic = null;
     if (isSessionError(err)) { handleSessionExpired(); return; }
     state.middlegameError = err.message;
+    showToast(err.message, 'error');
     drawMiddlegame(app);
     return;
   }
@@ -2758,6 +2789,7 @@ async function middlegameReply(app) {
     state.middlegameThinking = false;
     if (isSessionError(err)) { handleSessionExpired(); return; }
     state.middlegameError = err.message;
+    showToast(err.message, 'error');
     try {
       const fresh = await api('/api/middlegame/session/' + encodeURIComponent(session.id));
       state.middlegameSession = fresh;
@@ -2785,11 +2817,12 @@ async function middlegameAnalyze(app) {
     storeMiddlegameJob(session.id, res.job_id);
     middlegamePoll(app, res.job_id);
   } catch (err) {
-    if (isSessionError()) { handleSessionExpired(); return; }
+    if (isSessionError(err)) { handleSessionExpired(); return; }
     state.middlegameAnalyzing = false;
     state.middlegameJobId = null;
     clearMiddlegameJob();
     state.middlegameError = err.status === 503 ? 'Сервер занят, попробуйте ещё раз' : err.message;
+    showToast(state.middlegameError, 'error');
     drawMiddlegame(app);
   }
 }
@@ -2959,6 +2992,7 @@ async function viewCoach(app) {
         btn.textContent = 'Запустить';
       }
       document.getElementById('job-container').innerHTML = `<div class="alert alert-error">${esc(err.message)}</div>`;
+       showToast(err.message, 'error');
     }
   });
 
@@ -3034,14 +3068,16 @@ function showJob(app, jobId) {
     quoteIdx++;
   };
   paintQuote();
-  const quoteTimer = setInterval(paintQuote, 8000);
+  if (state.timers.quote) clearInterval(state.timers.quote);
+  state.timers.quote = setInterval(paintQuote, 8000);
 
   const startedAt = Date.now();
-  const stopQuote = () => clearInterval(quoteTimer);
+  const stopQuote = () => { if (state.timers.quote) { clearInterval(state.timers.quote); state.timers.quote = null; } };
 
   if (state.timers.coach) clearInterval(state.timers.coach);
   let pollFails = 0;
   state.timers.coach = setInterval(async () => {
+    if (state.currentView !== 'coach') { clearInterval(state.timers.coach); state.timers.coach = null; stopQuote(); return; }
     try {
       const j = await api('/api/jobs/' + jobId);
       pollFails = 0;
@@ -3282,6 +3318,7 @@ function toolError(err) {
   }
   const box = document.getElementById('tool-result');
   if (box) box.innerHTML = `<div class="alert alert-error">${esc(err.message)}</div>`;
+  showToast(err.message, 'error');
 }
 
 function startToolJob(jobId, onDone) {
