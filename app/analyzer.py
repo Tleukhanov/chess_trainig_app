@@ -43,18 +43,35 @@ def win_percent(cp_white: float | None, mate: int | None = None) -> float:
     Аргументы должны быть в перспективе стороны, для которой считается вероятность.
     """
     if mate is not None:
-        if mate > 0:
+        try:
+            mate_value = int(mate)
+        except (TypeError, ValueError):
+            mate_value = 0
+        if mate_value > 0:
             return 100.0
-        if mate < 0:
+        if mate_value < 0:
             return 0.0
         return 50.0
     if cp_white is None:
         return 50.0
     try:
-        return 50.0 + 50.0 * (2.0 / (1.0 + math.exp(-0.00368208 * cp_white)) - 1.0)
+        cp_value = float(cp_white)
+    except (TypeError, ValueError):
+        return 50.0
+    if cp_value != cp_value:  # NaN
+        return 50.0
+    if cp_value == float("inf"):
+        return 100.0
+    if cp_value == float("-inf"):
+        return 0.0
+    # Зажимаем экстремальные значения, чтобы избежать переполнения и дать
+    # устойчивый предел даже при мусорных входах.
+    cp_value = max(-10000.0, min(10000.0, cp_value))
+    try:
+        return 50.0 + 50.0 * (2.0 / (1.0 + math.exp(-0.00368208 * cp_value)) - 1.0)
     except OverflowError:
         # Очень большие по модулю cp: вероятность вырождается в 0/100.
-        return 0.0 if cp_white < 0 else 100.0
+        return 0.0 if cp_value < 0 else 100.0
 
 
 def classify_move(win_before: float | None, win_after: float | None, is_best: bool = False) -> str:
@@ -258,12 +275,29 @@ class Engine:
             return None
         return self.time_ms / 1000.0
 
-    def _ensure_started(self) -> None:
-        if self._engine is not None:
-            return
+    def _start_process(self) -> None:
+        """Запускает новый процесс Stockfish и применяет конфигурацию."""
+        engine = chess.engine.SimpleEngine.popen_uci(str(self.path))
         try:
-            self._engine = chess.engine.SimpleEngine.popen_uci(str(self.path))
-            self._engine.configure({"Threads": self.threads, "Hash": self.hash_mb})
+            engine.configure({"Threads": self.threads, "Hash": self.hash_mb})
+        except Exception:
+            try:
+                engine.quit()
+            except Exception:  # noqa: BLE001
+                pass
+            raise
+        self._engine = engine
+
+    def _ensure_started(self) -> None:
+        # Health-check: если процесс упал/завис, перезапускаем его.
+        if self._engine is not None:
+            try:
+                self._engine.ping()
+                return
+            except Exception:  # noqa: BLE001
+                self.close()
+        try:
+            self._start_process()
         except Exception as exc:
             if self._engine is not None:
                 try:
@@ -278,6 +312,8 @@ class Engine:
             return
         try:
             self._engine.quit()
+        except Exception:  # noqa: BLE001
+            pass
         finally:
             self._engine = None
 
@@ -298,11 +334,23 @@ class Engine:
 
         Каждая линия: {"pv": [SAN...], "eval": {cp, mate}, "win": win% для белых}.
         """
-        self._ensure_started()
-        assert self._engine is not None
         multipv = self.multipv if self.multipv and self.multipv > 0 else 1
         limit = chess.engine.Limit(depth=self.depth, time=self._time_limit_seconds)
-        infos = self._engine.analyse(board, limit, multipv=multipv)
+        infos = None
+        last_exc: Exception | None = None
+        for _attempt in range(2):
+            try:
+                self._ensure_started()
+                assert self._engine is not None
+                infos = self._engine.analyse(board, limit, multipv=multipv)
+                last_exc = None
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                self.close()
+        if last_exc is not None:
+            raise RuntimeError(f"Stockfish analysis failed ({self.path}): {last_exc}") from last_exc
+        assert infos is not None
         lines: list[dict[str, Any]] = []
         for info in infos:
             score = info.get("score")
@@ -354,7 +402,11 @@ class Engine:
                 )
             )
             if ply < len(moves):
-                board.push_san(moves[ply])
+                try:
+                    board.push_san(moves[ply])
+                except (ValueError, chess.IllegalMoveError):
+                    # Нелегальный ход в записи: дальше анализировать нельзя.
+                    break
         return entries
 
     def analyze_game(self, game: Game) -> GameAnalysis:
