@@ -271,7 +271,7 @@ def board_of(session: MiddlegameSession) -> chess.Board:
     board = chess.Board(session.fen)
     for uci in session.moves:
         try:
-            move = chess.Move.from_uci(uci)
+            move = chess.Move.from_uci(str(uci).strip())
         except ValueError as exc:
             raise ValueError(f"Недопустимый ход в истории: {uci!r}") from exc
         if move not in board.legal_moves:
@@ -301,7 +301,7 @@ def user_turn(session: MiddlegameSession) -> bool:
 def _parse_move(board: chess.Board, uci: str) -> chess.Move:
     """Парсит UCI и проверяет легальность; ошибки — русским ``ValueError``."""
     try:
-        move = chess.Move.from_uci(str(uci))
+        move = chess.Move.from_uci(str(uci).strip())
     except ValueError as exc:
         raise ValueError(f"Недопустимый ход: {uci!r}") from exc
     if move not in board.legal_moves:

@@ -670,7 +670,12 @@ def pick_move(
         max_style_delta=max_style_delta,
         max_candidates=max_candidates,
     )
-    temp = temperature if temperature and temperature > 0 else 1.0
+    try:
+        temp = float(temperature)
+    except (TypeError, ValueError):
+        temp = 1.0
+    if not temp or temp <= 0 or temp != temp:  # NaN check
+        temp = 1.0
     if abs(temp - 1.0) < 1e-9:
         weighted = list(ranked)
     else:
@@ -798,10 +803,15 @@ def opponent_move(
     Политика — любой объект с методом ``probs(board, *, k=...)``. Бросает
     ``ValueError``, если сейчас не очередь соперника.
     """
+    if is_finished(game):
+        raise ValueError("Партия уже завершена")
     board = board_from_moves(game.moves)
     if board.turn != opponent_color(game):
         raise ValueError("Сейчас не ход соперника")
-    candidates = policy.probs(board, k=k)
+    try:
+        candidates = policy.probs(board, k=k)
+    except Exception as exc:
+        raise ValueError(f"Соперник (Maia) недоступен: {exc}") from exc
     san, reason = pick_move(
         board,
         candidates,
@@ -819,6 +829,8 @@ def opponent_move(
 
 def user_move(game: OpeningGame, san: str) -> None:
     """Применяет ход пользователя (SAN). Недопустимо/не в свой ход -> ValueError."""
+    if is_finished(game):
+        raise ValueError("Партия уже завершена")
     board = board_from_moves(game.moves)
     if board.turn != user_color(game):
         raise ValueError("Сейчас не ход пользователя")

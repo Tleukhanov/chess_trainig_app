@@ -21,7 +21,7 @@ _VALID_ROLES = frozenset({"system", "user", "assistant"})
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "0.0.0.0", "::1"})
 
 _THINK_BLOCK_RE = re.compile(
-    r"<(?:think|thinking|thought)\b[^>]*>.*?</(?:think|thinking|thought)>",
+    r"<(?:think|thinking|thought|reasoning|analysis)\b[^>]*>.*?</(?:think|thinking|thought|reasoning|analysis)>",
     re.IGNORECASE | re.DOTALL,
 )
 _HSPACE_RE = re.compile(r"[ \t\u00a0]+")
@@ -218,7 +218,12 @@ class LLMClient:
             raise RuntimeError("LLM: не удалось разобрать JSON-ответ") from exc
 
         if isinstance(data, dict) and data.get("error"):
-            raise RuntimeError(f"LLM: {data['error']}")
+            err = data["error"]
+            if isinstance(err, dict):
+                detail = err.get("message") or err.get("detail") or str(err)
+            else:
+                detail = str(err)
+            raise RuntimeError(f"LLM: {detail}")
 
         choices = data.get("choices") if isinstance(data, dict) else None
         if not choices:
@@ -230,7 +235,10 @@ class LLMClient:
         content = msg.get("content")
         if not isinstance(content, str) or not content.strip():
             finish = first.get("finish_reason") or first.get("native_finish_reason")
-            has_reasoning = bool(msg.get("reasoning") or msg.get("reasoning_content"))
+            has_reasoning = bool(
+                msg.get("reasoning") or msg.get("reasoning_content")
+                or (isinstance(data, dict) and (data.get("reasoning") or data.get("reasoning_content")))
+            )
             hint = ""
             if finish == "length" or has_reasoning:
                 hint = " — модель потратила лимит на размышление, увеличьте лимит токенов"
