@@ -274,6 +274,7 @@ h3 { font-size: 15px; font-weight: 600; margin-top: 16px; }
 .form-group { margin-bottom: 12px; }
 .form-group label { display: block; font-size: 13px; font-weight: 500; margin-bottom: 4px; color: var(--c-text); }
 .form-group input[type="text"],
+.form-group input[type="password"],
 .form-group input[type="number"],
 .form-group select {
   width: 100%;
