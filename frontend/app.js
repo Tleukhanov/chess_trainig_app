@@ -1,6 +1,6 @@
 // Chess Trainer Frontend — SPA на vanilla JS, потребляет /api/* эндпоинты.
 
-import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.5.6';
+import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.5.7';
 
 const state = {
   user: null,
@@ -1608,6 +1608,7 @@ async function drawOpeningSetup(app, errorMsg) {
             <button type="button" class="btn btn-secondary" data-opp="stronger" title="Соперник на 200 Elo выше твоего рейтинга (база: твой рейтинг или 1500 по умолчанию); Maia играет сильнее">сильнее (+200)</button>
           </div>
           <div style="font-size:12px;color:var(--c-text-muted);margin-top:4px">Число — разница Elo соперника относительно твоего рейтинга (база из профиля или 1500): +100/+200 означает соперника сильнее на 100/200 пунктов. Используется для выбора силы Maia.</div>
+          <div id="opening-strength-note" style="font-size:12px;color:var(--c-text-muted);margin-top:4px;display:none">Твой рейтинг ≥ 2000: Maia не различает силы выше 2000 Elo, доступен только равный уровень.</div>
         </div>
         <div class="form-group">
           <label>Твой цвет</label>
@@ -1637,8 +1638,26 @@ async function drawOpeningSetup(app, errorMsg) {
       app.querySelectorAll('#opening-form [data-color]').forEach(b => b.classList.toggle('btn-active', b === btn));
     });
   });
+  const updateOpeningStrengthAvailability = () => {
+    const my = document.getElementById('opening-my-elo');
+    const base = Number(my && my.value) || 1500;
+    const high = base >= 2000;
+    const note = document.getElementById('opening-strength-note');
+    if (note) note.style.display = high ? 'block' : 'none';
+    app.querySelectorAll('#opening-form [data-opp="plus100"], #opening-form [data-opp="stronger"]').forEach(btn => {
+      btn.disabled = high;
+      btn.style.opacity = high ? '0.45' : '';
+      btn.style.cursor = high ? 'not-allowed' : '';
+      btn.title = high
+        ? 'Maia не различает силы выше 2000 Elo: для твоего рейтинга +100/+200 недоступны'
+        : (btn.dataset.opp === 'plus100'
+            ? 'Соперник на 100 Elo выше твоего рейтинга (база: твой рейтинг или 1500 по умолчанию); Maia играет сильнее'
+            : 'Соперник на 200 Elo выше твоего рейтинга (база: твой рейтинг или 1500 по умолчанию); Maia играет сильнее');
+    });
+  };
   app.querySelectorAll('#opening-form [data-opp]').forEach(btn => {
     btn.addEventListener('click', () => {
+      if (btn.disabled) return;
       app.querySelectorAll('#opening-form [data-opp]').forEach(b => b.classList.toggle('btn-active', b === btn));
       const my = document.getElementById('opening-my-elo');
       const opp = document.getElementById('opening-opp-elo');
@@ -1649,6 +1668,9 @@ async function drawOpeningSetup(app, errorMsg) {
       else opp.value = String(base + 200);
     });
   });
+  const myEloInput = document.getElementById('opening-my-elo');
+  if (myEloInput) myEloInput.addEventListener('input', updateOpeningStrengthAvailability);
+  updateOpeningStrengthAvailability();
 
   const form = document.getElementById('opening-form');
   form.addEventListener('submit', async e => {
@@ -2553,9 +2575,18 @@ function drawMiddlegameSetup(app) {
             <div class="form-group">
               <label>Соперник</label>
               <div class="games-filter" id="middlegame-strength">
-                ${Object.keys(MIDDLEGAME_STRENGTH_LABELS).map(key => `<button type="button" class="btn btn-secondary ${key === strength ? 'btn-active' : ''}" data-strength="${esc(key)}" title="${key === 'equal' ? 'Соперник того же уровня: рейтинг равен твоему' : key === 'plus100' ? 'Соперник на 100 Elo выше твоего рейтинга' : 'Соперник на 200 Elo выше твоего рейтинга'}">${esc(MIDDLEGAME_STRENGTH_LABELS[key])}</button>`).join('')}
+                ${Object.keys(MIDDLEGAME_STRENGTH_LABELS).map(key => {
+                  const disabled = (key !== 'equal') && ((state.middlegameMeta && state.middlegameMeta.base_elo >= 2000) || false);
+                  const title = key === 'equal'
+                    ? 'Соперник того же уровня: рейтинг равен твоему'
+                    : (disabled
+                        ? 'Maia не различает силы выше 2000 Elo: для твоего рейтинга +100/+200 недоступны'
+                        : (key === 'plus100' ? 'Соперник на 100 Elo выше твоего рейтинга' : 'Соперник на 200 Elo выше твоего рейтинга'));
+                  return `<button type="button" class="btn btn-secondary ${key === strength ? 'btn-active' : ''}" data-strength="${esc(key)}" title="${esc(title)}" ${disabled ? 'disabled style="opacity:0.45;cursor:not-allowed"' : ''}>${esc(MIDDLEGAME_STRENGTH_LABELS[key])}</button>`;
+                }).join('')}
               </div>
               <div style="font-size:12px;color:var(--c-text-muted);margin-top:4px">Число — разница Elo соперника относительно твоего рейтинга (база из профиля или значение по умолчанию): +100/+200 = соперник сильнее на 100/200 пунктов. Используется для выбора силы Maia.</div>
+              ${state.middlegameMeta && state.middlegameMeta.base_elo >= 2000 ? '<div style="font-size:12px;color:var(--c-text-muted);margin-top:4px">Твой рейтинг ≥ 2000: Maia не различает силы выше 2000 Elo, доступен только равный уровень.</div>' : ''}
             </div>
             <div class="alert alert-error" id="middlegame-setup-err" style="display:none"></div>
             <button type="submit" class="btn btn-primary" id="middlegame-start" ${ready ? '' : 'disabled'}>Начать партию</button>
@@ -2578,6 +2609,7 @@ function drawMiddlegameSetup(app) {
   }
   app.querySelectorAll('#middlegame-strength [data-strength]').forEach(btn => {
     btn.addEventListener('click', () => {
+      if (btn.disabled) return;
       state.middlegameStrength = btn.dataset.strength;
       app.querySelectorAll('#middlegame-strength [data-strength]').forEach(b => b.classList.toggle('btn-active', b === btn));
     });

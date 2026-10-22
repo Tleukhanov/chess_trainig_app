@@ -2285,7 +2285,7 @@ class FrontendTests(ApiTestBase):
         html = resp.text
         self.assertIn("app.js?v=", html)
         self.assertIn("style.css?v=", html)
-        self.assertIn("v0.5.6", html)
+        self.assertIn("v0.5.7", html)
 
     def test_api_version(self):
         self.assertEqual(self.app.version, "0.4.8")
