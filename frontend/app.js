@@ -1,5 +1,7 @@
 // Chess Trainer Frontend — SPA на vanilla JS, потребляет /api/* эндпоинты.
 
+import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.5.3';
+
 const state = {
   user: null,
   currentView: 'dashboard',
@@ -40,6 +42,7 @@ const state = {
   middlegameAnalyzing: false,
   middlegameJobId: null,
   middlegameError: null,
+  middlegameOptimistic: null,
   authMode: 'login',
   trackStarted: false,
 };
@@ -1016,7 +1019,7 @@ function drawGameDetail(app) {
     <div style="margin-bottom:16px"><a href="#" class="btn btn-secondary" data-view="games">← К списку партий</a></div>
     <div class="grid game-layout">
       <div class="card">
-        ${boardHtml(fens[ply], lastMove, game.user_color === 'black')}
+        ${boardHtml(fens[ply], { lastMove, flip: game.user_color === 'black' })}
         <div class="board-meta">
           <span class="badge badge-neutral">Ходят: ${turnLabel}</span>
           <span class="badge badge-blue">${esc(posLabel)}</span>
@@ -1049,6 +1052,7 @@ function drawGameDetail(app) {
     </div>`;
 
   bindLinks(app);
+  bindBoard(app.querySelector('.board'));
   app.querySelectorAll('.move-cell').forEach(cell => {
     cell.addEventListener('click', () => {
       state.gamePly = +cell.dataset.ply;
@@ -1083,76 +1087,6 @@ function gameMetricsHtml(analysis) {
     </div>`;
 }
 
-const PIECE_GLYPHS = {
-  K: '♚', Q: '♛', R: '♜', B: '♝', N: '♞', P: '♟',
-  k: '♚', q: '♛', r: '♜', b: '♝', n: '♞', p: '♟',
-};
-const FILES = 'abcdefgh';
-
-function fenPieces(fen) {
-  const placement = fen.split(' ')[0];
-  const pieces = {};
-  let rank = 8, file = 0;
-  for (const ch of placement) {
-    if (ch === '/') { rank--; file = 0; continue; }
-    if (ch >= '1' && ch <= '8') { file += +ch; continue; }
-    pieces[FILES[file] + rank] = ch;
-    file++;
-  }
-  return pieces;
-}
-
-function lastMoveSquares(fenBefore, fenAfter) {
-  const before = fenPieces(fenBefore);
-  const after = fenPieces(fenAfter);
-  const froms = [];
-  const tos = [];
-  for (let r = 8; r >= 1; r--) {
-    for (let f = 0; f < 8; f++) {
-      const sq = FILES[f] + r;
-      if (before[sq] && !after[sq]) froms.push(sq);
-      if (!before[sq] && after[sq]) tos.push(sq);
-    }
-  }
-  if (froms.length === 2 && tos.length === 1) {
-    // en passant: снятая пешка стоит на вертикали пункта назначения
-    const to = tos[0];
-    const captured = froms.find(s => s[0] === to[0]) || froms[1];
-    const from = froms.find(s => s !== captured) || froms[0];
-    return [from, to, captured];
-  }
-  return froms.concat(tos);
-}
-
-function boardHtml(fen, hlSquares, flip = false) {
-  const pieces = fenPieces(fen);
-  const hl = hlSquares || [];
-  const flipped = !!flip;
-  const ranks = [];
-  for (let r = 8; r >= 1; r--) ranks.push(r);
-  if (flipped) ranks.reverse();
-  const files = [];
-  for (let f = 0; f < 8; f++) files.push(f);
-  if (flipped) files.reverse();
-  let html = '';
-  for (let ri = 0; ri < 8; ri++) {
-    const rank = ranks[ri];
-    for (let ci = 0; ci < 8; ci++) {
-      const f = files[ci];
-      const square = FILES[f] + rank;
-      const light = ((f + (8 - rank)) % 2 === 0);
-      const cls = ['sq', light ? 'light' : 'dark'];
-      if (hl.includes(square)) cls.push('lm');
-      const piece = pieces[square];
-      const coordColor = light ? 'var(--c-sq-dark)' : 'var(--c-sq-light)';
-      let coord = '';
-      if (ci === 0) coord += `<span class="board-coord board-coord-rank" style="color:${coordColor}">${rank}</span>`;
-      if (ri === 7) coord += `<span class="board-coord board-coord-file" style="color:${coordColor}">${FILES[f]}</span>`;
-      html += `<div class="${cls.join(' ')}" data-square="${square}">${coord}${piece ? `<span class="piece ${piece === piece.toUpperCase() ? 'pw' : 'pb'}">${PIECE_GLYPHS[piece]}</span>` : ''}</div>`;
-    }
-  }
-  return `<div class="board">${html}</div>`;
-}
 
 function bindGameKeyboard() {
   clearGameKeyboard();
@@ -1383,7 +1317,7 @@ function drawTask(app) {
     <div class="card-header"><h1>Задача дня</h1><span class="badge badge-blue">${esc(state.user.nick)}</span></div>
     <div class="grid game-layout">
       <div class="card">
-        ${boardHtml(task.fen, undefined, task.user_color === 'black')}
+        ${boardHtml(task.fen, { flip: task.user_color === 'black' })}
         <div class="board-meta">
           <span class="badge badge-blue">${esc(task.date)}</span>
           <span class="badge badge-neutral">${esc(task.opening || '—')}${task.eco ? ` ${esc(task.eco)}` : ''}</span>
@@ -1419,47 +1353,24 @@ function drawTask(app) {
   }
   const explainBtn = document.getElementById('task-explain');
   if (explainBtn) explainBtn.addEventListener('click', () => taskExplain(app));
+  bindBoard(app.querySelector('.board'));
   if (!state.taskResult && !task.done) {
     api('/api/task/legal').then(legal => {
       if (!legal || !state.task || legal.task_key !== state.task.task_key) return;
       if (state.taskResult || state.task.done) return;
+      // Доска могла перерисоваться, пока шёл запрос: берём актуальную ноду.
+      const board = app.querySelector('.board');
+      if (!board) return;
       const moves = (legal.moves || []).filter(m => m && m.from && m.to && m.san);
-      if (!moves.length) return;
-      const squares = app.querySelectorAll('.sq[data-square]');
-      if (!squares.length) return;
-      let selected = null;
-      const clearHl = () => squares.forEach(sq => sq.classList.remove('lm'));
-      squares.forEach(sq => {
-        sq.addEventListener('click', () => {
-          const sqName = sq.dataset.square;
-          if (selected) {
-            const targets = moves.filter(m => m.from === selected);
-            const cands = targets.filter(m => m.to === sqName);
-            if (cands.length) {
-              const pick = cands.find(m => (m.san || '').includes('=Q')) || cands[0];
-              submitTaskAnswer(app, pick.san);
-              return;
-            }
-          }
-          if (moves.some(m => m.from === sqName)) {
-            if (selected === sqName) {
-              selected = null;
-              clearHl();
-              return;
-            }
-            selected = sqName;
-            clearHl();
-            const goals = new Set(moves.filter(m => m.from === sqName).map(m => m.to));
-            squares.forEach(el => {
-              if (el.dataset.square === sqName || goals.has(el.dataset.square)) el.classList.add('lm');
-            });
-            return;
-          }
-          selected = null;
-          clearHl();
-        });
+      if (!moves.length) { bindBoard(board); return; }
+      bindBoard(board, {
+        moves,
+        onMove: move => submitTaskAnswer(app, move.san),
       });
+      const hint = document.getElementById('task-board-hint');
+      if (hint) hint.textContent = 'кликни фигуру, затем клетку (или перетащи её) — либо введи ход текстом';
     }).catch(() => {
+      bindBoard(app.querySelector('.board'));
       const hint = document.getElementById('task-board-hint');
       if (hint) hint.textContent = 'введи ход текстом (доска-интерактив недоступен)';
     });
@@ -1821,7 +1732,7 @@ function drawOpening(app) {
         ${state.openingThinking
           ? '<p style="color:var(--c-text-muted);font-size:13px;margin-top:0">соперник думает…</p>'
           : yourTurn
-            ? '<p style="color:var(--c-text-muted);font-size:13px;margin-top:0">кликни фигуру, затем клетку — доска подсветит доступные поля</p>'
+            ? '<p style="color:var(--c-text-muted);font-size:13px;margin-top:0">кликни или перетащи фигуру — точки показывают доступные поля; ПКМ-протяжка рисует стрелку</p>'
             : '<p style="color:var(--c-text-muted);font-size:13px;margin-top:0">ждём соперника…</p>'}
       </div>`;
   }
@@ -1831,7 +1742,7 @@ function drawOpening(app) {
     ${state.openingError ? `<div class="alert alert-error">${esc(state.openingError)}</div>` : ''}
     <div class="grid game-layout">
       <div class="card">
-        ${boardHtml(s.fen, openingHighlight(), flip)}
+        ${boardHtml(s.fen, { lastMove: openingHighlight(), flip, animate: yourTurn && !state.openingThinking && moves.length > 0 })}
         <div class="board-meta">
           <span class="badge badge-neutral">${esc(openingStyleLabel(s.style))}</span>
           <span class="badge badge-blue">ты: ${colorLabel}</span>
@@ -1851,6 +1762,7 @@ function drawOpening(app) {
       </div>
     </div>`;
 
+  bindBoard(app.querySelector('.board'));
   const newBtn = document.getElementById('opening-new');
   if (newBtn) newBtn.addEventListener('click', () => {
     if (state.timers.opening) { clearInterval(state.timers.opening); state.timers.opening = null; }
@@ -1876,40 +1788,24 @@ function bindOpeningBoard(app, sessionId) {
   api('/api/opening/' + encodeURIComponent(sessionId) + '/legal').then(legal => {
     const s = state.openingSession;
     if (!s || s.id !== sessionId) return;
-    if (s.finished || s.turn !== s.color || state.openingThinking) return;
+    // Доска могла перерисоваться, пока шёл запрос: берём актуальную ноду.
+    const board = app.querySelector('.board');
+    if (!board) return;
+    if (s.finished || s.turn !== s.color || state.openingThinking) { bindBoard(board); return; }
     const moves = ((legal && legal.moves) || []).filter(m => m && m.from && m.to && m.san);
-    if (!moves.length) return;
-    const squares = app.querySelectorAll('.sq[data-square]');
-    if (!squares.length) return;
-    let selected = null;
-    const clearHl = () => squares.forEach(sq => sq.classList.remove('lm'));
-    squares.forEach(sq => {
-      sq.addEventListener('click', () => {
-        if (state.openingThinking || state.openingSession !== s || s.finished) return;
-        const sqName = sq.dataset.square;
-        if (selected) {
-          const cands = moves.filter(m => m.from === selected && m.to === sqName);
-          if (cands.length) {
-            const pick = cands.find(m => (m.san || '').includes('=Q')) || cands[0];
-            submitOpeningMove(app, pick.san);
-            return;
-          }
-        }
-        if (moves.some(m => m.from === sqName)) {
-          if (selected === sqName) { selected = null; clearHl(); return; }
-          selected = sqName;
-          clearHl();
-          const goals = new Set(moves.filter(m => m.from === sqName).map(m => m.to));
-          squares.forEach(el => {
-            if (el.dataset.square === sqName || goals.has(el.dataset.square)) el.classList.add('lm');
-          });
-          return;
-        }
-        selected = null;
-        clearHl();
-      });
+    if (!moves.length) { bindBoard(board); return; }
+    bindBoard(board, {
+      moves,
+      canMove: () => {
+        const cur = state.openingSession;
+        return !!cur && cur.id === sessionId && !cur.finished && !state.openingThinking;
+      },
+      onMove: move => submitOpeningMove(app, move.san),
     });
-  }).catch(() => { /* доска недоступна — партию можно продолжить позже */ });
+  }).catch(() => {
+    /* доска недоступна для ходов — стрелки и подсветка всё равно нужны */
+    bindBoard(app.querySelector('.board'));
+  });
 }
 
 async function submitOpeningMove(app, san) {
@@ -2183,6 +2079,11 @@ function mgInCheck(state, color) {
   const king = state.board.indexOf(color === 'w' ? 'K' : 'k');
   if (king < 0) return false;
   return mgAttacked(state, king, color === 'w' ? 'b' : 'w');
+}
+
+function mgKingSquare(state, color) {
+  const king = state.board.indexOf(color === 'w' ? 'K' : 'k');
+  return king >= 0 ? mgSquare(king) : null;
 }
 
 function mgPseudoMoves(state) {
@@ -2487,6 +2388,7 @@ async function createMiddlegameSession(app) {
   state.middlegameAnalyzing = false;
   state.middlegameJobId = null;
   state.middlegameError = null;
+  state.middlegameOptimistic = null;
   state.middlegamePlanDraft = '';
   state.middlegameStrength = 'equal';
   app.innerHTML = '<div class="card"><p>Выбираю позицию миттельшпиля...</p></div>';
@@ -2546,6 +2448,7 @@ async function loadMiddlegameSession(app, id) {
   }
   state.middlegameSession = session;
   state.middlegameError = null;
+  state.middlegameOptimistic = null;
   storeMiddlegameSessionId(session.id);
   const savedJob = readMiddlegameJob();
   if (savedJob && savedJob.sessionId !== session.id) clearMiddlegameJob();
@@ -2625,6 +2528,7 @@ function drawMiddlegameSetup(app) {
       </div>
     </div>`;
 
+  bindBoard(app.querySelector('.board'));
   const input = document.getElementById('middlegame-plan-input');
   const start = document.getElementById('middlegame-start');
   const counter = document.getElementById('middlegame-plan-count');
@@ -2687,9 +2591,24 @@ function drawMiddlegameGame(app) {
   const report = session.report;
   const finished = !!session.result || replay.legal.length === 0 || moves.length >= MIDDLEGAME_MAX_PLIES;
   const yourTurn = !finished && session.status === 'playing' && replay.state.turn === 'w';
-  const lastMove = replay.fens.length > 1
-    ? lastMoveSquares(replay.fens[replay.fens.length - 2], replay.fens[replay.fens.length - 1])
-    : [];
+  // Последний ход берём из UCI: по разнице FEN не видно взятия на занятом поле
+  // (фигура на клетке назначения просто меняется), а анимация нужна и там.
+  const lastUci = moves.length ? String(moves[moves.length - 1]) : '';
+  const lastMove = /^[a-h][1-8][a-h][1-8]/.test(lastUci)
+    ? [lastUci.slice(0, 2), lastUci.slice(2, 4)]
+    : (replay.fens.length > 1
+      ? lastMoveSquares(replay.fens[replay.fens.length - 2], replay.fens[replay.fens.length - 1])
+      : []);
+  // Пока сервер не подтвердил ход, рисуем его локально — без «мигания» фигуры назад.
+  const optimistic = state.middlegameOptimistic;
+  const boardFen = optimistic ? optimistic.fen : replay.fen;
+  const boardLastMove = optimistic ? optimistic.lastMove : lastMove;
+  // Анимируем только чужой ход: свой уже проехал под курсором или в оптимистичной отрисовке.
+  const animateBoard = optimistic
+    ? optimistic.animate !== false
+    : (!state.middlegameThinking && moves.length % 2 === 0);
+  const checkState = mgParseFen(boardFen);
+  const checkSquare = mgInCheck(checkState, checkState.turn) ? mgKingSquare(checkState, checkState.turn) : null;
   const errorMsg = state.middlegameError || (session.status === 'error' ? session.error : null);
   const resultBadge = session.result === '1-0' ? 'badge-good' : session.result === '0-1' ? 'badge-bad' : 'badge-neutral';
 
@@ -2711,7 +2630,7 @@ function drawMiddlegameGame(app) {
         ${state.middlegameThinking
           ? '<p style="color:var(--c-text-muted);font-size:13px;margin-top:0">соперник думает…</p>'
           : yourTurn
-            ? '<p style="color:var(--c-text-muted);font-size:13px;margin-top:0">кликни фигуру, затем клетку — доска подсветит доступные поля</p>'
+            ? '<p style="color:var(--c-text-muted);font-size:13px;margin-top:0">кликни или перетащи фигуру — точки показывают доступные поля; ПКМ-протяжка рисует стрелку</p>'
             : '<p style="color:var(--c-text-muted);font-size:13px;margin-top:0">ждём соперника…</p>'}
         ${!yourTurn && !state.middlegameThinking ? '<button class="btn btn-primary" id="middlegame-resume">Продолжить</button>' : ''}
       </div>`;
@@ -2722,7 +2641,7 @@ function drawMiddlegameGame(app) {
     ${errorMsg ? `<div class="alert alert-error">${esc(errorMsg)}</div>` : ''}
     <div class="grid game-layout">
       <div class="card">
-        ${boardHtml(replay.fen, lastMove, false)}
+        ${boardHtml(boardFen, { lastMove: boardLastMove, animate: animateBoard, check: checkSquare })}
         <div class="board-meta">
           <span class="badge badge-neutral">${esc(title)}</span>
           <span class="badge badge-blue">позиция ${esc(String(session.n || 0))} из ${total}</span>
@@ -2743,6 +2662,7 @@ function drawMiddlegameGame(app) {
       </div>
     </div>`;
 
+  bindBoard(app.querySelector('.board'));
   const newBtn = document.getElementById('middlegame-new');
   if (newBtn) newBtn.addEventListener('click', () => {
     if (state.timers.middlegame) { clearInterval(state.timers.middlegame); state.timers.middlegame = null; }
@@ -2751,6 +2671,7 @@ function drawMiddlegameGame(app) {
     state.middlegameAnalyzing = false;
     state.middlegameJobId = null;
     state.middlegameError = null;
+    state.middlegameOptimistic = null;
     state.middlegamePlanDraft = '';
     state.middlegameStrength = 'equal';
     clearMiddlegameSessionId();
@@ -2771,44 +2692,35 @@ function drawMiddlegameGame(app) {
 function bindMiddlegameBoard(app, sessionId, legalMoves) {
   const session = state.middlegameSession;
   if (!session || session.id !== sessionId || !legalMoves.length) return;
-  const squares = app.querySelectorAll('.sq[data-square]');
-  if (!squares.length) return;
-  let selected = null;
-  const clearHl = () => squares.forEach(sq => sq.classList.remove('lm'));
-  squares.forEach(sq => {
-    sq.addEventListener('click', () => {
+  const board = app.querySelector('.board');
+  if (!board) return;
+  bindBoard(board, {
+    moves: legalMoves.map(m => ({
+      from: mgSquare(m.from),
+      to: mgSquare(m.to),
+      promotion: m.promotion,
+      uci: mgMoveUci(m),
+    })),
+    canMove: () => {
       const current = state.middlegameSession;
-      if (state.middlegameThinking || !current || current.id !== sessionId || current.result) return;
-      const square = sq.dataset.square;
-      if (selected) {
-        const candidates = legalMoves.filter(m => mgSquare(m.from) === selected && mgSquare(m.to) === square);
-        if (candidates.length) {
-          const pick = candidates.find(m => m.promotion === 'q') || candidates[0];
-          submitMiddlegameMove(app, mgMoveUci(pick));
-          return;
-        }
-      }
-      if (legalMoves.some(m => mgSquare(m.from) === square)) {
-        if (selected === square) { selected = null; clearHl(); return; }
-        selected = square;
-        clearHl();
-        const goals = new Set(legalMoves.filter(m => mgSquare(m.from) === square).map(m => mgSquare(m.to)));
-        squares.forEach(el => {
-          if (el.dataset.square === square || goals.has(el.dataset.square)) el.classList.add('lm');
-        });
-        return;
-      }
-      selected = null;
-      clearHl();
-    });
+      return !!current && current.id === sessionId && !current.result && !state.middlegameThinking;
+    },
+    onMove: (move, meta) => submitMiddlegameMove(app, move.uci, { animate: !meta.dragged }),
   });
 }
 
-async function submitMiddlegameMove(app, uci) {
+async function submitMiddlegameMove(app, uci, opts = {}) {
   const session = state.middlegameSession;
   if (!session) return;
+  const replay = mgReplayMoves(session.fen, session.moves || []);
+  const move = mgFindMove(replay.legal, uci);
   state.middlegameThinking = true;
   state.middlegameError = null;
+  state.middlegameOptimistic = move ? {
+    fen: mgFen(mgApply(replay.state, move)),
+    lastMove: [mgSquare(move.from), mgSquare(move.to)],
+    animate: opts.animate !== false,
+  } : null;
   drawMiddlegame(app);
   let result;
   try {
@@ -2819,6 +2731,7 @@ async function submitMiddlegameMove(app, uci) {
     });
   } catch (err) {
     state.middlegameThinking = false;
+    state.middlegameOptimistic = null;
     if (isSessionError(err)) { handleSessionExpired(); return; }
     state.middlegameError = err.message;
     drawMiddlegame(app);
@@ -2826,6 +2739,7 @@ async function submitMiddlegameMove(app, uci) {
   }
   state.middlegameSession = result.session;
   state.middlegameThinking = false;
+  state.middlegameOptimistic = null;
   storeMiddlegameSessionId(result.session.id);
   drawMiddlegame(app);
   if (result.need_reply) await middlegameReply(app);

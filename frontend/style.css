@@ -54,6 +54,7 @@
   --c-sq-light: #f0d9b5;
   --c-sq-dark: #b58863;
   --c-sq-highlight: #cdd26a;
+  --c-move-dot: rgba(20, 85, 30, 0.5);
   --c-board-frame: #8a6f4d;
   --c-piece: #2f2f2f;
   --c-move-blunder-bg: #c5221f;
@@ -111,6 +112,7 @@
   --c-sq-light: #a89a85;
   --c-sq-dark: #6e6252;
   --c-sq-highlight: #8f8f4d;
+  --c-move-dot: rgba(20, 85, 30, 0.55);
   --c-board-frame: #4c4438;
   --c-piece: #15130f;
   --c-move-blunder-bg: #a5322a;
@@ -405,9 +407,7 @@ td.center { text-align: center; }
 .game-side { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
 
 .board {
-  display: grid;
-  grid-template-columns: repeat(8, 1fr);
-  grid-template-rows: repeat(8, 1fr);
+  position: relative;
   width: 100%;
   max-width: 440px;
   aspect-ratio: 1;
@@ -415,18 +415,91 @@ td.center { text-align: center; }
   border-radius: 6px;
   overflow: hidden;
   user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+  cursor: pointer;
   box-shadow: 0 2px 8px rgba(0,0,0,0.15);
 }
-.sq { display: flex; align-items: center; justify-content: center; position: relative; }
+.board-grid {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  grid-template-rows: repeat(8, 1fr);
+}
+.sq { position: relative; display: flex; align-items: center; justify-content: center; }
 .sq.light { background: var(--c-sq-light); }
 .sq.dark { background: var(--c-sq-dark); }
 .sq.lm { background: var(--c-sq-highlight); }
-.board-coord { position: absolute; font-size: 10px; font-weight: 600; line-height: 1; opacity: .9; pointer-events: none; }
+.sq.sel { background: var(--c-sq-highlight); }
+/* Поле под курсором во время перетаскивания (как в Lichess) */
+.sq.over { box-shadow: inset 0 0 0 4px rgba(20, 85, 30, 0.45); }
+/* Шах королю */
+.sq.in-check { background: radial-gradient(circle, rgba(255, 0, 0, 0.7) 0%, rgba(231, 0, 0, 0.35) 45%, rgba(169, 0, 0, 0) 72%); }
+/* Правый клик по полю — красная подсветка */
+.sq.rh { background-image: linear-gradient(rgba(190, 50, 50, 0.45), rgba(190, 50, 50, 0.45)); }
+/* Точки и кольца доступных ходов */
+.sq.dot::after,
+.sq.cap::after {
+  content: '';
+  position: absolute;
+  pointer-events: none;
+}
+.sq.dot::after {
+  width: 30%;
+  height: 30%;
+  border-radius: 50%;
+  background: var(--c-move-dot);
+}
+.sq.cap::after {
+  inset: 3%;
+  border-radius: 50%;
+  border: 0.32rem solid var(--c-move-dot);
+}
+.board-coord { position: absolute; font-size: 10px; font-weight: 600; line-height: 1; opacity: .9; pointer-events: none; z-index: 2; }
 .board-coord-rank { top: 2px; left: 3px; }
 .board-coord-file { bottom: 2px; right: 3px; }
-.piece { font-size: clamp(20px, 5.5vw, 34px); line-height: 1; color: var(--c-piece); filter: drop-shadow(0 1px 1px rgba(0,0,0,0.35)); }
-.piece.pb { color: #161512; }
-.piece.pw { color: #f8f6f0; -webkit-text-stroke: 0.045em #2b2620; paint-order: stroke fill; }
+.piece {
+  position: relative;
+  display: block;
+  width: 94%;
+  height: 94%;
+  z-index: 1;
+  pointer-events: none;
+}
+.piece img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  -webkit-user-drag: none;
+  user-select: none;
+}
+/* Оригинальная фигура прячется, пока её тащат */
+.piece.dragging { opacity: 0; }
+.piece-ghost {
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: 10;
+  pointer-events: none;
+  will-change: transform;
+  filter: drop-shadow(0 6px 6px rgba(0, 0, 0, 0.35));
+}
+.board-arrows {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  overflow: visible;
+  z-index: 5;
+}
+.board-drag-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 6;
+}
 .board-meta { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; align-items: center; }
 .board-controls { display: flex; align-items: center; gap: 6px; margin-top: 12px; }
 .board-controls input[type="range"] { flex: 1; accent-color: var(--c-btn-primary); min-width: 60px; }
