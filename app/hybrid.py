@@ -41,12 +41,12 @@ class HybridPolicy:
         self.threshold_cp = int(threshold_cp)
         self.depth = int(depth)
         self.time_ms = int(time_ms)
-        self._maia = None
+        self._maia_cached = None
 
-    def _maia(self):  # type: ignore[override]
-        if self._maia is None:
-            self._maia = _maia_policy(self.self_elo, self.opp_elo)
-        return self._maia
+    def _maia(self):
+        if self._maia_cached is None:
+            self._maia_cached = _maia_policy(self.self_elo, self.opp_elo)
+        return self._maia_cached
 
     def _eval_white(self, board: chess.Board) -> float | None:
         """Оценка позиции в centipawn (белые). None при ошибке."""
@@ -129,4 +129,4 @@ class HybridPolicy:
 
     def close(self) -> None:
         # Maia-сессия общая (singleton) — не закрываем; просто сбрасываем ссылку.
-        self._maia = None
+        self._maia_cached = None
