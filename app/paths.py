@@ -24,6 +24,9 @@ def user_dir(user: str | None, *, root: Path | None = None) -> Path:
     nick = (user or "").strip().lower()
     if not nick:
         return base
+    # Защита от path traversal: ник должен быть простым именем папки.
+    if "/" in nick or "\\" in nick or nick in (".", "..") or "\x00" in nick:
+        return base
     return base / nick
 
 

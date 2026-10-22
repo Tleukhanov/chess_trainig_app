@@ -267,7 +267,7 @@ def verify_password(pw: str, stored: str | None) -> bool:
         iters = int(parts[1])
         salt = bytes.fromhex(parts[2])
         expected = bytes.fromhex(parts[3])
-        if iters <= 0 or not salt or not expected:
+        if iters <= 0 or iters > 1_000_000 or not salt or not expected:
             return False
         dk = hashlib.pbkdf2_hmac("sha256", (pw or "").encode("utf-8"), salt, iters)
         return hmac.compare_digest(dk, expected)
@@ -471,9 +471,10 @@ def _migrate_v3(path: Path | str) -> None:
     Всё на отдельном автокоммитном соединении с ``foreign_keys=OFF``:
     с включёнными FK пересборка таблиц роняла бы ссылки анализов.
     """
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=30.0)
     conn.row_factory = sqlite3.Row
     try:
+        conn.execute("PRAGMA busy_timeout=30000")
         conn.execute("PRAGMA foreign_keys=OFF")
         conn.execute(_USERS_DDL.format(table="users"))
         conn.execute(_META_DDL.format(table="meta"))
@@ -505,6 +506,12 @@ def _migrate_v3(path: Path | str) -> None:
 
         _backfill_users(conn)
         conn.commit()
+    except BaseException:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
     finally:
         conn.close()
 
@@ -535,8 +542,9 @@ class Database:
         if self.backend == "pg":
             assert self.dsn is not None
             return pgdb.connect(self.dsn)
-        conn = sqlite3.connect(self.path)
+        conn = sqlite3.connect(self.path, timeout=30.0)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=30000")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA foreign_keys=ON")
@@ -706,13 +714,17 @@ class Database:
                 inserted += cur.rowcount
         return inserted
 
-    def get_games(self, user: str, limit: int = 200) -> list[Game]:
+    def get_games(self, user: str, limit: int = 200, offset: int = 0) -> list[Game]:
         """Возвращает партии пользователя в порядке created_at ASC."""
+        try:
+            resolved_offset = max(0, int(offset))
+        except (TypeError, ValueError):
+            resolved_offset = 0
         with self._connection() as conn:
             rows = conn.execute(
                 "SELECT * FROM games WHERE LOWER(player) = LOWER(?) "
-                "ORDER BY created_at ASC, id ASC LIMIT ?",
-                (user, limit),
+                "ORDER BY created_at ASC, id ASC LIMIT ? OFFSET ?",
+                (user, limit, resolved_offset),
             ).fetchall()
         return [_row_to_game(row) for row in rows]
 
@@ -783,23 +795,31 @@ class Database:
         """Отбирает из списка те id, для которых нет анализа."""
         if not game_ids:
             return []
-        placeholders = ", ".join("?" for _ in game_ids)
+        analyzed: set[str] = set()
+        chunk_size = 900
         with self._connection() as conn:
-            rows = conn.execute(
-                f"SELECT game_id FROM analyses WHERE game_id IN ({placeholders})",
-                game_ids,
-            ).fetchall()
-        analyzed = {row["game_id"] for row in rows}
+            for start in range(0, len(game_ids), chunk_size):
+                chunk = game_ids[start : start + chunk_size]
+                placeholders = ", ".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"SELECT game_id FROM analyses WHERE game_id IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+                analyzed.update(row["game_id"] for row in rows)
         return [game_id for game_id in game_ids if game_id not in analyzed]
 
-    def get_analyzed_games(self, user: str, limit: int = 200) -> list[tuple[Game, dict]]:
+    def get_analyzed_games(self, user: str, limit: int = 200, offset: int = 0) -> list[tuple[Game, dict]]:
         """Пары (Game, analysis_json) только для партий с сохранённым анализом."""
+        try:
+            resolved_offset = max(0, int(offset))
+        except (TypeError, ValueError):
+            resolved_offset = 0
         with self._connection() as conn:
             rows = conn.execute(
                 "SELECT g.*, a.analysis_json AS analysis_json "
                 "FROM games g JOIN analyses a ON a.game_id = g.id "
-                "WHERE LOWER(g.player) = LOWER(?) ORDER BY g.created_at ASC, g.id ASC LIMIT ?",
-                (user, limit),
+                "WHERE LOWER(g.player) = LOWER(?) ORDER BY g.created_at ASC, g.id ASC LIMIT ? OFFSET ?",
+                (user, limit, resolved_offset),
             ).fetchall()
         result: list[tuple[Game, dict]] = []
         for row in rows:
@@ -893,6 +913,10 @@ class Database:
                 "UPDATE users SET is_active = ? WHERE nick_lower = ?",
                 (1 if active else 0, key),
             )
+            if not active:
+                conn.execute(
+                    "DELETE FROM sessions WHERE LOWER(nick) = LOWER(?)", (key,)
+                )
 
     def create_session(self, nick: str, token: str, days: int = 30) -> None:
         """Создаёт сессию входа (token PRIMARY KEY)."""
@@ -954,7 +978,7 @@ class Database:
         if not key:
             return
         with self._connection() as conn:
-            conn.execute("DELETE FROM sessions WHERE nick = ?", (key,))
+            conn.execute("DELETE FROM sessions WHERE LOWER(nick) = LOWER(?)", (key,))
 
     def list_users(self) -> list[dict[str, Any]]:
         """Все профили с числом партий и анализов для команды ``user list``.
@@ -967,10 +991,17 @@ class Database:
             rows = conn.execute(
                 "SELECT u.nick_lower, u.nick, u.lichess, u.fide_id, u.role, "
                 "u.is_active, u.created_at, u.last_seen_at, u.bound_at, "
-                "(SELECT count(*) FROM games g WHERE LOWER(g.player) = u.nick_lower) AS games, "
-                "(SELECT count(*) FROM analyses a JOIN games g2 ON g2.id = a.game_id "
-                " WHERE LOWER(g2.player) = u.nick_lower) AS analyses "
-                "FROM users u ORDER BY u.bound_at ASC, u.nick_lower ASC"
+                "COALESCE(g.games, 0) AS games, "
+                "COALESCE(a.analyses, 0) AS analyses "
+                "FROM users u "
+                "LEFT JOIN (SELECT LOWER(player) AS p, COUNT(*) AS games "
+                "           FROM games GROUP BY LOWER(player)) g "
+                "  ON g.p = u.nick_lower "
+                "LEFT JOIN (SELECT LOWER(g2.player) AS p, COUNT(*) AS analyses "
+                "           FROM analyses a JOIN games g2 ON g2.id = a.game_id "
+                "           GROUP BY LOWER(g2.player)) a "
+                "  ON a.p = u.nick_lower "
+                "ORDER BY u.bound_at ASC, u.nick_lower ASC"
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -1132,14 +1163,18 @@ class Database:
         return _row_to_opening_session(row) if row else None
 
     def get_opening_sessions(
-        self, player: str, limit: int = 20
+        self, player: str, limit: int = 20, offset: int = 0
     ) -> list[dict[str, Any]]:
         """Сессии игрока, самые новые первыми (по created_at DESC)."""
+        try:
+            resolved_offset = max(0, int(offset))
+        except (TypeError, ValueError):
+            resolved_offset = 0
         with self._connection() as conn:
             rows = conn.execute(
                 "SELECT * FROM opening_sessions WHERE LOWER(player) = LOWER(?) "
-                "ORDER BY created_at DESC, id DESC LIMIT ?",
-                (player, limit),
+                "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                (player, limit, resolved_offset),
             ).fetchall()
         return [_row_to_opening_session(row) for row in rows]
 
@@ -1271,7 +1306,7 @@ class Database:
             )
         session.updated_at = _ms_to_iso(now)
 
-    def recent_middlegame_keys(self, user: str, limit: int = 16) -> list[str]:
+    def recent_middlegame_keys(self, user: str, limit: int = 16, offset: int = 0) -> list[str]:
         """Ключи последних позиций игрока, самые новые первыми."""
         try:
             resolved_limit = int(limit)
@@ -1280,11 +1315,15 @@ class Database:
         if resolved_limit <= 0:
             return []
         with self._connection() as conn:
+            try:
+                resolved_offset = max(0, int(offset))
+            except (TypeError, ValueError):
+                resolved_offset = 0
             rows = conn.execute(
                 "SELECT position_key FROM middlegame_sessions "
                 "WHERE LOWER(player) = LOWER(?) "
-                "ORDER BY created_at DESC, id DESC LIMIT ?",
-                (user, resolved_limit),
+                "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                (user, resolved_limit, resolved_offset),
             ).fetchall()
         return [str(row["position_key"]) for row in rows]
 
@@ -1331,6 +1370,10 @@ class Database:
                 (key, key),
             )
             conn.execute("DELETE FROM games WHERE LOWER(player) = LOWER(?)", (key,))
+            conn.execute("DELETE FROM sessions WHERE LOWER(nick) = LOWER(?)", (key,))
+            conn.execute("DELETE FROM opening_sessions WHERE LOWER(player) = LOWER(?)", (key,))
+            conn.execute("DELETE FROM middlegame_sessions WHERE LOWER(player) = LOWER(?)", (key,))
+            conn.execute("DELETE FROM task_explanations WHERE LOWER(player) = LOWER(?)", (key,))
             cur = conn.execute("DELETE FROM users WHERE nick_lower = ?", (key,))
         if is_current:
             self.clear_current_user()
