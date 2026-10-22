@@ -681,12 +681,29 @@ class MiddlegameMoveBody(BaseModel):
 
 
 def _opening_policy(opp_elo: int, my_elo: int) -> tuple[Any, str]:
-    """Политика соперника: Maia-2 ONNX, при отсутствии модели — MaiaLite.
+    """Политика соперника: Maia-2 ONNX, гибрид Maia+Stockfish или MaiaLite.
 
-    Возвращает ``(policy, engine)``, где ``engine`` — ``"maia2"`` либо
-    ``"maia_lite"``. Отдельная функция — шов для тестов: они подменяют её
-    заглушкой и не поднимают ни модель, ни Stockfish.
+    ``opp_elo < 0`` означает режим гибрида (Maia-кандидаты, отфильтрованные
+    Stockfish): Maia играет с верхнего бина (>=2000), фильтр отсекает зевки.
+    Возвращает ``(policy, engine)``, где ``engine`` — ``"maia2"``,
+    ``"hybrid"`` либо ``"maia_lite"``.
     """
+    if opp_elo is not None and int(opp_elo) < 0:
+        try:
+            from .hybrid import HybridPolicy
+
+            return HybridPolicy(self_elo=2500, opp_elo=my_elo), "hybrid"
+        except Exception:  # noqa: BLE001
+            # Фолбэк на чистую Maia, если гибрид не поднялся.
+            try:
+                from .maia_onnx import get_policy
+
+                return get_policy(self_elo=2000, opp_elo=my_elo), "maia2"
+            except RuntimeError:
+                policy = MaiaLitePolicy()
+                policy.__enter__()
+                return policy, "maia_lite"
+
     try:
         from .maia_onnx import get_policy
 
@@ -703,7 +720,7 @@ def _close_opening_policy(policy: Any, engine: str) -> None:
     Singleton Maia-2 не закрываем: его ONNX-сессия переиспользуется между
     ходами, а память освобождает :func:`_unload_maia` перед анализом.
     """
-    if engine != "maia_lite":
+    if engine not in ("maia_lite", "hybrid"):
         return
     close = getattr(policy, "close", None)
     if callable(close):
@@ -1104,7 +1121,9 @@ def _middlegame_base_elo(db: Database, nick: str) -> int:
 
 
 def _middlegame_opp_elo(base: int, strength: str) -> int:
-    """Elo соперника по выбранной силе: equal / +100 / +200 (с зажимом)."""
+    """Elo соперника по выбранной силе. hybrid -> -1 (sentinel для гибрида)."""
+    if strength == "hybrid":
+        return -1
     delta = _MIDDLEGAME_STRENGTHS[strength]
     return max(_MIDDLEGAME_ELO_MIN, min(_MIDDLEGAME_ELO_MAX, int(base) + delta))
 
@@ -3563,7 +3582,9 @@ def create_api(
             played = len(
                 db.recent_middlegame_keys(user["nick"], limit=1_000_000)
             )
+            base_elo = _middlegame_base_elo(db, user["nick"])
         return {
+            "base_elo": base_elo,
             "total": len(mg.POSITIONS),
             "sources": [
                 {
@@ -3599,10 +3620,10 @@ def create_api(
         user = _require_user(request)
         nick = user["nick"]
         strength = (body.strength or "equal").strip()
-        if strength not in _MIDDLEGAME_STRENGTHS:
+        if strength not in _MIDDLEGAME_STRENGTHS and strength != "hybrid":
             raise HTTPException(
                 400,
-                "Сила соперника: equal, plus100 или plus200",
+                "Сила соперника: equal, plus100, plus200 или hybrid",
             )
         with Database(app.state.db_path) as db:
             db.init_db()
@@ -3670,7 +3691,7 @@ def create_api(
         with Database(app.state.db_path) as db:
             db.init_db()
             base = _middlegame_base_elo(db, nick)
-        opp_elo = int(session.opp_elo or settings.maia_default_elo)
+        opp_elo = int(session.opp_elo if session.opp_elo is not None else settings.maia_default_elo)
         policy, engine_name = _opening_policy(opp_elo, base)
         try:
             board = mg.board_of(session)
