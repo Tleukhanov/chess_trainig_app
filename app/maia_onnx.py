@@ -464,10 +464,9 @@ def get_policy(
     opp_elo = self_elo if opp_elo is None else int(opp_elo)
     key = (str(model_path), str(vocab_dir), self_elo, opp_elo, float(temperature), int(threads))
 
-    _ensure_artifacts(model_path, vocab_dir)
-
     global _POLICY, _POLICY_KEY
     with _POLICY_LOCK:
+        _ensure_artifacts(model_path, vocab_dir)
         if _POLICY is not None and _POLICY_KEY == key:
             return _POLICY
         old = _POLICY
@@ -476,7 +475,10 @@ def get_policy(
         )
         _POLICY_KEY = key
     if old is not None:
-        old.close()
+        try:
+            old.close()
+        except Exception:  # noqa: BLE001
+            pass
     return _POLICY
 
 
@@ -492,5 +494,8 @@ def unload() -> None:
         _POLICY = None
         _POLICY_KEY = None
     if policy is not None:
-        policy.close()
+        try:
+            policy.close()
+        except Exception:  # noqa: BLE001
+            pass
     release_memory()

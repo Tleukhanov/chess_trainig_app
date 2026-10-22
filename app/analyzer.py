@@ -50,7 +50,11 @@ def win_percent(cp_white: float | None, mate: int | None = None) -> float:
         return 50.0
     if cp_white is None:
         return 50.0
-    return 50.0 + 50.0 * (2.0 / (1.0 + math.exp(-0.00368208 * cp_white)) - 1.0)
+    try:
+        return 50.0 + 50.0 * (2.0 / (1.0 + math.exp(-0.00368208 * cp_white)) - 1.0)
+    except OverflowError:
+        # Очень большие по модулю cp: вероятность вырождается в 0/100.
+        return 0.0 if cp_white < 0 else 100.0
 
 
 def classify_move(win_before: float | None, win_after: float | None, is_best: bool = False) -> str:
@@ -250,16 +254,24 @@ class Engine:
     @property
     def _time_limit_seconds(self) -> float | None:
         """Лимит времени на одну позицию (None — без лимита; глубина всё равно ограничена)."""
-        return self.time_ms / 1000.0 if self.time_ms else None
+        if not self.time_ms or self.time_ms <= 0:
+            return None
+        return self.time_ms / 1000.0
 
     def _ensure_started(self) -> None:
         if self._engine is not None:
             return
         try:
             self._engine = chess.engine.SimpleEngine.popen_uci(str(self.path))
+            self._engine.configure({"Threads": self.threads, "Hash": self.hash_mb})
         except Exception as exc:
+            if self._engine is not None:
+                try:
+                    self._engine.quit()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._engine = None
             raise RuntimeError(f"Не удалось запустить Stockfish ({self.path}): {exc}") from exc
-        self._engine.configure({"Threads": self.threads, "Hash": self.hash_mb})
 
     def close(self) -> None:
         if self._engine is None:
@@ -288,8 +300,9 @@ class Engine:
         """
         self._ensure_started()
         assert self._engine is not None
+        multipv = self.multipv if self.multipv and self.multipv > 0 else 1
         limit = chess.engine.Limit(depth=self.depth, time=self._time_limit_seconds)
-        infos = self._engine.analyse(board, limit, multipv=self.multipv)
+        infos = self._engine.analyse(board, limit, multipv=multipv)
         lines: list[dict[str, Any]] = []
         for info in infos:
             score = info.get("score")
@@ -323,8 +336,10 @@ class Engine:
                     entries.append((Eval(cp=None, mate=-1), None, []))  # сторона, чей ход, получает мат
                 else:
                     entries.append((Eval(cp=0.0, mate=None), None, []))  # пат/ничья
+                # Партия уже завершена: дальше анализировать бессмысленно (и ходы
+                # после мата нелегальны), поэтому останавливаемся.
                 if ply < len(moves):
-                    board.push_san(moves[ply])
+                    break
                 continue
             lines = self.analyze_position(board)
             if not lines:

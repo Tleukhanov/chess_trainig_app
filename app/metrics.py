@@ -16,6 +16,7 @@ win% перед его ходом — «точностью». Оба имени 
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 __all__ = [
@@ -45,12 +46,13 @@ def _coerce(value: Any) -> float | None:
     """
     if value is None or isinstance(value, bool):
         return None
-    if isinstance(value, (int, float)):
-        return float(value)
     try:
-        return float(value)
+        number = float(value)
     except (TypeError, ValueError):
         return None
+    if not math.isfinite(number):
+        return None
+    return number
 
 
 def metric(analysis: dict, key: str, default: float | None = 0.0) -> float | None:
@@ -61,6 +63,8 @@ def metric(analysis: dict, key: str, default: float | None = 0.0) -> float | Non
     :data:`LEGACY_METRIC_KEYS` — так вычисления по записям, сделанным до
     переименования, остаются корректными без миграции базы.
     """
+    if not isinstance(analysis, dict):
+        return default
     for candidate in (key, LEGACY_METRIC_KEYS.get(key)):
         if candidate is None or candidate not in analysis:
             continue

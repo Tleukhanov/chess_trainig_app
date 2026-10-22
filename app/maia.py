@@ -53,14 +53,15 @@ def _softmax(
     сторону, для которой строятся вероятности. Линии без pv пропускаются.
     Возвращает пары (SAN, вероятность), отсортированные по убыванию.
     """
+    temp = temperature if isinstance(temperature, (int, float)) and temperature and temperature > 0 else 1.0
     logits: list[tuple[str, float]] = []
     for line in lines:
         pv = line.get("pv")
         win = line.get("win")
-        if not pv or not isinstance(win, (int, float)):
+        if not pv or not isinstance(win, (int, float)) or isinstance(win, bool):
             continue
         side_win = win if side_is_white else 100.0 - win
-        logits.append((str(pv[0]), side_win / temperature))
+        logits.append((str(pv[0]), side_win / temp))
     if not logits:
         return []
     max_logit = max(logit for _, logit in logits)
