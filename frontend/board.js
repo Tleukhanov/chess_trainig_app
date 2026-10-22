@@ -126,13 +126,13 @@ export function boardHtml(fen, opts = {}) {
       const pieceHtml = piece
         ? `<span class="piece ${piece === piece.toUpperCase() ? 'pw' : 'pb'}" aria-label="${pieceColor} ${pieceName}"><img src="${PIECE_DIR}/${PIECE_IMAGES[piece]}.svg" alt="${pieceColor} ${pieceName}" draggable="false" decoding="async"></span>`
         : '';
-      html += `<div class="${cls.join(' ')}" data-square="${square}">${coord}${pieceHtml}</div>`;
+      html += `<div class="${cls.join(' ')}" data-square="${square}" role="gridcell" aria-label="${square}" tabindex="-1">${coord}${pieceHtml}</div>`;
     }
   }
 
   return `<div class="board${flip ? ' flipped' : ''}" role="application" aria-label="Chess board" data-flip="${flip ? '1' : '0'}"
     data-anim-from="${animate ? animFrom : ''}" data-anim-to="${animate ? animTo : ''}">
-    <div class="board-grid">${html}</div>
+    <div class="board-grid" role="grid" aria-label="Chess board grid">${html}</div>
     <svg class="board-arrows" viewBox="0 0 8 8" preserveAspectRatio="none" aria-hidden="true"></svg>
     <div class="board-drag-layer"></div>
   </div>`;
@@ -488,6 +488,9 @@ export function bindBoard(root, opts = {}) {
     finishMove(move, ended.dragged);
   });
 
+  root.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { hidePromoPicker(); clearSelection(); }
+  });
   root.addEventListener('pointercancel', () => {
     hidePromoPicker();
     if (drag) {

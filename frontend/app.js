@@ -133,6 +133,10 @@ function navigate(view) {
   document.querySelectorAll('#nav a').forEach(a => {
     a.classList.toggle('active', a.dataset.view === view);
   });
+  document.querySelectorAll('#nav .nav-group').forEach(g => {
+    const groupViews = Array.from(g.querySelectorAll('a')).map(a => a.dataset.view);
+    g.classList.toggle('active', groupViews.includes(view));
+  });
   render(view);
 }
 
@@ -416,7 +420,7 @@ async function viewDashboard(app) {
   if (plan.patterns.motifs.length > 0) {
     motifsHtml = `
       <table class="table-wrap">
-        <thead><tr><th>Мотив</th><th>Частота</th><th>Ср. потеря win%</th></tr></thead>
+        <thead><tr><th>Мотив</th><th>Частота</th><th title="Средняя потеря win% на ход игрока">Ср. потеря win%</th></tr></thead>
         <tbody>
           ${plan.patterns.motifs.slice(0, 5).map(m => `
             <tr><td>${esc(m[0])}</td><td class="num">${m[1].count}</td><td class="num">${fmt(m[1].avg_drop)}%</td></tr>`).join('')}
@@ -448,7 +452,7 @@ async function viewDashboard(app) {
     <div class="grid grid-4">
       <div class="card stat"><div class="stat-value">${plan.games}</div><div class="stat-label">Партий</div></div>
       <div class="card stat"><div class="stat-value">${scorePct}</div><div class="stat-label">Счёт</div></div>
-      <div class="card stat"><div class="stat-value">${avgWinLoss}</div><div class="stat-label">Ср. потеря win%</div></div>
+      <div class="card stat"><div class="stat-value">${avgWinLoss}</div><div class="stat-label" title="Средняя потеря win% (процентов) на ход игрока (метрика avg_win_loss из анализа)">Ср. потеря win%</div></div>
       <div class="card stat"><div class="stat-value">${weakCount}</div><div class="stat-label">Дебютов в фокусе</div></div>
     </div>
     <div class="grid grid-2">
@@ -691,7 +695,7 @@ async function viewPlan(app) {
     <div class="grid grid-4">
       <div class="card stat"><div class="stat-value">${plan.games}</div><div class="stat-label">Партий</div></div>
       <div class="card stat"><div class="stat-value">${scorePct}</div><div class="stat-label">Счёт</div></div>
-      <div class="card stat"><div class="stat-value">${avgWinLoss}</div><div class="stat-label">Ср. потеря win%</div></div>
+      <div class="card stat"><div class="stat-value">${avgWinLoss}</div><div class="stat-label" title="Средняя потеря win% (процентов) на ход игрока (метрика avg_win_loss из анализа)">Ср. потеря win%</div></div>
       <div class="card stat"><div class="stat-value">${plan.drills.total}/${plan.drills.unnatural}</div><div class="stat-label">Ошибки всего/неест.</div></div>
     </div>
     <div class="card">
@@ -885,7 +889,7 @@ async function viewProgress(app) {
     <div class="card">
       <div class="card-header"><span class="card-title">Таблица окон (${pr.windows} окон, ${pr.games} партий)</span></div>
       <table class="table-wrap">
-        <thead><tr><th>№</th><th>Период</th><th>Партий</th><th>Счёт %</th><th>Ср. потеря win%</th><th>Win% до хода</th><th>Ошибок/партию</th><th>Неест. %</th><th>Ср. рейтинг</th></tr></thead>
+        <thead><tr><th>№</th><th>Период</th><th>Партий</th><th>Счёт %</th><th title="Средняя потеря win% на ход игрока">Ср. потеря win%</th><th title="Средний win% перед ходом игрока">Win% до хода</th><th>Ошибок/партию</th><th>Неест. %</th><th>Ср. рейтинг</th></tr></thead>
         <tbody>
           ${pr.windows_rows.map(w => `<tr>
             <td class="num">${w.index}</td><td>${esc(w.dates)}</td><td class="num">${w.games}</td>
@@ -1106,8 +1110,8 @@ function gameMetricsHtml(analysis) {
       <div class="stat"><div class="stat-value" style="color:var(--c-err-mistake)">${mistakes}</div><div class="stat-label">Ошибки</div></div>
       <div class="stat"><div class="stat-value" style="color:var(--c-err-inaccuracy)">${inaccuracies}</div><div class="stat-label">Неточности</div></div>
       <div class="stat"><div class="stat-value">${missed}</div><div class="stat-label">Упущ. выигрыши</div></div>
-      <div class="stat"><div class="stat-value">${avgLoss}</div><div class="stat-label">Ср. потеря win%</div></div>
-      <div class="stat"><div class="stat-value">${avgBefore}</div><div class="stat-label">Win% до хода</div></div>
+      <div class="stat"><div class="stat-value">${avgLoss}</div><div class="stat-label" title="Средняя потеря win% (процентов) на ход игрока (метрика avg_win_loss из анализа)">Ср. потеря win%</div></div>
+      <div class="stat"><div class="stat-value">${avgBefore}</div><div class="stat-label" title="Средний win% перед ходом игрока (метрика avg_win_before)">Win% до хода</div></div>
     </div>`;
 }
 
@@ -1159,7 +1163,7 @@ async function viewDrills(app) {
         <button class="btn btn-secondary" style="height:38px">Применить</button>
       </form>
     </div>
-    ${summary ? `<div class="grid grid-3"><div class="card stat"><div class="stat-value">${summary.found}</div><div class="stat-label">Ошибок найдено</div></div><div class="card stat"><div class="stat-value">${summary.games}</div><div class="stat-label">Партий</div></div><div class="card stat"><div class="stat-value">${summary.avg_drop != null ? fmt(summary.avg_drop) + '%' : '—'}</div><div class="stat-label">Ср. потеря win%</div></div></div>` : ''}
+    ${summary ? `<div class="grid grid-3"><div class="card stat"><div class="stat-value">${summary.found}</div><div class="stat-label">Ошибок найдено</div></div><div class="card stat"><div class="stat-value">${summary.games}</div><div class="stat-label">Партий</div></div><div class="card stat"><div class="stat-value">${summary.avg_drop != null ? fmt(summary.avg_drop) + '%' : '—'}</div><div class="stat-label" title="Средняя потеря win% (процентов) на ход игрока (метрика avg_win_loss из анализа)">Ср. потеря win%</div></div></div>` : ''}
     <div class="card">
       <div class="card-header"><span class="card-title">Список ошибок (${items.length})</span><div><a href="/api/drills.pgn?${params}" class="btn btn-secondary" style="font-size:12px;padding:4px 10px">PGN</a> <a href="/api/drills.json?${params}" class="btn btn-secondary" style="font-size:12px;padding:4px 10px;margin-left:4px">JSON</a></div></div>
       ${items.length ? `<table class="table-wrap"><thead><tr><th>#</th><th>Партия</th><th>Ход</th><th>Сыграно</th><th>Лучше</th><th>Класс</th><th>Потеря</th><th>Win% до/после</th><th>Дебют</th><th>Результат</th></tr></thead><tbody>${items.map((d, i) => `<tr class="drill-row"><td class="num">${i + 1}</td><td>${d.link ? '<a href="' + safeHttp(d.link) + '" target="_blank" rel="noopener" title="Открыть партию">' + esc(d.game_id.slice(0, 8)) + '</a>' : esc(d.game_id.slice(0, 8))}</td><td class="num">${d.ply}</td><td class="drill-san">${esc(d.san_played)}</td><td class="drill-best">${esc(d.best_move_san)}</td><td><span class="badge ${d.classification === 'blunder' ? 'badge-bad' : 'badge-neutral'}">${d.classification}</span></td><td class="num">${fmt(d.drop)}%</td><td class="num">${fmt(d.win_before)}% → ${fmt(d.win_after)}%</td><td>${esc(d.opening)}</td><td class="center"><span class="badge ${d.result_for_user === 'win' ? 'badge-good' : d.result_for_user === 'loss' ? 'badge-bad' : 'badge-neutral'}">${d.result_for_user}</span></td></tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted);padding:16px">Ошибок не найдено.</p>'}
@@ -1197,7 +1201,7 @@ async function viewDrillsWithParams(app, params) {
         <button class="btn btn-secondary" style="height:38px">Применить</button>
       </form>
     </div>
-    ${summary ? `<div class="grid grid-3"><div class="card stat"><div class="stat-value">${summary.found}</div><div class="stat-label">Ошибок найдено</div></div><div class="card stat"><div class="stat-value">${summary.games}</div><div class="stat-label">Партий</div></div><div class="card stat"><div class="stat-value">${summary.avg_drop != null ? fmt(summary.avg_drop) + '%' : '—'}</div><div class="stat-label">Ср. потеря win%</div></div></div>` : ''}
+    ${summary ? `<div class="grid grid-3"><div class="card stat"><div class="stat-value">${summary.found}</div><div class="stat-label">Ошибок найдено</div></div><div class="card stat"><div class="stat-value">${summary.games}</div><div class="stat-label">Партий</div></div><div class="card stat"><div class="stat-value">${summary.avg_drop != null ? fmt(summary.avg_drop) + '%' : '—'}</div><div class="stat-label" title="Средняя потеря win% (процентов) на ход игрока (метрика avg_win_loss из анализа)">Ср. потеря win%</div></div></div>` : ''}
     <div class="card">
       <div class="card-header"><span class="card-title">Список ошибок (${items.length})</span><div><a href="/api/drills.pgn?${params}" class="btn btn-secondary" style="font-size:12px;padding:4px 10px">PGN</a> <a href="/api/drills.json?${params}" class="btn btn-secondary" style="font-size:12px;padding:4px 10px;margin-left:4px">JSON</a></div></div>
       ${items.length ? `<table class="table-wrap"><thead><tr><th>#</th><th>Партия</th><th>Ход</th><th>Сыграно</th><th>Лучше</th><th>Класс</th><th>Потеря</th><th>Win% до/после</th><th>Дебют</th><th>Результат</th></tr></thead><tbody>${items.map((d, i) => `<tr class="drill-row"><td class="num">${i + 1}</td><td>${d.link ? '<a href="' + safeHttp(d.link) + '" target="_blank" rel="noopener" title="Открыть партию">' + esc(d.game_id.slice(0, 8)) + '</a>' : esc(d.game_id.slice(0, 8))}</td><td class="num">${d.ply}</td><td class="drill-san">${esc(d.san_played)}</td><td class="drill-best">${esc(d.best_move_san)}</td><td><span class="badge ${d.classification === 'blunder' ? 'badge-bad' : 'badge-neutral'}">${d.classification}</span></td><td class="num">${fmt(d.drop)}%</td><td class="num">${fmt(d.win_before)}% → ${fmt(d.win_after)}%</td><td>${esc(d.opening)}</td><td class="center"><span class="badge ${d.result_for_user === 'win' ? 'badge-good' : d.result_for_user === 'loss' ? 'badge-bad' : 'badge-neutral'}">${d.result_for_user}</span></td></tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted);padding:16px">Ошибок не найдено.</p>'}
@@ -1600,9 +1604,10 @@ async function drawOpeningSetup(app, errorMsg) {
           <label>Соперник</label>
           <div class="games-filter">
             <button type="button" class="btn btn-secondary" data-opp="equal">равный</button>
-            <button type="button" class="btn btn-secondary" data-opp="plus100" title="Соперник примерно на 100 пунктов сильнее тебя">+100</button>
-            <button type="button" class="btn btn-secondary" data-opp="stronger" title="Соперник примерно на 200 пунктов сильнее тебя">сильнее (+200)</button>
+            <button type="button" class="btn btn-secondary" data-opp="plus100" title="Соперник на 100 Elo выше твоего рейтинга (база: твой рейтинг или 1500 по умолчанию); Maia играет сильнее">+100</button>
+            <button type="button" class="btn btn-secondary" data-opp="stronger" title="Соперник на 200 Elo выше твоего рейтинга (база: твой рейтинг или 1500 по умолчанию); Maia играет сильнее">сильнее (+200)</button>
           </div>
+          <div style="font-size:12px;color:var(--c-text-muted);margin-top:4px">Число — разница Elo соперника относительно твоего рейтинга (база из профиля или 1500): +100/+200 означает соперника сильнее на 100/200 пунктов. Используется для выбора силы Maia.</div>
         </div>
         <div class="form-group">
           <label>Твой цвет</label>
@@ -2548,8 +2553,9 @@ function drawMiddlegameSetup(app) {
             <div class="form-group">
               <label>Соперник</label>
               <div class="games-filter" id="middlegame-strength">
-                ${Object.keys(MIDDLEGAME_STRENGTH_LABELS).map(key => `<button type="button" class="btn btn-secondary ${key === strength ? 'btn-active' : ''}" data-strength="${esc(key)}">${esc(MIDDLEGAME_STRENGTH_LABELS[key])}</button>`).join('')}
+                ${Object.keys(MIDDLEGAME_STRENGTH_LABELS).map(key => `<button type="button" class="btn btn-secondary ${key === strength ? 'btn-active' : ''}" data-strength="${esc(key)}" title="${key === 'equal' ? 'Соперник того же уровня: рейтинг равен твоему' : key === 'plus100' ? 'Соперник на 100 Elo выше твоего рейтинга' : 'Соперник на 200 Elo выше твоего рейтинга'}">${esc(MIDDLEGAME_STRENGTH_LABELS[key])}</button>`).join('')}
               </div>
+              <div style="font-size:12px;color:var(--c-text-muted);margin-top:4px">Число — разница Elo соперника относительно твоего рейтинга (база из профиля или значение по умолчанию): +100/+200 = соперник сильнее на 100/200 пунктов. Используется для выбора силы Maia.</div>
             </div>
             <div class="alert alert-error" id="middlegame-setup-err" style="display:none"></div>
             <button type="submit" class="btn btn-primary" id="middlegame-start" ${ready ? '' : 'disabled'}>Начать партию</button>
@@ -2934,7 +2940,7 @@ async function viewCoach(app) {
       <div class="grid grid-4" style="margin-bottom:12px">
         <div class="card stat"><div class="stat-value">${report.games_analyzed}</div><div class="stat-label">Проанализировано</div></div>
         <div class="card stat"><div class="stat-value">${fmt(report.score.score_pct)}%</div><div class="stat-label">Счёт</div></div>
-        <div class="card stat"><div class="stat-value">${fmt(report.avg.avg_win_loss, 2)}</div><div class="stat-label">Ср. потеря win%</div></div>
+        <div class="card stat"><div class="stat-value">${fmt(report.avg.avg_win_loss, 2)}</div><div class="stat-label" title="Средняя потеря win% (процентов) на ход игрока (метрика avg_win_loss из анализа)">Ср. потеря win%</div></div>
         <div class="card stat"><div class="stat-value">${report.total.blunders + report.total.mistakes}</div><div class="stat-label">Ошибок всего</div></div>
       </div>
       ${report.worst_games.length ? `<div class="card" style="margin-top:12px"><h3 style="font-size:14px;margin-bottom:8px">Худшие партии</h3><table class="table-wrap" style="font-size:12px"><thead><tr><th>Партия</th><th>Соперник</th><th>Результат</th><th>Ср. потеря</th><th>Win% до</th><th>Грубых</th></tr></thead><tbody>${report.worst_games.slice(0, 5).map(g => `<tr><td>${esc(g.game_id.slice(0, 8))}</td><td>${esc(g.opponent)}</td><td>${esc(g.result)}</td><td class="num">${fmt(g.avg_win_loss)}%</td><td class="num">${fmt(g.avg_win_before)}%</td><td class="num">${g.blunders}</td></tr>`).join('')}</tbody></table></div>` : ''}

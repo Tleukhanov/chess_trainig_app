@@ -11,18 +11,27 @@
   <div class="topbar-inner">
     <a class="brand" href="#" data-view="dashboard"><span class="brand-mark">♞</span> chess trainer</a>
     <nav class="nav" id="nav">
-      <a href="#" data-view="dashboard">Дашборд</a>
-      <a href="#" data-view="overview">Обзор</a>
-      <a href="#" data-view="plan">План</a>
-      <a href="#" data-view="progress">Прогресс</a>
-      <a href="#" data-view="games">Партии</a>
-      <a href="#" data-view="drills">Ошибки</a>
-      <a href="#" data-view="task">Задача</a>
-      <a href="#" data-view="opening">Дебюты</a>
-      <a href="#" data-view="middlegame">Миттельшпиль</a>
-      <a href="#" data-view="coach">Анализ</a>
-      <a href="#" data-view="tools">Инструменты</a>
-      <a href="#" data-view="users">Профили</a>
+      <div class="nav-group" data-group="training">
+        <span class="nav-group-title">Тренировка</span>
+        <a href="#" data-view="task">Задача</a>
+        <a href="#" data-view="opening">Дебюты</a>
+        <a href="#" data-view="middlegame">Миттельшпиль</a>
+      </div>
+      <div class="nav-group" data-group="analysis">
+        <span class="nav-group-title">Анализ</span>
+        <a href="#" data-view="overview">Обзор</a>
+        <a href="#" data-view="games">Партии</a>
+        <a href="#" data-view="drills">Ошибки</a>
+        <a href="#" data-view="coach">Анализ</a>
+      </div>
+      <div class="nav-group" data-group="progress">
+        <span class="nav-group-title">Прогресс</span>
+        <a href="#" data-view="dashboard">Дашборд</a>
+        <a href="#" data-view="plan">План</a>
+        <a href="#" data-view="progress">Прогресс</a>
+        <a href="#" data-view="users">Профили</a>
+        <a href="#" data-view="tools">Инструменты</a>
+      </div>
     </nav>
     <div class="topbar-right">
       <div class="userbox" id="userbox"></div>
