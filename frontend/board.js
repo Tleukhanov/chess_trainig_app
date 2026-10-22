@@ -56,6 +56,18 @@ export function lastMoveSquares(fenBefore, fenAfter) {
   }
   // взятие: поле назначения было занято, поэтому состав фигур там просто сменился
   if (froms.length === 1 && tos.length === 0 && changed.length === 1) return [froms[0], changed[0]];
+  // рокировка: король и ладья сменили поля (2 опустели, 2 заполнились)
+  if (froms.length === 2 && tos.length === 2) {
+    // король ходит дальше (на 2 клетки) — его путь даёт from/to
+    const kingFrom = froms.find(sq => Math.abs(FILES.indexOf(sq[0]) - FILES.indexOf(tos.find(t => t[0] === sq[0] || true)[0])) >= 2) || froms[0];
+    // выберем пару король: from->to с расстоянием по горизонтали 2
+    let from = froms[0], to = tos[0];
+    for (const f of froms) {
+      const tf = tos.find(t => Math.abs(FILES.indexOf(t[0]) - FILES.indexOf(f[0])) === 2 && t[1] === f[1]);
+      if (tf) { from = f; to = tf; break; }
+    }
+    return [from, to];
+  }
   // обычный ход: одно поле опустело, другое заполнилось
   if (froms.length === 1 && tos.length === 1) return [froms[0], tos[0]];
   return froms.concat(tos);

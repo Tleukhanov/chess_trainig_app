@@ -29,7 +29,8 @@ _load_dotenv()
 
 
 def _cfg(name: str, default: str) -> str:
-    return os.environ.get(name, default)
+    value = os.environ.get(name)
+    return value if value not in (None, "") else default
 
 
 def _is_heroku() -> bool:

@@ -1573,8 +1573,8 @@ async function drawOpeningSetup(app, errorMsg) {
           <label>Соперник</label>
           <div class="games-filter">
             <button type="button" class="btn btn-secondary" data-opp="equal">равный</button>
-            <button type="button" class="btn btn-secondary" data-opp="plus100">+100</button>
-            <button type="button" class="btn btn-secondary" data-opp="stronger">сильнее (+200)</button>
+            <button type="button" class="btn btn-secondary" data-opp="plus100" title="Соперник примерно на 100 пунктов сильнее тебя">+100</button>
+            <button type="button" class="btn btn-secondary" data-opp="stronger" title="Соперник примерно на 200 пунктов сильнее тебя">сильнее (+200)</button>
           </div>
         </div>
         <div class="form-group">
