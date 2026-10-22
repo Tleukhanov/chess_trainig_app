@@ -121,14 +121,16 @@ export function boardHtml(fen, opts = {}) {
       let coord = '';
       if (ci === 0) coord += `<span class="board-coord board-coord-rank" style="color:${coordColor}">${rank}</span>`;
       if (ri === 7) coord += `<span class="board-coord board-coord-file" style="color:${coordColor}">${FILES[f]}</span>`;
+      const pieceName = piece ? ({ K: 'king', Q: 'queen', R: 'rook', B: 'bishop', N: 'knight', P: 'pawn' }[piece.toUpperCase()] || 'piece') : '';
+      const pieceColor = piece ? (piece === piece.toUpperCase() ? 'White' : 'Black') : '';
       const pieceHtml = piece
-        ? `<span class="piece ${piece === piece.toUpperCase() ? 'pw' : 'pb'}"><img src="${PIECE_DIR}/${PIECE_IMAGES[piece]}.svg" alt="" draggable="false" decoding="async"></span>`
+        ? `<span class="piece ${piece === piece.toUpperCase() ? 'pw' : 'pb'}" aria-label="${pieceColor} ${pieceName}"><img src="${PIECE_DIR}/${PIECE_IMAGES[piece]}.svg" alt="${pieceColor} ${pieceName}" draggable="false" decoding="async"></span>`
         : '';
       html += `<div class="${cls.join(' ')}" data-square="${square}">${coord}${pieceHtml}</div>`;
     }
   }
 
-  return `<div class="board${flip ? ' flipped' : ''}" data-flip="${flip ? '1' : '0'}"
+  return `<div class="board${flip ? ' flipped' : ''}" role="application" aria-label="Chess board" data-flip="${flip ? '1' : '0'}"
     data-anim-from="${animate ? animFrom : ''}" data-anim-to="${animate ? animTo : ''}">
     <div class="board-grid">${html}</div>
     <svg class="board-arrows" viewBox="0 0 8 8" preserveAspectRatio="none" aria-hidden="true"></svg>
@@ -215,6 +217,63 @@ export function bindBoard(root, opts = {}) {
 
   const arrows = [];
   let selected = null;
+  let promoPicker = null;
+
+  function hidePromoPicker() {
+    if (promoPicker) { promoPicker.remove(); promoPicker = null; }
+  }
+
+  function showPromoPicker(from, to, candidates, onPick) {
+    hidePromoPicker();
+    const boardRect = root.getBoundingClientRect();
+    const sqRect = squares.get(to).getBoundingClientRect();
+    const pieceEl = squares.get(from) && squares.get(from).querySelector('.piece');
+    const isWhite = !!(pieceEl && pieceEl.classList.contains('pw'));
+    const color = isWhite ? 'w' : 'b';
+    const letterMap = { q: 'Q', r: 'R', b: 'B', n: 'N' };
+
+    const box = document.createElement('div');
+    box.className = 'board-promo';
+    Object.assign(box.style, {
+      position: 'absolute',
+      left: (sqRect.left - boardRect.left + sqRect.width / 2 - 22) + 'px',
+      top: (isWhite ? sqRect.bottom - boardRect.top + 4 : sqRect.top - boardRect.top - 4 - candidates.length * 44) + 'px',
+      display: 'flex', flexDirection: 'column', gap: '2px',
+      zIndex: '20', background: 'var(--c-panel, #fff)',
+      border: '1px solid var(--c-border, #ccc)', borderRadius: '6px',
+      padding: '4px', boxShadow: '0 4px 12px rgba(0,0,0,0.25)',
+    });
+
+    for (const m of candidates) {
+      const promo = (m.promotion || 'q').toLowerCase();
+      const letter = letterMap[promo] || 'Q';
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      Object.assign(btn.style, { width: '40px', height: '40px', padding: '2px', border: 'none', background: 'transparent', cursor: 'pointer' });
+      const img = document.createElement('img');
+      img.src = PIECE_DIR + '/' + color + letter + '.svg';
+      img.alt = (color === 'w' ? 'White ' : 'Black ') + letter;
+      img.style.width = '100%'; img.style.height = '100%';
+      btn.appendChild(img);
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        hidePromoPicker();
+        onPick(m);
+      });
+      box.appendChild(btn);
+    }
+
+    const cancel = (e) => {
+      if (box.contains(e.target)) return;
+      hidePromoPicker();
+      clearSelection();
+      document.removeEventListener('pointerdown', cancel, true);
+    };
+    setTimeout(() => document.addEventListener('pointerdown', cancel, true), 0);
+
+    root.appendChild(box);
+    promoPicker = box;
+  }
   let drag = null;
   let arrowDraft = null;
   let hoverSquare = null;
@@ -369,6 +428,11 @@ export function bindBoard(root, opts = {}) {
     if (!allowed()) { clearSelection(); return; }
 
     if (selected && findMove(selected, square)) {
+      const cands = moves.filter(m => m.from === selected && m.to === square);
+      if (cands.length > 1) {
+        showPromoPicker(selected, square, cands, (chosen) => finishMove(chosen, false));
+        return;
+      }
       finishMove(findMove(selected, square), false);
       return;
     }
@@ -416,10 +480,16 @@ export function bindBoard(root, opts = {}) {
     if (!ended) { clearSelection(); return; }
     const move = findMove(ended.from, ended.target);
     if (!move) { if (ended.dragged) clearSelection(); return; }
+    const cands = moves.filter(m => m.from === ended.from && m.to === ended.target);
+    if (cands.length > 1) {
+      showPromoPicker(ended.from, ended.target, cands, (chosen) => finishMove(chosen, ended.dragged));
+      return;
+    }
     finishMove(move, ended.dragged);
   });
 
   root.addEventListener('pointercancel', () => {
+    hidePromoPicker();
     if (drag) {
       drag.ghost.remove();
       drag.piece.classList.remove('dragging');
