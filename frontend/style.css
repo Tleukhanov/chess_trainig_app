@@ -277,6 +277,7 @@ h3 { font-size: 15px; font-weight: 600; margin-top: 16px; }
 .form-group input[type="password"],
 .form-group input[type="number"],
 .form-group select {
+  display: block;
   width: 100%;
   max-width: 320px;
   padding: 8px 12px;
