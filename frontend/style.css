@@ -434,6 +434,7 @@ td.center { text-align: center; }
 .sq.dark { background: var(--c-sq-dark); }
 .sq.lm { background: var(--c-sq-highlight); }
 .sq.sel { background: var(--c-sq-highlight); }
+.sq.focus { outline: 2px solid var(--c-link); outline-offset: -2px; }
 /* Поле под курсором во время перетаскивания (как в Lichess) */
 .sq.over { box-shadow: inset 0 0 0 4px rgba(20, 85, 30, 0.45); }
 /* Шах королю */

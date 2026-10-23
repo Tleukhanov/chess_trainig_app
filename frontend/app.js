@@ -1,6 +1,6 @@
 // Chess Trainer Frontend — SPA на vanilla JS, потребляет /api/* эндпоинты.
 
-import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.5.8';
+import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.5.9';
 
 const state = {
   user: null,

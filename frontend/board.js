@@ -130,7 +130,7 @@ export function boardHtml(fen, opts = {}) {
     }
   }
 
-  return `<div class="board${flip ? ' flipped' : ''}" role="application" aria-label="Chess board" data-flip="${flip ? '1' : '0'}"
+  return `<div class="board${flip ? ' flipped' : ''}" role="application" aria-label="Chess board" tabindex="0" data-flip="${flip ? '1' : '0'}"
     data-anim-from="${animate ? animFrom : ''}" data-anim-to="${animate ? animTo : ''}">
     <div class="board-grid" role="grid" aria-label="Chess board grid">${html}</div>
     <svg class="board-arrows" viewBox="0 0 8 8" preserveAspectRatio="none" aria-hidden="true"></svg>
@@ -217,6 +217,7 @@ export function bindBoard(root, opts = {}) {
 
   const arrows = [];
   let selected = null;
+  let focusSquare = null;
   let promoPicker = null;
 
   function hidePromoPicker() {
@@ -293,6 +294,19 @@ export function bindBoard(root, opts = {}) {
   function clearSelection() {
     selected = null;
     squares.forEach(sq => sq.classList.remove('sel', 'dot', 'cap'));
+    hidePromoPicker();
+  }
+
+  function setFocus(square) {
+    if (focusSquare) {
+      const prev = squares.get(focusSquare);
+      if (prev) prev.classList.remove('focus');
+    }
+    focusSquare = square;
+    if (square) {
+      const next = squares.get(square);
+      if (next) next.classList.add('focus');
+    }
   }
 
   function select(from) {
@@ -491,6 +505,54 @@ export function bindBoard(root, opts = {}) {
   root.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') { hidePromoPicker(); clearSelection(); }
   });
+  root.addEventListener('keydown', (e) => {
+    const flip = root.dataset.flip === '1';
+    const dirs = {
+      ArrowRight: [flip ? -1 : 1, 0],
+      ArrowLeft: [flip ? 1 : -1, 0],
+      ArrowUp: [0, flip ? -1 : 1],
+      ArrowDown: [0, flip ? 1 : -1],
+    };
+    if (dirs[e.key]) {
+      e.preventDefault();
+      if (!focusSquare) {
+        setFocus(flip ? 'h1' : 'a8');
+        return;
+      }
+      const [df, dr] = dirs[e.key];
+      const f = FILES.indexOf(focusSquare[0]) + df;
+      const r = Number(focusSquare[1]) + dr;
+      if (f < 0 || f > 7 || r < 1 || r > 8) return;
+      setFocus(FILES[f] + r);
+      return;
+    }
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      if (!focusSquare) return;
+      if (selected && findMove(selected, focusSquare)) {
+        const cands = moves.filter(m => m.from === selected && m.to === focusSquare);
+        if (cands.length > 1) {
+          showPromoPicker(selected, focusSquare, cands, (chosen) => finishMove(chosen, false));
+          return;
+        }
+        finishMove(findMove(selected, focusSquare), false);
+        return;
+      }
+      if (moves.some(m => m.from === focusSquare)) {
+        if (selected === focusSquare) { clearSelection(); return; }
+        select(focusSquare);
+        return;
+      }
+      clearSelection();
+      return;
+    }
+    if (e.key === 'Escape') {
+      hidePromoPicker();
+      clearSelection();
+      setFocus(null);
+    }
+  });
+
   root.addEventListener('pointercancel', () => {
     hidePromoPicker();
     if (drag) {
