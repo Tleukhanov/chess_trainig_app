@@ -1,6 +1,6 @@
 // Chess Trainer Frontend — SPA на vanilla JS, потребляет /api/* эндпоинты.
 
-import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.5.9';
+import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.5.10';
 
 const state = {
   user: null,
@@ -43,6 +43,8 @@ const state = {
   middlegameJobId: null,
   middlegameError: null,
   middlegameOptimistic: null,
+  middlegameHuman: true,
+  openingHuman: true,
   authMode: 'login',
   trackStarted: false,
 };
@@ -1610,6 +1612,13 @@ async function drawOpeningSetup(app, errorMsg) {
           </div>
           <div style="font-size:12px;color:var(--c-text-muted);margin-top:4px">Число — разница Elo соперника относительно твоего рейтинга (база из профиля или 1500): +100/+200 означает соперника сильнее на 100/200 пунктов. Используется для выбора силы Maia.</div>
           <div style="font-size:12px;color:var(--c-text-muted);margin-top:4px">«Maia+ (фильтр)» — гибрид: Maia предлагает человеческие ходы, Stockfish отсекает зевки. Сильнее ~2200-2400, но играет по-человечески. Работает на сервере с достаточной RAM.</div>
+          <div class="form-group" style="margin-top:8px">
+            <label>Скорость соперника</label>
+            <div class="games-filter">
+              <button type="button" class="btn btn-secondary ${state.openingHuman ? '' : 'btn-active'}" data-speed="fast">Быстро</button>
+              <button type="button" class="btn btn-secondary ${state.openingHuman ? 'btn-active' : ''}" data-speed="human">Как человек</button>
+            </div>
+          </div>
           <div id="opening-strength-note" style="font-size:12px;color:var(--c-text-muted);margin-top:4px;display:none">Твой рейтинг ≥ 2000: Maia не различает силы выше 2000 Elo, доступен только равный уровень.</div>
         </div>
         <div class="form-group">
@@ -1689,6 +1698,12 @@ async function drawOpeningSetup(app, errorMsg) {
   const myEloInput = document.getElementById('opening-my-elo');
   if (myEloInput) myEloInput.addEventListener('input', updateOpeningStrengthAvailability);
   updateOpeningStrengthAvailability();
+  app.querySelectorAll('#opening-form [data-speed]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      state.openingHuman = btn.dataset.speed === 'human';
+      app.querySelectorAll('#opening-form [data-speed]').forEach(b => b.classList.toggle('btn-active', b === btn));
+    });
+  });
 
   const form = document.getElementById('opening-form');
   form.addEventListener('submit', async e => {
@@ -1701,6 +1716,7 @@ async function drawOpeningSetup(app, errorMsg) {
     const opp = String(fd.get('opp_elo') || '').trim();
     if (my) body.my_elo = Number(my);
     if (opp) body.opp_elo = Number(opp);
+    body.human = !!state.openingHuman;
     const btn = form.querySelector('button[type="submit"]');
     if (btn) btn.disabled = true;
     try {
@@ -1916,7 +1932,7 @@ async function submitOpeningMove(app, san) {
     const replyState = await api('/api/opening/reply', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_id: s.id }),
+      body: JSON.stringify({ session_id: s.id, human: !!state.openingHuman }),
     });
     if (state.openingFens) state.openingFens.push(replyState.fen);
     state.openingSession = replyState;
@@ -1941,7 +1957,7 @@ async function openingAnalyze(app) {
     const res = await api('/api/opening/analyze', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_id: s.id }),
+      body: JSON.stringify({ session_id: s.id, human: !!state.openingHuman }),
     });
     state.openingJobId = res.job_id;
     openingPoll(app, res.job_id);
@@ -2607,6 +2623,13 @@ function drawMiddlegameSetup(app) {
               </div>
               <div style="font-size:12px;color:var(--c-text-muted);margin-top:4px">Число — разница Elo соперника относительно твоего рейтинга (база из профиля или значение по умолчанию): +100/+200 = соперник сильнее на 100/200 пунктов. Используется для выбора силы Maia.</div>
               ${state.middlegameMeta && state.middlegameMeta.base_elo >= 2000 ? '<div style="font-size:12px;color:var(--c-text-muted);margin-top:4px">Твой рейтинг ≥ 2000: Maia не различает силы выше 2000 Elo, доступен только равный уровень.</div>' : ''}
+              <div class="form-group" style="margin-top:8px">
+                <label>Скорость соперника</label>
+                <div class="games-filter">
+                  <button type="button" class="btn btn-secondary ${state.middlegameHuman ? '' : 'btn-active'}" data-speed="fast">Быстро</button>
+                  <button type="button" class="btn btn-secondary ${state.middlegameHuman ? 'btn-active' : ''}" data-speed="human">Как человек</button>
+                </div>
+              </div>
             </div>
             <div class="alert alert-error" id="middlegame-setup-err" style="display:none"></div>
             <button type="submit" class="btn btn-primary" id="middlegame-start" ${ready ? '' : 'disabled'}>Начать партию</button>
@@ -2632,6 +2655,13 @@ function drawMiddlegameSetup(app) {
       if (btn.disabled) return;
       state.middlegameStrength = btn.dataset.strength;
       app.querySelectorAll('#middlegame-strength [data-strength]').forEach(b => b.classList.toggle('btn-active', b === btn));
+    });
+  });
+  app.querySelectorAll('[data-speed]').forEach(btn => {
+    if (btn.closest('#middlegame-strength')) return;
+    btn.addEventListener('click', () => {
+      state.middlegameHuman = btn.dataset.speed === 'human';
+      app.querySelectorAll('[data-speed]').forEach(b => { if (!b.closest('#middlegame-strength')) b.classList.toggle('btn-active', b === btn); });
     });
   });
 
@@ -2842,7 +2872,7 @@ async function middlegameReply(app) {
   drawMiddlegame(app);
   let result;
   try {
-    result = await api('/api/middlegame/session/' + encodeURIComponent(session.id) + '/reply', { method: 'POST' });
+    result = await api('/api/middlegame/session/' + encodeURIComponent(session.id) + '/reply' + (state.middlegameHuman ? '?human=1' : '') , { method: 'POST' });
   } catch (err) {
     state.middlegameThinking = false;
     if (isSessionError(err)) { handleSessionExpired(); return; }
