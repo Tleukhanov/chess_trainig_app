@@ -2833,6 +2833,28 @@ class GameCausesNotesApiTests(ApiTestBase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json(), {"causes": {}})
 
+    def test_review_payload(self):
+        self._seed_game()
+        resp = self.client.get("/api/games/cn1/review")
+        self.assertEqual(resp.status_code, 200, resp.text)
+        review = resp.json()["review"]
+        self.assertIsNotNone(review)
+        self.assertIn("user", review["accuracy"])
+        self.assertIn("opponent", review["accuracy"])
+        self.assertEqual(set(review["phases"]), {"opening", "middlegame", "endgame"})
+        self.assertEqual(set(review["categories"]), {"opening", "middlegame", "endgame", "tactics", "strategy", "positional"})
+        self.assertTrue(review["summary"])
+        self.assertEqual(len(review["moves"]), len(self.MOVES))
+        # 1.e4 — теоретический ход из ECO-книги.
+        self.assertEqual(review["moves"][0]["badge"], "book")
+        self.assertTrue(review["moves"][0]["comment"])
+        # Ошибки получают бейдж не «good».
+        self.assertNotIn(review["moves"][12]["badge"], ("good", "excellent", "best", "book"))
+        # Без анализа — review = null, а не 500.
+        self._seed_game("cn_plain2", analysis=False)
+        self.assertEqual(self.client.get("/api/games/cn_plain2/review").status_code, 200)
+        self.assertIsNone(self.client.get("/api/games/cn_plain2/review").json()["review"])
+
     def test_causes_404_for_unknown_and_foreign_game(self):
         self._seed_game()
         self.assertEqual(self.client.get("/api/games/nope/causes").status_code, 404)

@@ -65,10 +65,14 @@ from .openings import (
     opponent_color,
     opponent_move,
     result,
+    theory_moves,
     user_move,
 )
+from .accuracy import accuracy as acc_accuracy, category_stats, estimate_rating, phase_stats
+from .comments import game_summary, move_comment
 from .paths import user_dir
 from .patterns import phase
+from .review_moves import badge_for, badge_label, detect_sacrifice
 from .plan import build_plan
 from .progress import build_progress
 from .repertoire import Repertoire, opening_stats
@@ -3002,6 +3006,105 @@ def create_api(
                 return {"repeats": []}
             history = db.get_analyzed_games(user["nick"], limit=500)
         return {"repeats": repeated_mistakes(game, analysis, history)}
+
+    def _review_payload(game, analysis: dict) -> dict:
+        """Полный разбор партии: бейджи, точность, фазы, категории, комментарии."""
+        moves_san = list(game.moves or [])
+        records = analysis.get("moves") or []
+        user_is_white = game.user_color == "white"
+
+        def _norm(san: str) -> str:
+            return str(san or "").strip().rstrip("+#")
+
+        def _avg_drop(for_user: bool) -> float:
+            values: list[float] = []
+            for ply, entry in enumerate(records):
+                if not isinstance(entry, dict):
+                    continue
+                is_user = (ply % 2 == 0) == user_is_white
+                if is_user != for_user:
+                    continue
+                raw = entry.get("drop")
+                if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                    continue
+                values.append(float(raw))
+            return sum(values) / len(values) if values else 0.0
+
+        board = chess.Board()
+        items: list[dict] = []
+        for ply, san in enumerate(moves_san):
+            entry = records[ply] if ply < len(records) and isinstance(records[ply], dict) else {}
+            theory = {_norm(t_san) for t_san, _ in theory_moves(moves_san[:ply])}
+            in_book = bool(theory) and _norm(san) in theory
+            played_line = entry.get("played_line") or []
+            try:
+                sacrifice = detect_sacrifice(board, san, played_line)
+            except Exception:  # noqa: BLE001
+                sacrifice = False
+            current_phase = phase(ply, board)
+            phase_key = "middlegame" if current_phase in ("midgame", "middlegame") else current_phase
+            cause = None
+            if entry.get("classification") in ("blunder", "mistake"):
+                cause = classify_cause(entry, phase_key, repeated=False)
+            badge = badge_for(entry, in_book=in_book, sacrifice=sacrifice)
+            items.append(
+                {
+                    "ply": ply,
+                    "san": san,
+                    "color": "w" if ply % 2 == 0 else "b",
+                    "is_user": (ply % 2 == 0) == user_is_white,
+                    "badge": badge,
+                    "label": badge_label(badge),
+                    "comment": move_comment(
+                        entry,
+                        badge,
+                        best_move_san=entry.get("best_move_san"),
+                        phase=phase_key,
+                        cause=cause,
+                    ),
+                    "drop": entry.get("drop"),
+                    "win_before": entry.get("win_before"),
+                    "win_after": entry.get("win_after"),
+                    "best_move_san": entry.get("best_move_san"),
+                }
+            )
+            try:
+                board.push_san(san)
+            except ValueError:
+                break
+
+        phases = phase_stats(moves_san, analysis, game.user_color)
+        user_acc = acc_accuracy(_avg_drop(for_user=True))
+        opponent_acc = acc_accuracy(_avg_drop(for_user=False))
+        return {
+            "accuracy": {"user": user_acc, "opponent": opponent_acc},
+            "rating_estimate": estimate_rating(user_acc, game.user_rating),
+            "phases": phases,
+            "categories": category_stats(phases),
+            "summary": game_summary(
+                phases,
+                user_acc,
+                user_color=game.user_color,
+                result=game.result_for_user,
+            ),
+            "moves": items,
+        }
+
+    @app.get("/api/games/{game_id}/review")
+    def api_game_review(game_id: str, request: Request):
+        """Разбор партии в стиле chess.com: бейджи, точность, фазы, комментарии."""
+        user = _current_user(app.state.db_path, request)
+        if not user:
+            raise HTTPException(404, "No current user")
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            game = db.get_game(game_id, user["nick"])
+            if game is None:
+                raise HTTPException(404, "Партия не найдена")
+            analysis = db.get_analysis(game_id)
+        if not isinstance(analysis, dict):
+            return {"review": None}
+        return {"review": _review_payload(game, analysis)}
 
     @app.get("/api/games/{game_id}/causes")
     def api_game_causes(game_id: str, request: Request):

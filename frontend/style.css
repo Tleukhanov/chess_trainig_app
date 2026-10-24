@@ -614,3 +614,86 @@ td.center { text-align: center; }
   .card { min-width: 0; }
   .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
 }
+/* ============================================================
+   Бейджи ходов и анимации разбора
+   Иконки: frontend/assets/badges/*.svg (24x24, прозрачный фон).
+   Фон и обводку бейджа задаёт класс .mb-*, глиф цвета — сама иконка.
+   ============================================================ */
+
+.move-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
+  vertical-align: middle;
+  border-radius: 5px;
+  border: 1px solid transparent;
+  background: var(--c-badge-neutral-bg);
+  line-height: 1;
+  overflow: hidden;
+  transform-origin: center;
+  user-select: none;
+}
+
+.move-badge img {
+  display: block;
+  width: 16px;
+  height: 16px;
+  pointer-events: none;
+}
+
+/* Цвета фона/обводки. Полупрозрачные тона работают и в светлой, и в тёмной теме. */
+.mb-book        { background: rgba(138, 111, 77, .14);  border-color: rgba(138, 111, 77, .52); }
+.mb-brilliant   { background: rgba(20, 163, 127, .16);  border-color: rgba(20, 163, 127, .58); }
+.mb-great       { background: rgba(43, 127, 212, .16);  border-color: rgba(43, 127, 212, .58); }
+.mb-best        { background: rgba(46, 158, 74, .16);   border-color: rgba(46, 158, 74, .58); }
+.mb-excellent   { background: rgba(63, 158, 87, .16);   border-color: rgba(63, 158, 87, .52); }
+.mb-good        { background: rgba(99, 159, 64, .16);   border-color: rgba(99, 159, 64, .52); }
+.mb-inaccuracy  { background: rgba(224, 155, 26, .18);  border-color: rgba(224, 155, 26, .58); }
+.mb-mistake     { background: rgba(214, 79, 0, .16);    border-color: rgba(214, 79, 0, .52); }
+.mb-blunder     { background: rgba(197, 34, 31, .16);   border-color: rgba(197, 34, 31, .52); }
+.mb-missed-win  { background: rgba(179, 38, 30, .16);   border-color: rgba(179, 38, 30, .52); }
+
+/* Появление бейджа */
+@keyframes badge-pop {
+  0%   { transform: scale(.4); opacity: 0; }
+  70%  { transform: scale(1.15); }
+  100% { transform: scale(1); opacity: 1; }
+}
+
+.move-badge.pop { animation: badge-pop .28s ease-out; }
+
+/* Появление пузыря тренера: fade + подъём на 8px */
+@keyframes bubble-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.coach-bubble.enter { animation: bubble-in .3s ease-out; }
+
+/* Пульсация маркера на графике разбора */
+@keyframes marker-pulse {
+  0%   { transform: scale(1);   opacity: 1; }
+  50%  { transform: scale(1.35); opacity: .65; }
+  100% { transform: scale(1);   opacity: 1; }
+}
+
+.marker-pulse {
+  animation: marker-pulse 1.6s ease-in-out infinite;
+  transform-origin: center;
+}
+
+/* Уважаем настройку «уменьшить движение» */
+@media (prefers-reduced-motion: reduce) {
+  .move-badge.pop,
+  .coach-bubble.enter,
+  .marker-pulse { animation: none !important; }
+}
+
+/* Мобильные размеры */
+@media (max-width: 720px) {
+  .move-badge { width: 16px; height: 16px; border-radius: 4px; }
+  .move-badge img { width: 14px; height: 14px; }
+}
