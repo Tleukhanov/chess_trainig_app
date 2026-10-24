@@ -1,6 +1,6 @@
 // Chess Trainer Frontend — SPA на vanilla JS, потребляет /api/* эндпоинты.
 
-import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.5.10';
+import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.6.0';
 
 const state = {
   user: null,
@@ -1716,21 +1716,6 @@ async function drawOpeningSetup(app, errorMsg) {
     const high = base >= 2000;
     const note = document.getElementById('opening-strength-note');
     if (note) note.style.display = high ? 'block' : 'none';
-    app.querySelectorAll('#opening-form [data-opp="plus100"], #opening-form [data-opp="stronger"]').forEach(btn => {
-      btn.disabled = high;
-      btn.style.opacity = high ? '0.45' : '';
-      btn.style.cursor = high ? 'not-allowed' : '';
-      btn.title = high
-        ? 'Maia не различает силы выше 2000 Elo: для твоего рейтинга +100/+200 недоступны'
-        : (btn.dataset.opp === 'plus100'
-            ? 'Соперник на 100 Elo выше твоего рейтинга (база: твой рейтинг или 1500 по умолчанию); Maia играет сильнее'
-            : 'Соперник на 200 Elo выше твоего рейтинга (база: твой рейтинг или 1500 по умолчанию); Maia играет сильнее');
-    });
-  };
-  const updateOpeningStrengthAvailability = () => {
-    const my = document.getElementById('opening-my-elo');
-    const base = Number(my && my.value) || 1500;
-    const high = base >= 2000;
     app.querySelectorAll('#opening-form [data-opp="plus100"], #opening-form [data-opp="stronger"]').forEach(btn => {
       btn.disabled = high;
       btn.style.opacity = high ? '0.45' : '';
