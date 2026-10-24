@@ -1,6 +1,6 @@
 // Chess Trainer Frontend — SPA на vanilla JS, потребляет /api/* эндпоинты.
 
-import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.6.1';
+import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.6.2';
 
 const state = {
   user: null,
@@ -10,6 +10,7 @@ const state = {
   gameId: null,
   gameData: null,
   gamePly: 0,
+  gameExtras: null,
   keyHandler: null,
   tool: 'repertoire',
   task: null,
@@ -1014,6 +1015,7 @@ async function viewGameDetail(app) {
   }
   state.gameData = data;
   state.gamePly = 0;
+  state.gameExtras = null;
   drawGameDetail(app);
   bindGameKeyboard();
 }
@@ -1026,6 +1028,7 @@ function drawGameDetail(app) {
   const ply = Math.max(0, Math.min(state.gamePly, fens.length - 1));
   state.gamePly = ply;
   const moves = game.moves || [];
+  if (analysis) ensureGameExtras(game.id);
 
   const lastMove = ply > 0 ? lastMoveSquares(fens[ply - 1], fens[ply]) : [];
 
@@ -1067,6 +1070,13 @@ function drawGameDetail(app) {
         </div>`).join('')
     : '<p style="color:var(--c-text-muted)">Ходов нет.</p>';
 
+  // Перерисовка (стрелки/слайдер) убирает textarea из DOM без blur —
+  // сохраняем заметку заранее, чтобы не потерять введённый текст.
+  const activeNote = document.activeElement;
+  if (activeNote && activeNote.classList && activeNote.classList.contains('err-note')) {
+    saveGameNote(activeNote);
+  }
+
   app.innerHTML = `
     <div class="card-header">
       <h1 style="margin:0">Партия <code>${esc(game.id)}</code></h1>
@@ -1103,6 +1113,7 @@ function drawGameDetail(app) {
         <div class="card">
           <div class="card-header"><span class="card-title">Анализ</span></div>
           ${analysis ? gameMetricsHtml(analysis) : '<p style="color:var(--c-text-muted)">Не проанализирована.</p>'}
+          ${analysis ? '<div id="game-errors"></div>' : ''}
           <div id="game-repeats"></div>
           ${analysis ? `<div style="margin-top:10px"><button class="btn btn-primary" id="train-from-game" data-color="${esc(game.user_color || 'white')}">Тренировать этот дебют</button></div>` : ''}
         </div>
@@ -1111,6 +1122,7 @@ function drawGameDetail(app) {
 
   bindLinks(app);
   bindBoard(app.querySelector('.board'));
+  renderGameErrors(app);
   const repeatsBox = document.getElementById('game-repeats');
   if (repeatsBox && analysis) {
     api('/api/games/' + encodeURIComponent(game.id) + '/repeats').then(data => {
@@ -1176,6 +1188,215 @@ function gameMetricsHtml(analysis) {
       <div class="stat"><div class="stat-value">${avgLoss}</div><div class="stat-label" title="Средняя потеря win% (процентов) на ход игрока (метрика avg_win_loss из анализа)">Ср. потеря win%</div></div>
       <div class="stat"><div class="stat-value">${avgBefore}</div><div class="stat-label" title="Средний win% перед ходом игрока (метрика avg_win_before)">Win% до хода</div></div>
     </div>`;
+}
+
+// --- Ошибки партии: причина (/causes) и «твоя идея» (/notes) ---
+
+// Кэш ответов /causes и /notes на текущую партию. drawGameDetail()
+// перерисовывает весь экран на каждый полуход, поэтому данные держим
+// в state и не дёргаем API повторно.
+function ensureGameExtras(gameId) {
+  if (state.gameExtras && state.gameExtras.gameId === gameId) return state.gameExtras;
+  const extras = {
+    gameId,
+    causes: {},
+    notes: {},
+    drafts: {},
+    saving: {},
+    causesLoading: true,
+    causesError: false,
+  };
+  state.gameExtras = extras;
+  loadGameExtras(extras);
+  return extras;
+}
+
+function loadGameExtras(extras) {
+  const base = '/api/games/' + encodeURIComponent(extras.gameId);
+  api(base + '/causes').then(data => {
+    if (state.gameExtras !== extras) return;
+    extras.causes = (data && data.causes) || {};
+    extras.causesLoading = false;
+    renderGameErrors(document.getElementById('app'));
+  }).catch(() => {
+    if (state.gameExtras !== extras) return;
+    extras.causesLoading = false;
+    extras.causesError = true;
+    renderGameErrors(document.getElementById('app'));
+  });
+  api(base + '/notes').then(data => {
+    if (state.gameExtras !== extras) return;
+    extras.notes = (data && data.notes) || {};
+    renderGameErrors(document.getElementById('app'));
+  }).catch(() => {
+    if (state.gameExtras !== extras) return;
+    // Блок ошибок остаётся на месте: заметки просто будут пустыми.
+    renderGameErrors(document.getElementById('app'));
+  });
+}
+
+// Ошибки игрока: зевки и ошибки, до 10 штук. Ключ — индекс полухода
+// в analysis.moves (0-based), как в /causes и /notes.
+function gameErrorEntries(analysis, game) {
+  const moves = (analysis && analysis.moves) || [];
+  const userColor = game && game.user_color;
+  const out = [];
+  moves.forEach((m, i) => {
+    if (!m) return;
+    const c = m.classification;
+    if (c !== 'blunder' && c !== 'mistake') return;
+    if (userColor && ((i % 2 === 0) !== (userColor === 'white'))) return;
+    out.push({ ply: i, san: m.san, drop: m.drop, classification: c });
+  });
+  return out;
+}
+
+function gameErrorsInnerHtml(analysis, game, extras) {
+  const errors = gameErrorEntries(analysis, game);
+  if (!errors.length) {
+    return `<div class="card-header" style="margin-top:12px"><span class="card-title">Ошибки: причина и твоя идея</span></div>
+      <p style="color:var(--c-text-muted)">Зевков и ошибок не найдено.</p>`;
+  }
+  const shown = errors.slice(0, 10);
+  const rows = shown.map(e => {
+    const cause = extras && extras.causes ? extras.causes[e.ply] : null;
+    let causeHtml;
+    if (extras && extras.causesError) {
+      causeHtml = '<span class="badge badge-neutral" title="Не удалось загрузить причину">—</span>';
+    } else if (!cause) {
+      const pending = !extras || extras.causesLoading;
+      causeHtml = `<span class="badge badge-neutral" title="${pending ? 'Причина загружается' : 'Причина не определена'}">${pending ? '…' : '—'}</span>`;
+    } else {
+      const label = cause.label || cause.cause || '—';
+      const explain = cause.explanation ? ` title="${esc(cause.explanation)}"` : '';
+      causeHtml = `<span class="badge badge-neutral"${explain}>${esc(label)}</span>`;
+    }
+    const explanation = cause && cause.explanation
+      ? `<div style="color:var(--c-text-muted);font-size:12px">${esc(cause.explanation)}</div>`
+      : '';
+    const saved = extras && extras.notes ? (extras.notes[e.ply] || '') : '';
+    const draft = extras && extras.drafts ? extras.drafts[e.ply] : undefined;
+    const value = draft !== undefined ? draft : saved;
+    const status = value === saved && saved ? 'сохранено' : '';
+    const clsBadge = e.classification === 'blunder'
+      ? '<span class="badge badge-bad" style="color:var(--c-err-blunder)">Зевок</span>'
+      : '<span class="badge badge-neutral" style="color:var(--c-err-mistake)">Ошибка</span>';
+    const loss = e.drop != null
+      ? `${e.drop >= 0 ? '−' : '+'}${fmt(Math.abs(e.drop))} win%`
+      : '—';
+    return `
+      <div class="game-error" data-ply="${e.ply}" style="padding:10px 0;border-top:1px solid var(--c-border);display:flex;flex-direction:column;gap:6px">
+        <div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px">
+          <button type="button" class="btn btn-secondary err-jump" data-ply="${e.ply}" style="padding:2px 8px;font-size:13px">${esc(e.san || '—')}</button>
+          ${clsBadge}
+          <span style="color:var(--c-text-muted);font-size:13px">${loss}</span>
+          ${causeHtml}
+        </div>
+        ${explanation}
+        <div class="form-group" style="margin:0">
+          <textarea class="err-note" data-ply="${e.ply}" rows="2" maxlength="500" placeholder="Твоя идея: что ты хотел сделать этим ходом?">${esc(value)}</textarea>
+          <div class="err-save-status" style="font-size:12px;color:var(--c-text-muted);min-height:14px">${esc(status)}</div>
+        </div>
+      </div>`;
+  }).join('');
+  const more = errors.length > shown.length
+    ? `<p style="color:var(--c-text-muted);font-size:12px">Показаны первые ${shown.length} из ${errors.length}.</p>`
+    : '';
+  return `<div class="card-header" style="margin-top:12px"><span class="card-title">Ошибки: причина и твоя идея</span></div>
+    <div class="game-errors-list">${rows}</div>${more}`;
+}
+
+function renderGameErrors(root) {
+  if (!root) return;
+  const box = root.querySelector('#game-errors');
+  if (!box) return;
+  const data = state.gameData;
+  if (!data || !data.analysis) return;
+  const extras = state.gameExtras && state.gameExtras.gameId === data.game.id
+    ? state.gameExtras
+    : null;
+  // Перерисовка приходит после ответа /causes или /notes — не теряем
+  // фокус и позицию курсора в textarea, которую пользователь заполняет.
+  const active = document.activeElement;
+  const focus = active && box.contains(active) && active.classList.contains('err-note')
+    ? { ply: active.dataset.ply, start: active.selectionStart, end: active.selectionEnd }
+    : null;
+  box.innerHTML = gameErrorsInnerHtml(data.analysis, data.game, extras);
+  bindGameErrors(box);
+  if (focus) {
+    const ta = box.querySelector('.err-note[data-ply="' + focus.ply + '"]');
+    if (ta) {
+      ta.focus();
+      try { ta.setSelectionRange(focus.start, focus.end); } catch { /* не критично */ }
+    }
+  }
+}
+
+function bindGameErrors(box) {
+  box.querySelectorAll('.err-note').forEach(ta => {
+    ta.addEventListener('input', () => {
+      if (state.gameExtras) state.gameExtras.drafts[ta.dataset.ply] = ta.value;
+    });
+    ta.addEventListener('blur', () => { saveGameNote(ta); });
+    ta.addEventListener('keydown', e => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        saveGameNote(ta);
+      }
+    });
+  });
+  box.querySelectorAll('.err-jump').forEach(btn => {
+    btn.addEventListener('click', () => {
+      state.gamePly = +btn.dataset.ply;
+      drawGameDetail(document.getElementById('app'));
+    });
+  });
+}
+
+function setNoteStatus(ta, text, isError) {
+  if (!ta || !ta.isConnected) return;
+  const el = ta.parentNode && ta.parentNode.querySelector('.err-save-status');
+  if (!el) return;
+  el.textContent = text;
+  el.style.color = isError ? 'var(--c-err-blunder)' : 'var(--c-text-muted)';
+}
+
+async function saveGameNote(ta) {
+  const extras = state.gameExtras;
+  if (!extras || !ta || !ta.isConnected) return;
+  const ply = +ta.dataset.ply;
+  const intent = ta.value.trim();
+  const saved = extras.notes[ply] || '';
+  if (intent === saved) {
+    setNoteStatus(ta, saved ? 'сохранено' : '');
+    return;
+  }
+  if (extras.saving[ply]) return;
+  extras.saving[ply] = true;
+  setNoteStatus(ta, 'сохранение…');
+  try {
+    await api('/api/games/' + encodeURIComponent(extras.gameId) + '/notes', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ply, intent }),
+    });
+    if (state.gameExtras !== extras) return;
+    extras.notes[ply] = intent;
+    extras.drafts[ply] = intent;
+    if (ta.isConnected) {
+      setNoteStatus(ta, 'сохранено');
+    } else {
+      // Экран успел перерисоваться, пока шёл запрос.
+      const cur = document.querySelector('#game-errors .err-note[data-ply="' + ply + '"]');
+      if (cur && cur.value.trim() === intent) setNoteStatus(cur, 'сохранено');
+    }
+  } catch (err) {
+    if (isSessionError(err)) { handleSessionExpired(); return; }
+    setNoteStatus(ta, 'не сохранено', true);
+    showToast(err.message, 'error');
+  } finally {
+    extras.saving[ply] = false;
+  }
 }
 
 

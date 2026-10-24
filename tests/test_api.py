@@ -2285,7 +2285,7 @@ class FrontendTests(ApiTestBase):
         html = resp.text
         self.assertIn("app.js?v=", html)
         self.assertIn("style.css?v=", html)
-        self.assertIn("v0.6.1", html)
+        self.assertIn("v0.6.2", html)
 
     def test_api_version(self):
         self.assertEqual(self.app.version, "0.4.8")
@@ -2768,6 +2768,149 @@ class JobLimitTests(ApiTestBase):
             self.assertEqual(resp.status_code, 200)
         finally:
             _JOBS.clear()
+
+
+class GameCausesNotesApiTests(ApiTestBase):
+    """Причины ошибок и заметки к ходам: /api/games/{id}/causes|notes.
+
+    Партия реплеится по game.moves; причины считаются только для ходов с
+    classification blunder/mistake, фаза — по позиции перед ходом.
+    """
+
+    # 1.e4 e5 2.Nf3 Nc6 3.Bb5 a6 4.Ba4 Nf6 5.O-O Be7 6.Re1 b5 7.Bb3 d6
+    MOVES = [
+        "e4", "e5", "Nf3", "Nc6", "Bb5", "a6", "Ba4",
+        "Nf6", "O-O", "Be7", "Re1", "b5", "Bb3", "d6",
+    ]
+
+    @staticmethod
+    def _entry(san: str, classification: str = "good", drop: float = 0.0) -> dict:
+        return {
+            "san": san,
+            "classification": classification,
+            "drop": drop,
+            "time_pressure": None,
+        }
+
+    def _analysis(self) -> dict:
+        entries = [self._entry(san) for san in self.MOVES]
+        # ply 2 (Nf3) — ошибка в дебюте: стратегическая.
+        entries[2] = self._entry("Nf3", "mistake", 5.0)
+        # ply 4 (Bb5) — дебют, даже большая потеря остаётся стратегической.
+        entries[4] = self._entry("Bb5", "blunder", 25.0)
+        # ply 12 (Bb3) — миттельшпиль, потеря >= 20 win.%: тактический зевок.
+        entries[12] = self._entry("Bb3", "blunder", 25.0)
+        return {"moves": entries}
+
+    def _seed_game(self, gid: str = "cn1", nick: str = "tester", analysis: bool = True) -> None:
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.save_games([mkgame_moves(gid, self.MOVES, user_color="white")], nick)
+            if analysis:
+                db.save_analysis(gid, self._analysis(), depth=8)
+        self._set_current(nick)
+
+    def test_causes_only_errors_with_labels(self):
+        self._seed_game()
+        resp = self.client.get("/api/games/cn1/causes")
+        self.assertEqual(resp.status_code, 200, resp.text)
+        causes = resp.json()["causes"]
+        # Только blunder/mistake; хорошие ходы (0, 1, 3, ...) не попадают.
+        self.assertEqual(set(causes), {"2", "4", "12"})
+        self.assertEqual(causes["2"]["cause"], "strategic")
+        self.assertEqual(causes["2"]["label"], "стратегическая ошибка")
+        self.assertTrue(causes["2"]["explanation"])
+        self.assertIn("дебюте", causes["2"]["explanation"])
+        # Дебютная потеря >= 20 win.% не становится «тактикой».
+        self.assertEqual(causes["4"]["cause"], "strategic")
+        self.assertEqual(causes["12"]["cause"], "tactical_oversight")
+        self.assertEqual(causes["12"]["label"], "тактический зевок")
+        self.assertIn("тактика", causes["12"]["explanation"])
+
+        # Без анализа — пустой словарь, а не 500.
+        self._seed_game("cn_plain", analysis=False)
+        resp = self.client.get("/api/games/cn_plain/causes")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json(), {"causes": {}})
+
+    def test_causes_404_for_unknown_and_foreign_game(self):
+        self._seed_game()
+        self.assertEqual(self.client.get("/api/games/nope/causes").status_code, 404)
+        # Партия другого игрока не видна: get_game сужается по пользователю.
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.save_games(
+                [mkgame_moves("cn_other", self.MOVES, user_color="white")], "other"
+            )
+            db.save_analysis("cn_other", self._analysis(), depth=8)
+        self.assertEqual(
+            self.client.get("/api/games/cn_other/causes").status_code, 404
+        )
+
+    def test_notes_roundtrip_and_delete(self):
+        self._seed_game()
+        resp = self.client.post(
+            "/api/games/cn1/notes", json={"ply": 4, "intent": "  идея: рокировка  "}
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json(), {"ok": True})
+        resp = self.client.get("/api/games/cn1/notes")
+        self.assertEqual(resp.status_code, 200)
+        # intent сохранён без окружающих пробелов, ply — строковый ключ.
+        self.assertEqual(resp.json(), {"notes": {"4": "идея: рокировка"}})
+
+        self.client.post("/api/games/cn1/notes", json={"ply": 6, "intent": "план"})
+        self.client.post("/api/games/cn1/notes", json={"ply": 4, "intent": "новый"})
+        notes = self.client.get("/api/games/cn1/notes").json()["notes"]
+        self.assertEqual(notes, {"4": "новый", "6": "план"})
+
+        # Пустой intent удаляет заметку (только указанный ply).
+        resp = self.client.post("/api/games/cn1/notes", json={"ply": 4, "intent": "   "})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            self.client.get("/api/games/cn1/notes").json(), {"notes": {"6": "план"}}
+        )
+
+    def test_notes_validation_and_foreign_404(self):
+        self._seed_game()
+        self.assertEqual(
+            self.client.post(
+                "/api/games/cn1/notes", json={"ply": -1, "intent": "x"}
+            ).status_code,
+            400,
+        )
+        self.assertEqual(
+            self.client.post(
+                "/api/games/cn1/notes", json={"ply": 0, "intent": "x" * 501}
+            ).status_code,
+            400,
+        )
+        # Ровно 500 символов — допустимо.
+        self.assertEqual(
+            self.client.post(
+                "/api/games/cn1/notes", json={"ply": 0, "intent": "x" * 500}
+            ).status_code,
+            200,
+        )
+
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.save_games(
+                [mkgame_moves("cn_other", self.MOVES, user_color="white")], "other"
+            )
+        # Чужая партия: и чтение, и запись — 404 (в т.ч. заметки другого игрока).
+        self.assertEqual(
+            self.client.get("/api/games/cn_other/notes").status_code, 404
+        )
+        self.assertEqual(
+            self.client.post(
+                "/api/games/cn_other/notes", json={"ply": 2, "intent": "чужая"}
+            ).status_code,
+            404,
+        )
+        self.assertEqual(
+            self.client.get("/api/games/cn1/notes").json()["notes"].keys(), {"0"}
+        )
 
 
 if __name__ == "__main__":

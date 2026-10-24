@@ -51,6 +51,7 @@ from .llm import ChatMessage, LLMClient, _is_local_host, clean_llm_text, looks_l
 from .maia import MaiaLitePolicy
 from .mentor import build_mentor_request, format_mentor_reply, run_mentor
 from .metrics import metric
+from .mistakes import cause_label, classify_cause, explain_cause
 from .opponent import build_confrontations, build_opponent_profile
 from .openings import (
     STYLE_DESCRIPTIONS_RU,
@@ -67,6 +68,7 @@ from .openings import (
     user_move,
 )
 from .paths import user_dir
+from .patterns import phase
 from .plan import build_plan
 from .progress import build_progress
 from .repertoire import Repertoire, opening_stats
@@ -681,6 +683,13 @@ class MiddlegameMoveBody(BaseModel):
     """Тело POST /api/middlegame/session/{id}/move."""
 
     move: str = ""
+
+
+class MoveNoteBody(BaseModel):
+    """Тело POST /api/games/{id}/notes: заметка (идея хода) на полуход."""
+
+    ply: int
+    intent: str = ""
 
 
 def _opening_policy(opp_elo: int, my_elo: int) -> tuple[Any, str]:
@@ -2414,6 +2423,12 @@ def _clock_seconds(clocks: list[float]) -> float:
     return sum(max(0.0, prev - cur) for prev, cur in zip(clocks, clocks[1:]))
 
 
+# Заметки к ходам: максимальная длина идеи хода и классы ошибок, для которых
+# /api/games/{id}/causes считает причину (см. app.mistakes).
+_MOVE_NOTE_MAX_LEN = 500
+_MOVE_ERROR_CLASSES = frozenset({"blunder", "mistake"})
+
+
 # --- API factory -----------------------------------------------------------
 
 def create_api(
@@ -2916,6 +2931,41 @@ def create_api(
             "fens": _fens_for(game.moves),
         }
 
+    def _causes_payload(game, analysis: dict) -> dict[str, dict]:
+        """Причины ошибок по полуходам: {"<ply>": {cause, label, explanation}}.
+
+        Доска восстанавливается по ``game.moves``; фаза берётся по позиции
+        ПЕРЕД ходом (``phase(ply, board)``), как в app.patterns. ``repeated``
+        пока всегда False — повторы считает отдельный эндпоинт /repeats.
+        Невалидный ход обрывает реплей: дальше позицию не восстановить.
+        """
+        moves = analysis.get("moves") or []
+        board = chess.Board()
+        causes: dict[str, dict] = {}
+        for ply, san in enumerate(game.moves):
+            entry = moves[ply] if ply < len(moves) else {}
+            if not isinstance(entry, dict):
+                entry = {}
+            if entry.get("classification") in _MOVE_ERROR_CLASSES:
+                current_phase = phase(ply, board)
+                cause = classify_cause(entry, current_phase, repeated=False)
+                causes[str(ply)] = {
+                    "cause": cause,
+                    "label": cause_label(cause),
+                    "explanation": explain_cause(
+                        cause, entry, repeated=False, phase=current_phase
+                    ),
+                }
+            try:
+                board.push_san(san)
+            except ValueError:
+                break
+        return causes
+
+    def _notes_payload(db, user: str, game_id: str) -> dict[str, str]:
+        """Заметки игрока к ходам: {"<ply>": intent}."""
+        return {str(ply): text for ply, text in db.get_move_notes(game_id, user).items()}
+
     @app.get("/api/games")
     def api_games(request: Request, limit: int = 100):
         user = _current_user(app.state.db_path, request)
@@ -2952,6 +3002,57 @@ def create_api(
                 return {"repeats": []}
             history = db.get_analyzed_games(user["nick"], limit=500)
         return {"repeats": repeated_mistakes(game, analysis, history)}
+
+    @app.get("/api/games/{game_id}/causes")
+    def api_game_causes(game_id: str, request: Request):
+        """Причины ошибок партии: только ходы с classification blunder/mistake."""
+        user = _current_user(app.state.db_path, request)
+        if not user:
+            raise HTTPException(404, "No current user")
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            game = db.get_game(game_id, user["nick"])
+            if game is None:
+                raise HTTPException(404, "Партия не найдена")
+            analysis = db.get_analysis(game_id)
+        if not isinstance(analysis, dict):
+            return {"causes": {}}
+        return {"causes": _causes_payload(game, analysis)}
+
+    @app.get("/api/games/{game_id}/notes")
+    def api_game_notes(game_id: str, request: Request):
+        """Заметки (идеи ходов) текущего игрока по партии."""
+        user = _current_user(app.state.db_path, request)
+        if not user:
+            raise HTTPException(404, "No current user")
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            game = db.get_game(game_id, user["nick"])
+            if game is None:
+                raise HTTPException(404, "Партия не найдена")
+            notes = _notes_payload(db, user["nick"], game_id)
+        return {"notes": notes}
+
+    @app.post("/api/games/{game_id}/notes")
+    def api_game_note_save(game_id: str, body: MoveNoteBody, request: Request):
+        """Сохраняет идею хода; пустой intent удаляет заметку."""
+        user = _current_user(app.state.db_path, request)
+        if not user:
+            raise HTTPException(404, "No current user")
+        if body.ply < 0:
+            raise HTTPException(400, "ply должен быть >= 0")
+        intent = (body.intent or "").strip()
+        if len(intent) > _MOVE_NOTE_MAX_LEN:
+            raise HTTPException(
+                400, f"intent не должен быть длиннее {_MOVE_NOTE_MAX_LEN} символов"
+            )
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            game = db.get_game(game_id, user["nick"])
+            if game is None:
+                raise HTTPException(404, "Партия не найдена")
+            db.save_move_note(game_id, user["nick"], body.ply, intent)
+        return {"ok": True}
 
     # --- Tools: репертуар / соперник / человечность / турнир / FIDE ---
     def _repertoire_payload(db, user: str, color: str, max_depth: int) -> dict:

@@ -139,6 +139,21 @@ CREATE TABLE IF NOT EXISTS {table}(
 )
 """
 
+# Заметки к ходам (идея хода), свои у каждого игрока: одна строка на
+# (партия, игрок, полуход). Колонка называется ``player``, а не ``user``:
+# ``user`` — зарезервированное слово PostgreSQL (та же причина, по которой
+# в games/task_explanations исторически переименовали user → player).
+_MOVE_NOTES_DDL = """
+CREATE TABLE IF NOT EXISTS {table}(
+    game_id TEXT NOT NULL,
+    player TEXT NOT NULL,
+    ply INTEGER NOT NULL,
+    intent TEXT,
+    updated_at BIGINT,
+    PRIMARY KEY(game_id, player, ply)
+)
+"""
+
 _GAME_COLUMNS = (
     "id, player, rated, speed, created_at, status, winner, white, black, "
     "opening, eco, user_color, opponent, user_rating, user_rating_diff, "
@@ -172,6 +187,7 @@ _BIGINT_COLUMNS = (
     ("task_explanations", "created_at"),
     ("middlegame_sessions", "created_at"),
     ("middlegame_sessions", "updated_at"),
+    ("move_notes", "updated_at"),
 )
 
 
@@ -198,6 +214,7 @@ _SCHEMA = f"""
 {_TASK_EXPLANATIONS_DDL.format(table="task_explanations")};
 {_OPENING_SESSIONS_DDL.format(table="opening_sessions")};
 {_MIDDLEGAME_SESSIONS_DDL.format(table="middlegame_sessions")};
+{_MOVE_NOTES_DDL.format(table="move_notes")};
 CREATE TABLE IF NOT EXISTS sessions(
     token TEXT PRIMARY KEY,
     nick TEXT,
@@ -478,6 +495,10 @@ def _migrate_v3(path: Path | str) -> None:
         conn.execute("PRAGMA foreign_keys=OFF")
         conn.execute(_USERS_DDL.format(table="users"))
         conn.execute(_META_DDL.format(table="meta"))
+        # Новые таблицы (move_notes) создаются и здесь: миграция должна
+        # приводить старую базу к актуальной схеме сама, не полагаясь на то,
+        # что init_db потом выполнит весь _SCHEMA.
+        conn.execute(_MOVE_NOTES_DDL.format(table="move_notes"))
 
         # analyses раньше игр: пока в нём есть FK на games, пересборка games
         # оставила бы висячую ссылку.
@@ -631,6 +652,7 @@ class Database:
         with self._connection() as conn:
             conn.executescript(schema)
             _ensure_bigint(conn)
+            conn.execute(_MOVE_NOTES_DDL.format(table="move_notes"))
             existing = {
                 row["column_name"]
                 for row in conn.execute(
@@ -828,6 +850,58 @@ class Database:
             if isinstance(analysis, dict):
                 result.append((game, analysis))
         return result
+
+    # --- заметки к ходам (идея хода) ---
+
+    def save_move_note(self, game_id: str, user: str, ply: int, intent: str) -> None:
+        """Сохраняет (UPSERT) заметку игрока к полуходу партии.
+
+        Пустой ``intent`` (или только пробелы) удаляет заметку — так фронтенду
+        не нужен отдельный DELETE-эндпоинт. Ключ — (партия, игрок, полуход):
+        заметки одного игрока не видны другому, даже если партия общая.
+        """
+        try:
+            ply_number = int(ply)
+        except (TypeError, ValueError):
+            raise ValueError("ply должен быть целым числом") from None
+        if ply_number < 0:
+            raise ValueError("ply должен быть >= 0")
+        clean = (intent or "").strip()
+        with self._connection() as conn:
+            if not clean:
+                conn.execute(
+                    "DELETE FROM move_notes "
+                    "WHERE game_id = ? AND LOWER(player) = LOWER(?) AND ply = ?",
+                    (game_id, user, ply_number),
+                )
+                return
+            conn.execute(
+                "INSERT INTO move_notes(game_id, player, ply, intent, updated_at) "
+                "VALUES (?,?,?,?,?) "
+                "ON CONFLICT(game_id, player, ply) DO UPDATE SET "
+                "intent = excluded.intent, "
+                "updated_at = excluded.updated_at",
+                (game_id, user, ply_number, clean, int(time.time() * 1000)),
+            )
+
+    def get_move_notes(self, game_id: str, user: str) -> dict[int, str]:
+        """Заметки игрока к ходам партии: {ply: intent}, по возрастанию ply."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT ply, intent FROM move_notes "
+                "WHERE game_id = ? AND LOWER(player) = LOWER(?) ORDER BY ply ASC",
+                (game_id, user),
+            ).fetchall()
+        notes: dict[int, str] = {}
+        for row in rows:
+            try:
+                ply_number = int(row["ply"])
+            except (TypeError, ValueError):
+                continue
+            text = str(row["intent"] or "")
+            if text:
+                notes[ply_number] = text
+        return notes
 
     def close(self) -> None:
         """Закрывает ресурсы (соединения не держатся, метод для совместимости)."""
@@ -1345,12 +1419,13 @@ class Database:
             )
 
     def delete_user(self, nick: str) -> bool:
-        """Удаляет профиль, его партии и анализ этих партий. True — профиль был.
+        """Удаляет профиль, его партии, анализ этих партий и заметки к ходам.
 
-        Порядок: сначала analyses (ссылок на games не нарушаем), затем games,
-        затем users. ``analyses`` привязан только к ``game_id`` (без user) и общий
-        для всех: удаляются лишь записи, чьи партии принадлежат исключительно
-        этому игроку — общий кеш партий между двумя профилями остаётся.
+        True — профиль был. Порядок: сначала analyses (ссылок на games не
+        нарушаем), затем games и move_notes, затем users. ``analyses`` привязан
+        только к ``game_id`` (без user) и общий для всех: удаляются лишь записи,
+        чьи партии принадлежат исключительно этому игроку — общий кеш партий
+        между двумя профилями остаётся.
 
         Файлы на диске (data/<ник>/) не трогаются — только строки БД.
         Если удалялся закреплённый игрок — он сбрасывается.
@@ -1374,6 +1449,7 @@ class Database:
             conn.execute("DELETE FROM opening_sessions WHERE LOWER(player) = LOWER(?)", (key,))
             conn.execute("DELETE FROM middlegame_sessions WHERE LOWER(player) = LOWER(?)", (key,))
             conn.execute("DELETE FROM task_explanations WHERE LOWER(player) = LOWER(?)", (key,))
+            conn.execute("DELETE FROM move_notes WHERE LOWER(player) = LOWER(?)", (key,))
             cur = conn.execute("DELETE FROM users WHERE nick_lower = ?", (key,))
         if is_current:
             self.clear_current_user()
