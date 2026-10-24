@@ -646,6 +646,7 @@ class OpeningStartBody(BaseModel):
     color: str = ""
     opp_elo: int | None = None
     my_elo: int | None = None
+    human: bool = False
 
 
 class OpeningMoveBody(BaseModel):
@@ -665,6 +666,7 @@ class OpeningReplyBody(BaseModel):
     """Тело POST /api/opening/reply."""
 
     session_id: str = ""
+    human: bool = False
 
 
 class MiddlegamePlanBody(BaseModel):
@@ -3379,6 +3381,8 @@ def create_api(
         last_reply: dict[str, Any] | None = None
         if game.color == "black":
             # Соперник — белые: его первый ход считаем сразу и сохраняем.
+            if body.human:
+                time.sleep(random.uniform(1.0, 3.0))
             policy, engine_name = _opening_policy(opp_elo, my_elo)
             try:
                 san, reason = opponent_move(game, policy, rng=random.Random())
@@ -3448,6 +3452,8 @@ def create_api(
         if not _opening_need_reply(game):
             return _opening_state(session)
 
+        if body.human:
+            time.sleep(random.uniform(1.0, 3.0))
         policy, engine_name = _opening_policy(game.opp_elo, game.my_elo)
         try:
             san, reason = opponent_move(game, policy, rng=random.Random())
@@ -3677,7 +3683,7 @@ def create_api(
         }
 
     @app.post("/api/middlegame/session/{session_id}/reply")
-    def api_middlegame_reply(session_id: str, request: Request):
+    def api_middlegame_reply(session_id: str, request: Request, human: bool = False):
         user = _require_user(request)
         nick = user["nick"]
         with Database(app.state.db_path) as db:
@@ -3688,10 +3694,17 @@ def create_api(
         if not mg.need_reply(session):
             return {"session": _middlegame_payload(session)}
 
+        # Имитация «человеческого» обдумывания: в режиме fast ход мгновенный,
+        # в режиме human — пауза 1..4 с, чтобы соперник не играл «пулемётом».
+        if human:
+            time.sleep(random.uniform(1.0, 4.0))
+
         with Database(app.state.db_path) as db:
             db.init_db()
             base = _middlegame_base_elo(db, nick)
         opp_elo = int(session.opp_elo if session.opp_elo is not None else settings.maia_default_elo)
+        if human:
+            time.sleep(random.uniform(1.0, 3.0))
         policy, engine_name = _opening_policy(opp_elo, base)
         try:
             board = mg.board_of(session)
