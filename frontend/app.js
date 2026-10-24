@@ -1,6 +1,6 @@
 // Chess Trainer Frontend — SPA на vanilla JS, потребляет /api/* эндпоинты.
 
-import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.6.2';
+import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.6.3';
 
 const state = {
   user: null,
@@ -11,6 +11,7 @@ const state = {
   gameData: null,
   gamePly: 0,
   gameExtras: null,
+  gameReview: null,
   keyHandler: null,
   tool: 'repertoire',
   task: null,
@@ -955,6 +956,7 @@ async function viewGames(app) {
 async function viewGameList(app) {
   state.gameId = null;
   state.gameData = null;
+  state.gameReview = null;
   clearGameKeyboard();
   app.innerHTML = '<div class="card"><p>Загрузка...</p></div>';
   const data = await api('/api/games?limit=100');
@@ -1016,6 +1018,7 @@ async function viewGameDetail(app) {
   state.gameData = data;
   state.gamePly = 0;
   state.gameExtras = null;
+  state.gameReview = null;
   drawGameDetail(app);
   bindGameKeyboard();
 }
@@ -1029,8 +1032,13 @@ function drawGameDetail(app) {
   state.gamePly = ply;
   const moves = game.moves || [];
   if (analysis) ensureGameExtras(game.id);
+  const reviewState = ensureGameReview(game.id);
+  const review = reviewState.status === 'ready' ? reviewState.data : null;
+  const reviewMoves = review && Array.isArray(review.moves) ? review.moves : [];
 
   const lastMove = ply > 0 ? lastMoveSquares(fens[ply - 1], fens[ply]) : [];
+  const animFrom = lastMove[0] || '';
+  const animTo = lastMove[1] || '';
 
   const res = game.result_for_user || 'draw';
   const resBadge = res === 'win' ? 'badge-good' : res === 'loss' ? 'badge-bad' : 'badge-neutral';
@@ -1059,7 +1067,14 @@ function drawGameDetail(app) {
     return '';
   };
 
-  const moveCellHtml = m => m ? `<button class="move-cell${clsForPly(m.ply)}${ply === m.ply ? ' active' : ''}" data-ply="${m.ply}">${esc(m.san)}</button>` : '';
+  const moveCellHtml = m => {
+    if (!m) return '';
+    const entry = reviewMoves[m.ply];
+    const badge = entry ? reviewBadge(entry.badge) : '';
+    const isCurrent = ply === m.ply + 1;
+    const badgeHtml = badge ? reviewBadgeIcon(badge, isCurrent ? 'pop' : '') : '';
+    return `<button class="move-cell${clsForPly(m.ply)}${isCurrent ? ' active' : ''}" data-ply="${m.ply}">${esc(m.san)}${badgeHtml}</button>`;
+  };
 
   const moveRowsHtml = moves.length
     ? Object.values(moveRows).map(r => `
@@ -1085,11 +1100,12 @@ function drawGameDetail(app) {
     <div style="margin-bottom:16px"><a href="#" class="btn btn-secondary" data-view="games">← К списку партий</a></div>
     <div class="grid game-layout">
       <div class="card">
-        ${boardHtml(fens[ply], { lastMove, flip: game.user_color === 'black' })}
+        ${boardHtml(fens[ply], { lastMove, animFrom, animTo, flip: game.user_color === 'black' })}
         <div class="board-meta">
           <span class="badge badge-neutral">Ходят: ${turnLabel}</span>
           <span class="badge badge-blue">${esc(posLabel)}</span>
         </div>
+        ${reviewGraphHtml(review, reviewState.status, ply)}
         <div class="board-controls">
           <button class="btn btn-secondary" id="mv-first" ${ply === 0 ? 'disabled' : ''}>⏮</button>
           <button class="btn btn-secondary" id="mv-prev" ${ply === 0 ? 'disabled' : ''}>◀</button>
@@ -1103,8 +1119,10 @@ function drawGameDetail(app) {
         </div>
       </div>
       <div class="game-side">
+        ${reviewReportCardHtml(review, reviewState.status)}
         <div class="card">
           <div class="card-header"><span class="card-title">Ходы</span></div>
+          ${reviewCoachHtml(review, ply)}
           <div class="moves-list">${moveRowsHtml}</div>
           <div class="game-links">
             ${game.link ? '<a class="btn btn-secondary" href="' + safeHttp(game.link) + '" target="_blank" rel="noopener">Открыть партию</a>' : ''}
@@ -1122,6 +1140,19 @@ function drawGameDetail(app) {
 
   bindLinks(app);
   bindBoard(app.querySelector('.board'));
+  app.querySelectorAll('.eval-marker').forEach(marker => {
+    const jump = () => {
+      state.gamePly = +marker.dataset.ply;
+      drawGameDetail(app);
+    };
+    marker.addEventListener('click', jump);
+    marker.addEventListener('keydown', e => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        jump();
+      }
+    });
+  });
   renderGameErrors(app);
   const repeatsBox = document.getElementById('game-repeats');
   if (repeatsBox && analysis) {
@@ -1158,7 +1189,8 @@ function drawGameDetail(app) {
   }
   app.querySelectorAll('.move-cell').forEach(cell => {
     cell.addEventListener('click', () => {
-      state.gamePly = +cell.dataset.ply;
+      // data-ply — индекс хода, а gamePly — индекс позиции: показываем позицию ПОСЛЕ хода.
+      state.gamePly = +cell.dataset.ply + 1;
       drawGameDetail(app);
     });
   });
@@ -1170,6 +1202,277 @@ function drawGameDetail(app) {
   document.getElementById('mv-prev').addEventListener('click', () => { state.gamePly = Math.max(0, state.gamePly - 1); drawGameDetail(app); });
   document.getElementById('mv-next').addEventListener('click', () => { state.gamePly = Math.min(fens.length - 1, state.gamePly + 1); drawGameDetail(app); });
   document.getElementById('mv-last').addEventListener('click', () => { state.gamePly = fens.length - 1; drawGameDetail(app); });
+}
+
+// --- Разбор партии (/review): бейджи, график оценки, отчёт ---
+
+// Порядок бейджей в отчёте — как в задании. book идёт последним.
+const REVIEW_BADGES = [
+  'brilliant', 'great', 'best', 'excellent', 'good',
+  'inaccuracy', 'mistake', 'blunder', 'missed_win', 'book',
+];
+
+const REVIEW_BADGE_LABELS = {
+  book: 'Теория',
+  brilliant: 'Блестящий ход',
+  great: 'Отличный ход',
+  best: 'Лучший ход',
+  excellent: 'Очень хороший',
+  good: 'Хороший ход',
+  inaccuracy: 'Неточность',
+  mistake: 'Ошибка',
+  blunder: 'Зевок',
+  missed_win: 'Упущенный выигрыш',
+};
+
+const REVIEW_BADGE_SHORT = {
+  brilliant: 'Блестящие',
+  great: 'Отличные',
+  best: 'Лучшие',
+  excellent: 'Оч. хорошие',
+  good: 'Хорошие',
+  inaccuracy: 'Неточности',
+  mistake: 'Ошибки',
+  blunder: 'Зевки',
+  missed_win: 'Упущ. выигрыши',
+  book: 'Теория',
+};
+
+// Цвета маркеров графика согласованы с .mb-* из style.css.
+const REVIEW_BADGE_COLORS = {
+  book: '#8a6f4d',
+  brilliant: '#14a37f',
+  great: '#2b7fd4',
+  best: '#2e9e4a',
+  excellent: '#3f9e57',
+  good: '#639f40',
+  inaccuracy: '#e09b1a',
+  mistake: '#d64f00',
+  blunder: '#c5221f',
+  missed_win: '#b3261e',
+};
+
+const REVIEW_CATEGORIES = [
+  ['opening', 'Дебют'],
+  ['middlegame', 'Миттельшпиль'],
+  ['endgame', 'Эндшпиль'],
+  ['tactics', 'Тактика'],
+  ['strategy', 'Стратегия'],
+  ['positional', 'Позиционка'],
+];
+
+const REVIEW_BADGE_SET = new Set(REVIEW_BADGES);
+
+function reviewBadge(badge) {
+  return typeof badge === 'string' && REVIEW_BADGE_SET.has(badge) ? badge : '';
+}
+
+function reviewBadgeIcon(badge, extraClass) {
+  const b = reviewBadge(badge);
+  if (!b) return '';
+  // Файл иконки — missed_win.svg, а CSS-класс — mb-missed-win.
+  const cls = 'move-badge mb-' + b.replace(/_/g, '-') + (extraClass ? ' ' + extraClass : '');
+  return `<span class="${cls}"><img src="assets/badges/${b}.svg" alt=""></span>`;
+}
+
+function reviewLimit(value) {
+  const num = value != null && value !== '' ? Number(value) : NaN;
+  return Number.isFinite(num) ? Math.max(0, Math.min(100, num)) : null;
+}
+
+// /review грузится один раз на партию; результат живёт в state.gameReview.
+function ensureGameReview(gameId) {
+  if (state.gameReview && state.gameReview.gameId === gameId) return state.gameReview;
+  const review = { gameId, status: 'loading', data: null };
+  state.gameReview = review;
+  api('/api/games/' + encodeURIComponent(gameId) + '/review').then(res => {
+    if (state.gameReview !== review) return;
+    review.data = res && res.review ? res.review : null;
+    review.status = review.data ? 'ready' : 'none';
+    refreshGameReviewView(gameId);
+  }).catch(() => {
+    if (state.gameReview !== review) return;
+    // Ошибка разбора не должна ломать экран партии: просто не рисуем блоки.
+    review.status = 'error';
+    refreshGameReviewView(gameId);
+  });
+  return review;
+}
+
+function refreshGameReviewView(gameId) {
+  if (state.currentView !== 'games' || state.gameId !== gameId) return;
+  if (!state.gameData || state.gameData.game.id !== gameId) return;
+  const app = document.getElementById('app');
+  if (app) drawGameDetail(app);
+}
+
+function reviewGraphHtml(review, status, ply) {
+  if (status === 'loading') {
+    return `<div class="review-graph review-graph-loading" aria-busy="true" style="margin-top:12px">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+        <span class="card-title">График оценки</span>
+        <span class="badge badge-neutral">…</span>
+      </div>
+      <div style="height:78px;margin-top:6px;border-radius:8px;background:var(--c-bg-hover);opacity:.55"></div>
+    </div>`;
+  }
+  if (!review) return '';
+  const moves = Array.isArray(review.moves) ? review.moves : [];
+  if (!moves.length) return '';
+
+  const W = 420;
+  const H = 116;
+  const padX = 14;
+  const padTop = 8;
+  const padBottom = 16;
+  const innerW = W - padX * 2;
+  const innerH = H - padTop - padBottom;
+
+  // win_before может отсутствовать — ведём линию от предыдущего значения.
+  let prev = 50;
+  const points = moves.map((m, i) => {
+    const raw = reviewLimit(m && m.win_before);
+    // win_before в анализе — для стороны, чей ход; график — от белых.
+    const value = raw == null ? null : (m && m.color === 'w' ? raw : 100 - raw);
+    const v = value != null ? value : prev;
+    prev = v;
+    const x = moves.length === 1 ? W / 2 : padX + i * innerW / (moves.length - 1);
+    const y = padTop + (1 - v / 100) * innerH;
+    return { x, y, v, i, san: (m && m.san) || '', badge: reviewBadge(m && m.badge) };
+  });
+
+  const line = points.map((p, i) => `${i ? 'L' : 'M'}${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(' ');
+  const bottom = (H - padBottom).toFixed(1);
+  const last = points[points.length - 1];
+  const area = `M${points[0].x.toFixed(1)} ${bottom} ` +
+    points.map(p => `L${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(' ') +
+    ` L${last.x.toFixed(1)} ${bottom} Z`;
+
+  const grid = [0, 25, 50, 75, 100].map(v => {
+    const y = padTop + (1 - v / 100) * innerH;
+    const dash = v === 50 ? '' : ' stroke-dasharray="3 4"';
+    return `<line x1="${padX}" y1="${y.toFixed(1)}" x2="${W - padX}" y2="${y.toFixed(1)}" stroke="var(--c-border)" stroke-width="0.7"${dash}></line>`;
+  }).join('');
+  const yLabels = [0, 50, 100].map(v => {
+    const y = padTop + (1 - v / 100) * innerH;
+    return `<text x="1" y="${(y + 2.5).toFixed(1)}" font-size="7" fill="var(--c-text-muted)">${v}</text>`;
+  }).join('');
+
+  const markers = points.map(p => {
+    const active = ply === p.i + 1;
+    const color = REVIEW_BADGE_COLORS[p.badge] || '#6d6d6d';
+    const title = `${p.i + 1}. ${p.san || '—'} · win ${Math.round(p.v)}%${p.badge ? ' · ' + REVIEW_BADGE_LABELS[p.badge] : ''}`;
+    const cls = 'eval-marker' + (active ? ' marker-pulse' : '');
+    return `<g class="${cls}" data-ply="${p.i + 1}" role="button" tabindex="0" aria-label="${esc(title)}">` +
+      `<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="${active ? 4.6 : 3.2}" fill="${color}" stroke="var(--c-bg-box)" stroke-width="1.2"></circle>` +
+      `<title>${esc(title)}</title></g>`;
+  }).join('');
+
+  const current = ply > 0 && points[ply - 1] ? points[ply - 1] : null;
+  const currentLabel = current ? `win ${Math.round(current.v)}%` : 'старт';
+
+  return `<div class="review-graph" style="margin-top:12px">
+    <div class="review-graph-head" style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+      <span class="card-title">График оценки</span>
+      <span class="badge badge-neutral">${esc(currentLabel)}</span>
+    </div>
+    <svg viewBox="0 0 ${W} ${H}" role="img" aria-label="График оценки по полуходам" style="display:block;width:100%;height:auto;margin-top:6px">
+      ${grid}
+      <path d="${area}" fill="var(--c-link)" opacity="0.12"></path>
+      <path d="${line}" fill="none" stroke="var(--c-link)" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"></path>
+      ${markers}
+      ${yLabels}
+    </svg>
+    <div style="font-size:11px;color:var(--c-text-muted);margin-top:2px">Клик по точке — позиция после хода; цвет точки — бейдж хода.</div>
+  </div>`;
+}
+
+function reviewCoachHtml(review, ply) {
+  if (!review) return '';
+  const moves = Array.isArray(review.moves) ? review.moves : [];
+  let badge = '';
+  let label = 'Начальная позиция';
+  let comment = 'Выбери ход в списке, стрелками или точкой на графике — здесь появится комментарий тренера.';
+  let score = 'старт';
+
+  if (ply > 0) {
+    const entry = moves[ply - 1];
+    if (!entry) return '';
+    badge = reviewBadge(entry.badge);
+    label = entry.label || REVIEW_BADGE_LABELS[badge] || 'Ход';
+    comment = entry.comment || '';
+    const win = reviewLimit(entry.win_before);
+    const whiteWin = win == null ? null : (entry.color === 'w' ? win : 100 - win);
+    score = whiteWin != null ? `win белых ${Math.round(whiteWin)}%` : '';
+  }
+
+  return `<div class="coach-bubble enter" style="margin:10px 0 12px;padding:10px 12px;border:1px solid var(--c-border);border-radius:10px;background:var(--c-bg-box-alt,var(--c-bg-hover))">
+    <div class="coach-bubble-head" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+      ${badge ? reviewBadgeIcon(badge) : ''}
+      <strong class="coach-bubble-label">${esc(label)}</strong>
+      <span class="coach-bubble-score" style="margin-left:auto;font-size:12px;color:var(--c-text-muted)">${esc(score)}</span>
+    </div>
+    <div class="coach-bubble-text" style="margin-top:6px;font-size:13px;line-height:1.45">${esc(comment)}</div>
+  </div>`;
+}
+
+function reviewReportCardHtml(review, status) {
+  if (status === 'loading') {
+    return `<div class="card review-report review-report-loading" aria-busy="true">
+      <div class="card-header"><span class="card-title">Отчёт</span><span class="badge badge-neutral">…</span></div>
+      <p style="color:var(--c-text-muted);margin:0">Загрузка разбора…</p>
+    </div>`;
+  }
+  if (!review) return '';
+
+  const accuracy = review.accuracy || {};
+  const moves = Array.isArray(review.moves) ? review.moves : [];
+  const counts = {};
+  moves.forEach(m => {
+    const b = reviewBadge(m && m.badge);
+    if (b) counts[b] = (counts[b] || 0) + 1;
+  });
+
+  const badgeCells = REVIEW_BADGES.map(b => {
+    const count = counts[b] || 0;
+    const title = REVIEW_BADGE_LABELS[b] + ': ' + count;
+    return `<div class="review-badge-stat${count ? '' : ' is-empty'}" title="${esc(title)}" style="display:flex;align-items:center;gap:4px;font-size:12px;${count ? '' : 'opacity:.55'}">
+      ${reviewBadgeIcon(b)}<span>${count}</span><span style="color:var(--c-text-muted)">${esc(REVIEW_BADGE_SHORT[b])}</span>
+    </div>`;
+  }).join('');
+
+  const categories = review.categories || {};
+  const catRows = REVIEW_CATEGORIES.map(([key, label]) => {
+    const value = reviewLimit(categories[key]) || 0;
+    return `<div class="review-cat" style="margin-top:8px">
+      <div style="display:flex;justify-content:space-between;gap:8px;font-size:12px"><span>${label}</span><span>${Math.round(value)}</span></div>
+      <div class="review-cat-bar" style="height:6px;margin-top:3px;border-radius:3px;overflow:hidden;background:var(--c-border)">
+        <div style="width:${value.toFixed(1)}%;height:100%;border-radius:3px;background:var(--c-btn-primary)"></div>
+      </div>
+    </div>`;
+  }).join('');
+
+  const rating = review.rating_estimate != null && Number.isFinite(Number(review.rating_estimate))
+    ? String(Math.round(Number(review.rating_estimate)))
+    : '—';
+  const summary = review.summary
+    ? `<p class="review-summary" style="font-size:13px;line-height:1.5;margin:10px 0 0">${esc(review.summary)}</p>`
+    : '';
+
+  return `<div class="card review-report">
+    <div class="card-header"><span class="card-title">Отчёт</span><span class="badge badge-blue">разбор</span></div>
+    <div style="display:flex;gap:8px;margin-top:4px">
+      <div class="stat" style="flex:1 1 0"><div class="stat-value">${accuracy.user != null ? fmt(accuracy.user, 1) + '%' : '—'}</div><div class="stat-label">Точность игрока</div></div>
+      <div class="stat" style="flex:1 1 0"><div class="stat-value">${accuracy.opponent != null ? fmt(accuracy.opponent, 1) + '%' : '—'}</div><div class="stat-label">Точность соперника</div></div>
+    </div>
+    <div style="display:flex;align-items:baseline;gap:8px;margin-top:8px">
+      <span style="font-size:24px;font-weight:700;line-height:1.1">${esc(rating)}</span>
+      <span style="font-size:12px;color:var(--c-text-muted)">оценка по точности</span>
+    </div>
+    <div class="review-badge-grid" style="display:flex;flex-wrap:wrap;gap:6px 12px;margin-top:10px">${badgeCells}</div>
+    <div class="review-categories" style="margin-top:12px">${catRows}</div>
+    ${summary}
+  </div>`;
 }
 
 function gameMetricsHtml(analysis) {
@@ -1347,7 +1650,7 @@ function bindGameErrors(box) {
   });
   box.querySelectorAll('.err-jump').forEach(btn => {
     btn.addEventListener('click', () => {
-      state.gamePly = +btn.dataset.ply;
+      state.gamePly = +btn.dataset.ply + 1;
       drawGameDetail(document.getElementById('app'));
     });
   });
