@@ -73,7 +73,7 @@ def _pgn_to_sans(pgn: str) -> list[str]:
 @lru_cache(maxsize=1)
 def _load_trie() -> dict[str, Any]:
     """Загружает все TSV и строит префиксное дерево (SAN -> глубже)."""
-    root: dict[str, Any] = {"name": None, "eco": None, "c": {}}
+    root: dict[str, Any] = {"name": None, "eco": None, "c": {}, "n": 0}
     for filename in _TSV_FILES:
         path = OPENINGS_DIR / filename
         if not path.is_file():
@@ -89,8 +89,9 @@ def _load_trie() -> dict[str, Any]:
             node = root
             for san in _pgn_to_sans(pgn):
                 if san not in node["c"]:
-                    node["c"][san] = {"name": None, "eco": None, "c": {}}
+                    node["c"][san] = {"name": None, "eco": None, "c": {}, "n": 0}
                 node = node["c"][san]
+                node["n"] = int(node.get("n", 0)) + 1
             if name and not node["name"]:
                 node["name"] = name
                 node["eco"] = eco
@@ -112,6 +113,51 @@ def classify_opening(moves_san: list[str]) -> tuple[str | None, str | None]:
         if node.get("name"):
             best = (node["name"], node["eco"])
     return best
+
+
+# Сколько первых полуходов соперник играет по теории (книга ECO), а не Maia.
+THEORY_PLIES = 12
+
+
+def theory_moves(moves_san: list[str]) -> list[tuple[str, int]]:
+    """Возвращает ходы-продолжения из ECO-книги для текущей позиции.
+
+    Каждый элемент — ``(san, weight)``, где ``weight`` — сколько линий датасета
+    проходят через этот ход (грубая мера популярности). Пустой список — позиция
+    вне книги.
+    """
+    node = _load_trie()
+    for san in moves_san:
+        node = node.get("c", {}).get(_normalize_san(san))
+        if node is None:
+            return []
+    return [
+        (san, int(child.get("n", 0)))
+        for san, child in (node.get("c") or {}).items()
+        if int(child.get("n", 0)) > 0
+    ]
+
+
+def _pick_theory_move(board: chess.Board, moves_san: list[str], rng: random.Random) -> str | None:
+    """Выбирает легальный ход из книги, взвешенно по популярности."""
+    options: list[tuple[str, int]] = []
+    for san, weight in theory_moves(moves_san):
+        try:
+            board.parse_san(san)
+        except ValueError:
+            continue
+        options.append((san, weight))
+    if not options:
+        return None
+    total = sum(w for _, w in options)
+    if total <= 0:
+        return options[0][0]
+    roll = rng.random() * total
+    for san, weight in options:
+        roll -= weight
+        if roll <= 0:
+            return san
+    return options[-1][0]
 
 
 # --------------------------------------------------------------------------- #
@@ -796,18 +842,25 @@ def opponent_move(
     min_ratio: float = MIN_RATIO,
     max_style_delta: float = MAX_STYLE_DELTA,
     max_candidates: int | None = None,
+    use_theory: bool = True,
 ) -> tuple[str, str]:
-    """Ход соперника: ``policy.probs`` -> фильтр правдоподобия/стиль -> выбор.
+    """Ход соперника: теория (первые полуходы) или ``policy.probs`` -> выбор.
 
-    Возвращает ``(san, reason_ru)`` и дописывает ход в ``game.moves``.
-    Политика — любой объект с методом ``probs(board, *, k=...)``. Бросает
-    ``ValueError``, если сейчас не очередь соперника.
+    Первые :data:`THEORY_PLIES` полуходов берутся из ECO-книги (как учат
+    дебюты), затем подключается Maia. Возвращает ``(san, reason_ru)`` и
+    дописывает ход в ``game.moves``.
     """
     if is_finished(game):
         raise ValueError("Партия уже завершена")
     board = board_from_moves(game.moves)
     if board.turn != opponent_color(game):
         raise ValueError("Сейчас не ход соперника")
+    rng = rng if rng is not None else random.Random()
+    if use_theory and len(game.moves) < THEORY_PLIES:
+        theory_san = _pick_theory_move(board, game.moves, rng)
+        if theory_san:
+            game.moves.append(theory_san)
+            return theory_san, "теория"
     try:
         candidates = policy.probs(board, k=k)
     except Exception as exc:

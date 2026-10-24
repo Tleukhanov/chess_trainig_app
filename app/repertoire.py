@@ -229,9 +229,15 @@ def opening_stats(
                 "draws": 0,
                 "bad_moves": 0,
                 "sum_drop": 0.0,
+                "white_games": 0,
+                "black_games": 0,
             },
         )
         group["games"] += 1
+        if game.user_color == "white":
+            group["white_games"] += 1
+        elif game.user_color == "black":
+            group["black_games"] += 1
         group["wins"] += int(game.result_for_user == "win")
         group["draws"] += int(game.result_for_user == "draw")
 
@@ -265,6 +271,7 @@ def opening_stats(
                 "bad_moves": bad,
                 "errors_per_game": round(bad / games, 2) if games else 0.0,
                 "avg_drop": round(group["sum_drop"] / bad, 2) if bad else 0.0,
+                "color": "white" if group["white_games"] >= group["black_games"] else "black",
             }
         )
     rows.sort(key=lambda row: (-row["errors_per_game"], -row["games"]))

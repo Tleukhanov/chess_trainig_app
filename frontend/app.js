@@ -376,7 +376,7 @@ async function viewDashboard(app) {
   if (plan.repertoire.weak_openings.length > 0) {
     weakOpeningsHtml = `
       <table class="table-wrap">
-        <thead><tr><th>Дебют</th><th>ECO</th><th>Партий</th><th>Очков %</th><th>Ошибок/партию</th><th>Ср. потеря</th></tr></thead>
+        <thead><tr><th>Дебют</th><th>ECO</th><th>Партий</th><th>Очков %</th><th>Ошибок/партию</th><th>Ср. потеря</th><th></th></tr></thead>
         <tbody>
           ${plan.repertoire.weak_openings.slice(0, 6).map(o => `
             <tr>
@@ -385,6 +385,7 @@ async function viewDashboard(app) {
               <td class="num">${fmt(o.points_pct)}%</td>
               <td class="num">${fmt(o.errors_per_game, 2)}</td>
               <td class="num">${fmt(o.avg_drop)}%</td>
+              <td class="center"><button type="button" class="btn btn-secondary" data-train-opening="${esc(o.eco || '')}" data-train-color="${esc(o.color || 'white')}" data-train-name="${esc(o.opening || '')}" style="font-size:12px;padding:4px 10px">Тренировать</button></td>
             </tr>`).join('')}
         </tbody>
       </table>`;
@@ -490,6 +491,31 @@ async function viewDashboard(app) {
       <a href="#" class="btn btn-primary" data-view="coach">Запустить анализ →</a>
     </div>`;
   bindLinks(app);
+
+  // Кнопка «Тренировать» у слабого дебюта: стартует тренажёр дебютов
+  // с нужным цветом, а не перекидывает автоматически.
+  app.querySelectorAll('[data-train-opening]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      try {
+        const res = await api('/api/opening/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            style: 'universal',
+            color: btn.dataset.trainColor || 'white',
+            human: true,
+          }),
+        });
+        startOpeningSession(res);
+        navigate('opening');
+      } catch (err) {
+        if (isSessionError(err)) { handleSessionExpired(); return; }
+        showToast(err.message, 'error');
+        btn.disabled = false;
+      }
+    });
+  });
 }
 
 async function viewOverview(app) {
@@ -1077,12 +1103,47 @@ function drawGameDetail(app) {
         <div class="card">
           <div class="card-header"><span class="card-title">Анализ</span></div>
           ${analysis ? gameMetricsHtml(analysis) : '<p style="color:var(--c-text-muted)">Не проанализирована.</p>'}
+          <div id="game-repeats"></div>
+          ${analysis ? `<div style="margin-top:10px"><button class="btn btn-primary" id="train-from-game" data-color="${esc(game.user_color || 'white')}">Тренировать этот дебют</button></div>` : ''}
         </div>
       </div>
     </div>`;
 
   bindLinks(app);
   bindBoard(app.querySelector('.board'));
+  const repeatsBox = document.getElementById('game-repeats');
+  if (repeatsBox && analysis) {
+    api('/api/games/' + encodeURIComponent(game.id) + '/repeats').then(data => {
+      const repeats = (data && data.repeats) || [];
+      if (!repeats.length) return;
+      repeatsBox.innerHTML = `
+        <div class="alert alert-error" style="margin-top:10px">
+          <strong>Повтор ошибки:</strong> ${repeats.length} ход(ов) уже были в прошлых партиях.
+          <ul style="margin:6px 0 0 18px">
+            ${repeats.map(r => `<li>${esc(r.san)} (полуход ${r.ply + 1}) — как в партии от ${new Date(r.created_at).toLocaleDateString('ru-RU')}${r.opening ? ' · ' + esc(r.opening) : ''}</li>`).join('')}
+          </ul>
+        </div>`;
+    }).catch(() => {});
+  }
+  const trainFromGame = document.getElementById('train-from-game');
+  if (trainFromGame) {
+    trainFromGame.addEventListener('click', async () => {
+      trainFromGame.disabled = true;
+      try {
+        const res = await api('/api/opening/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ style: 'universal', color: trainFromGame.dataset.color || 'white', human: true }),
+        });
+        startOpeningSession(res);
+        navigate('opening');
+      } catch (err) {
+        if (isSessionError(err)) { handleSessionExpired(); return; }
+        showToast(err.message, 'error');
+        trainFromGame.disabled = false;
+      }
+    });
+  }
   app.querySelectorAll('.move-cell').forEach(cell => {
     cell.addEventListener('click', () => {
       state.gamePly = +cell.dataset.ply;

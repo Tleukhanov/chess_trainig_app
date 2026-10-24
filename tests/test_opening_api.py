@@ -145,6 +145,10 @@ class OpeningApiTestBase(unittest.TestCase):
         )
         policy.start()
         self.addCleanup(policy.stop)
+        # Тесты проверяют policy-путь; книгу отключаем, иначе ход берётся из ECO.
+        theory = patch("app.openings.theory_moves", return_value=[])
+        theory.start()
+        self.addCleanup(theory.stop)
 
     def _register(self, client: TestClient, nick: str) -> None:
         resp = client.post(

@@ -18,6 +18,8 @@ from app.openings import (
     MIN_RATIO,
     STYLES,
     STYLE_LABELS_RU,
+    THEORY_PLIES,
+    theory_moves,
     OpeningGame,
     board_from_moves,
     game_over,
@@ -376,6 +378,46 @@ class TerminalPositionTests(unittest.TestCase):
         self.assertFalse(game_over(game))
         self.assertFalse(is_finished(game))
         self.assertIsNone(result(game))
+
+
+class TheoryBookTests(unittest.TestCase):
+    """Первые полуходы соперник берёт из ECO-книги, а не из Maia."""
+
+    def test_start_position_has_popular_theory_moves(self) -> None:
+        moves = dict(theory_moves([]))
+        self.assertIn("e4", moves)
+        self.assertIn("d4", moves)
+        self.assertGreater(moves["e4"], moves["d4"])
+
+    def test_after_e4_black_replies_are_theory(self) -> None:
+        moves = dict(theory_moves(["e4"]))
+        self.assertIn("e5", moves)
+        self.assertIn("c5", moves)
+        self.assertGreater(moves["e5"], moves["c5"])
+
+    def test_unknown_position_returns_empty(self) -> None:
+        self.assertEqual(theory_moves(["a4", "h5", "b4", "g5", "h4"]), [])
+
+    def test_opponent_plays_theory_first(self) -> None:
+        game = new_game(1500, 1500, "universal", "white")
+        game.moves = ["e4"]  # ход чёрных соперника
+        class _NoPolicy:
+            def probs(self, board, k=8):
+                raise AssertionError("policy не должен вызываться на теории")
+        san, reason = opponent_move(game, _NoPolicy(), rng=random.Random(1))
+        self.assertEqual(reason, "теория")
+        self.assertIn(san, dict(theory_moves(["e4"])))
+        self.assertLess(len(game.moves), THEORY_PLIES + 1)
+
+    def test_theory_disabled_falls_back_to_policy(self) -> None:
+        game = new_game(1500, 1500, "universal", "white")
+        game.moves = ["e4"]
+        class _Policy:
+            def probs(self, board, k=8):
+                return [("e5", 1.0)]
+        san, reason = opponent_move(game, _Policy(), rng=random.Random(1), use_theory=False)
+        self.assertEqual(san, "e5")
+        self.assertNotEqual(reason, "теория")
 
 
 if __name__ == "__main__":

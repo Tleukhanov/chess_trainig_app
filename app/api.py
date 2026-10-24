@@ -46,6 +46,7 @@ from .fide import (
 )
 from .games import Game, fetch_lichess_rating, fetch_user_games
 from .humanize import humanize_report
+from .review import repeated_mistakes
 from .llm import ChatMessage, LLMClient, _is_local_host, clean_llm_text, looks_like_refusal, looks_like_thinking
 from .maia import MaiaLitePolicy
 from .mentor import build_mentor_request, format_mentor_reply, run_mentor
@@ -2934,6 +2935,23 @@ def create_api(
             lambda db: _game_detail_payload(db, user["nick"], game_id),
             app.state.db_path,
         )
+
+    @app.get("/api/games/{game_id}/repeats")
+    def api_game_repeats(game_id: str, request: Request):
+        """Повторы ошибок: тот же полуход+SAN уже был в прошлых партиях."""
+        user = _current_user(app.state.db_path, request)
+        if not user:
+            raise HTTPException(404, "No current user")
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            game = db.get_game(game_id, user["nick"])
+            if game is None:
+                raise HTTPException(404, "Партия не найдена")
+            analysis = db.get_analysis(game_id)
+            if not isinstance(analysis, dict):
+                return {"repeats": []}
+            history = db.get_analyzed_games(user["nick"], limit=500)
+        return {"repeats": repeated_mistakes(game, analysis, history)}
 
     # --- Tools: репертуар / соперник / человечность / турнир / FIDE ---
     def _repertoire_payload(db, user: str, color: str, max_depth: int) -> dict:
