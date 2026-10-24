@@ -224,10 +224,38 @@ export function bindBoard(root, opts = {}) {
     if (promoPicker) { promoPicker.remove(); promoPicker = null; }
   }
 
+  // .board has overflow:hidden, so the picker must stay inside its padding box.
+  // Absolute children are positioned against the padding box, hence clientLeft/
+  // clientTop (border widths) are subtracted from viewport-based coordinates.
+  // Sizes are measured after the picker is in the DOM: the height depends on the
+  // number of candidates, and a hardcoded estimate breaks for custom button sizes.
+  function placePromoPicker(box, desiredLeft, desiredTop) {
+    const boardW = root.clientWidth;
+    const boardH = root.clientHeight;
+    const boxW = box.offsetWidth;
+    const boxH = box.offsetHeight;
+    if (!boardW || !boardH || !boxW || !boxH) return;
+
+    // Board smaller than the picker: shrink it instead of letting it be clipped.
+    const scale = Math.min(1, boardW / boxW, boardH / boxH);
+    if (scale < 1) {
+      box.style.transformOrigin = 'top left';
+      box.style.transform = `scale(${scale})`;
+    }
+    const width = boxW * scale;
+    const height = boxH * scale;
+    const maxLeft = Math.max(0, boardW - width);
+    const maxTop = Math.max(0, boardH - height);
+    box.style.left = Math.min(Math.max(desiredLeft, 0), maxLeft) + 'px';
+    box.style.top = Math.min(Math.max(desiredTop, 0), maxTop) + 'px';
+  }
+
   function showPromoPicker(from, to, candidates, onPick) {
     hidePromoPicker();
     const boardRect = root.getBoundingClientRect();
-    const sqRect = squares.get(to).getBoundingClientRect();
+    const targetSq = squares.get(to);
+    if (!targetSq) return;
+    const sqRect = targetSq.getBoundingClientRect();
     const pieceEl = squares.get(from) && squares.get(from).querySelector('.piece');
     const isWhite = !!(pieceEl && pieceEl.classList.contains('pw'));
     const color = isWhite ? 'w' : 'b';
@@ -237,8 +265,7 @@ export function bindBoard(root, opts = {}) {
     box.className = 'board-promo';
     Object.assign(box.style, {
       position: 'absolute',
-      left: (sqRect.left - boardRect.left + sqRect.width / 2 - 22) + 'px',
-      top: (isWhite ? sqRect.bottom - boardRect.top + 4 : sqRect.top - boardRect.top - 4 - candidates.length * 44) + 'px',
+      left: '0px', top: '0px',
       display: 'flex', flexDirection: 'column', gap: '2px',
       zIndex: '20', background: 'var(--c-panel, #fff)',
       border: '1px solid var(--c-border, #ccc)', borderRadius: '6px',
@@ -274,6 +301,20 @@ export function bindBoard(root, opts = {}) {
 
     root.appendChild(box);
     promoPicker = box;
+
+    // Measure now that the picker is laid out, then clamp into the board.
+    const centerX = sqRect.left - boardRect.left - root.clientLeft + sqRect.width / 2;
+    const boxH = box.offsetHeight;
+    const belowTop = sqRect.bottom - boardRect.top - root.clientTop + 4;
+    const aboveTop = sqRect.top - boardRect.top - root.clientTop - 4 - boxH;
+    // Prefer the natural side, but flip it when that side has no room: under
+    // flip a white promotion happens on the bottom row, so "below" is outside.
+    const fitsBelow = belowTop + boxH <= root.clientHeight;
+    const fitsAbove = aboveTop >= 0;
+    let desiredTop = isWhite ? belowTop : aboveTop;
+    if (isWhite && !fitsBelow && fitsAbove) desiredTop = aboveTop;
+    else if (!isWhite && !fitsAbove && fitsBelow) desiredTop = belowTop;
+    placePromoPicker(box, centerX - box.offsetWidth / 2, desiredTop);
   }
   let drag = null;
   let arrowDraft = null;

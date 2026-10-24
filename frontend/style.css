@@ -155,7 +155,7 @@ a:hover { color: var(--c-link-hover); text-decoration: underline; }
   max-width: 1280px;
   margin: 0 auto;
   padding: 0 16px;
-  height: 52px;
+  min-height: 52px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -189,6 +189,26 @@ a:hover { color: var(--c-link-hover); text-decoration: underline; }
 .nav a:hover { background: var(--c-bg-hover); color: var(--c-link); text-decoration: none; }
 .nav a.active { background: var(--c-btn-primary); color: var(--c-btn-primary-text); }
 .nav a.active:hover { background: var(--c-btn-primary-hover); color: var(--c-btn-primary-text); text-decoration: none; }
+
+/* Группы навигации: заголовок + ссылки одного раздела */
+.nav-group {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-wrap: wrap;
+  border-radius: 6px;
+}
+.nav-group-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  color: var(--c-text-muted);
+  padding: 0 6px;
+  white-space: nowrap;
+}
+/* Лёгкая подсветка группы, в которой находится активный раздел */
+.nav-group.active { background: rgba(99, 159, 64, 0.12); }
+.nav-group.active .nav-group-title { color: var(--c-text); }
 
 .topbar-right { display: flex; align-items: center; gap: 12px; }
 .userbox { display: flex; align-items: center; gap: 12px; font-size: 13px; }
@@ -229,7 +249,7 @@ h3 { font-size: 15px; font-weight: 600; margin-top: 16px; }
   padding: 16px;
   margin-bottom: 16px;
 }
-.card-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.card-header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
 .card-title { font-weight: 600; font-size: 14px; }
 
 /* Grid */
@@ -504,7 +524,7 @@ td.center { text-align: center; }
   z-index: 6;
 }
 .board-meta { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; align-items: center; }
-.board-controls { display: flex; align-items: center; gap: 6px; margin-top: 12px; }
+.board-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
 .board-controls input[type="range"] { flex: 1; accent-color: var(--c-btn-primary); min-width: 60px; }
 
 .moves-list { max-height: 300px; overflow-y: auto; }
@@ -556,7 +576,10 @@ td.center { text-align: center; }
 /* Responsive */
 @media (max-width: 720px) {
   .topbar-inner { flex-wrap: wrap; height: auto; padding: 12px 16px; gap: 12px; }
-  .nav { order: 3; width: 100%; justify-content: center; }
+  .nav { order: 3; width: 100%; justify-content: center; flex-wrap: wrap; }
+  .nav-group { flex: 1 1 100%; flex-wrap: wrap; }
+  .nav-group-title { flex: 1 1 100%; padding: 4px 2px 2px; }
+  .nav-group a { flex: 1 1 30%; text-align: center; padding: 8px 4px; }
   .nav a { flex: 1; text-align: center; padding: 8px 4px; }
   .topbar-right { order: 4; width: 100%; justify-content: center; }
   .grid-2, .grid-3, .grid-4, .game-layout { grid-template-columns: 1fr; }
@@ -583,4 +606,11 @@ td.center { text-align: center; }
   .card[style*="max-width:420px"] .games-filter .btn { flex: 1; padding: 10px 8px; font-size: 14px; }
   .card[style*="max-width:420px"] .btn-primary, .card[style*="max-width:420px"] .btn-secondary { width: 100%; padding: 12px; font-size: 15px; }
   .card[style*="max-width:420px"] .btn { min-width: 0; }
+}
+
+/* Узкие экраны: страница не скроллится по горизонтали, таблицы — внутри своей обёртки */
+@media (max-width: 720px) {
+  body { overflow-x: hidden; }
+  .card { min-width: 0; }
+  .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
 }

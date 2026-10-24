@@ -1,6 +1,6 @@
 // Chess Trainer Frontend — SPA на vanilla JS, потребляет /api/* эндпоинты.
 
-import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.6.0';
+import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.6.1';
 
 const state = {
   user: null,
@@ -375,7 +375,7 @@ async function viewDashboard(app) {
   let weakOpeningsHtml = '';
   if (plan.repertoire.weak_openings.length > 0) {
     weakOpeningsHtml = `
-      <table class="table-wrap">
+      <div class="table-wrap"><table>
         <thead><tr><th>Дебют</th><th>ECO</th><th>Партий</th><th>Очков %</th><th>Ошибок/партию</th><th>Ср. потеря</th><th></th></tr></thead>
         <tbody>
           ${plan.repertoire.weak_openings.slice(0, 6).map(o => `
@@ -388,7 +388,7 @@ async function viewDashboard(app) {
               <td class="center"><button type="button" class="btn btn-secondary" data-train-opening="${esc(o.eco || '')}" data-train-color="${esc(o.color || 'white')}" data-train-name="${esc(o.opening || '')}" style="font-size:12px;padding:4px 10px">Тренировать</button></td>
             </tr>`).join('')}
         </tbody>
-      </table>`;
+      </table></div>`;
   } else {
     weakOpeningsHtml = '<p style="color:var(--c-text-muted)">Дебютов нет — запусти анализ.</p>';
   }
@@ -411,10 +411,10 @@ async function viewDashboard(app) {
     }
     trendHtml = `
       <div style="margin-bottom:8px"><span class="badge ${badgeClass}">${t.overall.toUpperCase()}</span></div>
-      <table class="table-wrap" style="font-size:12px">
+      <div class="table-wrap"><table style="font-size:12px">
         <thead><tr><th>Метрика</th><th>Было</th><th>Стало</th><th>Δ</th><th>Вердикт</th></tr></thead>
         <tbody>${rows}</tbody>
-      </table>`;
+      </table></div>`;
   } else {
     trendHtml = '<p style="color:var(--c-text-muted)">Нет данных для тренда.</p>';
   }
@@ -422,13 +422,13 @@ async function viewDashboard(app) {
   let motifsHtml = '';
   if (plan.patterns.motifs.length > 0) {
     motifsHtml = `
-      <table class="table-wrap">
+      <div class="table-wrap"><table>
         <thead><tr><th>Мотив</th><th>Частота</th><th title="Средняя потеря win% на ход игрока">Ср. потеря win%</th></tr></thead>
         <tbody>
           ${plan.patterns.motifs.slice(0, 5).map(m => `
             <tr><td>${esc(m[0])}</td><td class="num">${m[1].count}</td><td class="num">${fmt(m[1].avg_drop)}%</td></tr>`).join('')}
         </tbody>
-      </table>`;
+      </table></div>`;
   } else {
     motifsHtml = '<p style="color:var(--c-text-muted)">Нет данных.</p>';
   }
@@ -550,16 +550,16 @@ async function viewOverview(app) {
     <div class="grid grid-2">
       <div class="card">
         <div class="card-header"><span class="card-title">Репертуар белых</span></div>
-        ${whiteBranches.length ? `<table class="table-wrap"><thead><tr><th>Ветвь</th><th>Партий</th><th>Прочность</th></tr></thead><tbody>${whiteBranches.map(b => `<tr><td><code>${esc(b.moves.join(' '))}</code></td><td class="num">${b.count}</td><td class="num">${fmt(b.path_ok_rate * 100, 0)}%</td></tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted)">Нет данных.</p>'}
+        ${whiteBranches.length ? `<div class="table-wrap"><table><thead><tr><th>Ветвь</th><th>Партий</th><th>Прочность</th></tr></thead><tbody>${whiteBranches.map(b => `<tr><td><code>${esc(b.moves.join(' '))}</code></td><td class="num">${b.count}</td><td class="num">${fmt(b.path_ok_rate * 100, 0)}%</td></tr>`).join('')}</tbody></table></div>` : '<p style="color:var(--c-text-muted)">Нет данных.</p>'}
       </div>
       <div class="card">
         <div class="card-header"><span class="card-title">Репертуар чёрных</span></div>
-        ${blackBranches.length ? `<table class="table-wrap"><thead><tr><th>Ветвь</th><th>Партий</th><th>Прочность</th></tr></thead><tbody>${blackBranches.map(b => `<tr><td><code>${esc(b.moves.join(' '))}</code></td><td class="num">${b.count}</td><td class="num">${fmt(b.path_ok_rate * 100, 0)}%</td></tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted)">Нет данных.</p>'}
+        ${blackBranches.length ? `<div class="table-wrap"><table><thead><tr><th>Ветвь</th><th>Партий</th><th>Прочность</th></tr></thead><tbody>${blackBranches.map(b => `<tr><td><code>${esc(b.moves.join(' '))}</code></td><td class="num">${b.count}</td><td class="num">${fmt(b.path_ok_rate * 100, 0)}%</td></tr>`).join('')}</tbody></table></div>` : '<p style="color:var(--c-text-muted)">Нет данных.</p>'}
       </div>
     </div>
     <div class="card">
       <div class="card-header"><span class="card-title">Слабые места репертуара</span></div>
-      ${ov.openings.length ? `<table class="table-wrap"><thead><tr><th>Дебют</th><th>ECO</th><th>Партий</th><th>Очков %</th><th>Ошибок/партию</th><th>Ср. потеря</th></tr></thead><tbody>${ov.openings.slice(0, 12).map(o => `<tr><td>${esc(o.opening)}</td><td>${esc(o.eco)}</td><td class="num">${o.games}</td><td class="num">${fmt(o.points_pct)}%</td><td class="num">${fmt(o.errors_per_game, 2)}</td><td class="num">${fmt(o.avg_drop)}%</td></tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted)">Нет данных.</p>'}
+      ${ov.openings.length ? `<div class="table-wrap"><table><thead><tr><th>Дебют</th><th>ECO</th><th>Партий</th><th>Очков %</th><th>Ошибок/партию</th><th>Ср. потеря</th></tr></thead><tbody>${ov.openings.slice(0, 12).map(o => `<tr><td>${esc(o.opening)}</td><td>${esc(o.eco)}</td><td class="num">${o.games}</td><td class="num">${fmt(o.points_pct)}%</td><td class="num">${fmt(o.errors_per_game, 2)}</td><td class="num">${fmt(o.avg_drop)}%</td></tr>`).join('')}</tbody></table></div>` : '<p style="color:var(--c-text-muted)">Нет данных.</p>'}
     </div>
     <div class="card">
       <div class="card-header"><span class="card-title">Человечность ошибок</span></div>
@@ -729,22 +729,22 @@ async function viewPlan(app) {
     <div class="card">
       <div class="card-header"><span class="card-title">Репертуар — частые ветви</span></div>
       <div class="grid grid-2">
-        <div><h3>Белые</h3>${plan.repertoire.white.length ? `<table class="table-wrap" style="font-size:12px"><thead><tr><th>Ветвь</th><th>Партий</th><th>OK %</th></tr></thead><tbody>${plan.repertoire.white.map(b => `<tr><td><code>${esc(b.moves.join(' '))}</code></td><td class="num">${b.count}</td><td class="num">${fmt(b.ok_rate * 100, 0)}%</td></tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted)">Нет данных.</p>'}</div>
-        <div><h3>Чёрные</h3>${plan.repertoire.black.length ? `<table class="table-wrap" style="font-size:12px"><thead><tr><th>Ветвь</th><th>Партий</th><th>OK %</th></tr></thead><tbody>${plan.repertoire.black.map(b => `<tr><td><code>${esc(b.moves.join(' '))}</code></td><td class="num">${b.count}</td><td class="num">${fmt(b.ok_rate * 100, 0)}%</td></tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted)">Нет данных.</p>'}</div>
+        <div><h3>Белые</h3>${plan.repertoire.white.length ? `<div class="table-wrap"><table style="font-size:12px"><thead><tr><th>Ветвь</th><th>Партий</th><th>OK %</th></tr></thead><tbody>${plan.repertoire.white.map(b => `<tr><td><code>${esc(b.moves.join(' '))}</code></td><td class="num">${b.count}</td><td class="num">${fmt(b.ok_rate * 100, 0)}%</td></tr>`).join('')}</tbody></table></div>` : '<p style="color:var(--c-text-muted)">Нет данных.</p>'}</div>
+        <div><h3>Чёрные</h3>${plan.repertoire.black.length ? `<div class="table-wrap"><table style="font-size:12px"><thead><tr><th>Ветвь</th><th>Партий</th><th>OK %</th></tr></thead><tbody>${plan.repertoire.black.map(b => `<tr><td><code>${esc(b.moves.join(' '))}</code></td><td class="num">${b.count}</td><td class="num">${fmt(b.ok_rate * 100, 0)}%</td></tr>`).join('')}</tbody></table></div>` : '<p style="color:var(--c-text-muted)">Нет данных.</p>'}</div>
       </div>
     </div>
     <div class="card">
       <div class="card-header"><span class="card-title">Слабые дебюты</span></div>
-      ${plan.repertoire.weak_openings.length ? `<table class="table-wrap"><thead><tr><th>Дебют</th><th>ECO</th><th>Партий</th><th>Очков %</th><th>Ошибок/партию</th><th>Ср. потеря</th></tr></thead><tbody>${plan.repertoire.weak_openings.slice(0, 6).map(o => `<tr><td>${esc(o.opening)}</td><td>${esc(o.eco)}</td><td class="num">${o.games}</td><td class="num">${fmt(o.points_pct)}%</td><td class="num">${fmt(o.errors_per_game, 2)}</td><td class="num">${fmt(o.avg_drop)}%</td></tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted)">Нет слабых дебютов.</p>'}
+      ${plan.repertoire.weak_openings.length ? `<div class="table-wrap"><table><thead><tr><th>Дебют</th><th>ECO</th><th>Партий</th><th>Очков %</th><th>Ошибок/партию</th><th>Ср. потеря</th></tr></thead><tbody>${plan.repertoire.weak_openings.slice(0, 6).map(o => `<tr><td>${esc(o.opening)}</td><td>${esc(o.eco)}</td><td class="num">${o.games}</td><td class="num">${fmt(o.points_pct)}%</td><td class="num">${fmt(o.errors_per_game, 2)}</td><td class="num">${fmt(o.avg_drop)}%</td></tr>`).join('')}</tbody></table></div>` : '<p style="color:var(--c-text-muted)">Нет слабых дебютов.</p>'}
     </div>
     <div class="grid grid-2">
       <div class="card">
         <div class="card-header"><span class="card-title">Мотивы ошибок</span></div>
-        ${plan.patterns.motifs.length ? `<table class="table-wrap"><thead><tr><th>Мотив</th><th>Частота</th><th>Ср. потеря</th></tr></thead><tbody>${plan.patterns.motifs.map(m => `<tr><td>${esc(m[0])}</td><td class="num">${m[1].count}</td><td class="num">${fmt(m[1].avg_drop)}%</td></tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted)">Нет данных.</p>'}
+        ${plan.patterns.motifs.length ? `<div class="table-wrap"><table><thead><tr><th>Мотив</th><th>Частота</th><th>Ср. потеря</th></tr></thead><tbody>${plan.patterns.motifs.map(m => `<tr><td>${esc(m[0])}</td><td class="num">${m[1].count}</td><td class="num">${fmt(m[1].avg_drop)}%</td></tr>`).join('')}</tbody></table></div>` : '<p style="color:var(--c-text-muted)">Нет данных.</p>'}
       </div>
       <div class="card">
         <div class="card-header"><span class="card-title">Фазы ошибок</span></div>
-        ${plan.patterns.phases.length ? `<table class="table-wrap"><thead><tr><th>Фаза</th><th>Ошибок</th><th>Грубых</th><th>Обычных</th><th>Ср. потеря</th></tr></thead><tbody>${plan.patterns.phases.map(p => `<tr><td>${esc(p[0])}</td><td class="num">${p[1].count}</td><td class="num">${p[1].blunders}</td><td class="num">${p[1].mistakes}</td><td class="num">${fmt(p[1].avg_drop)}%</td></tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted)">Нет данных.</p>'}
+        ${plan.patterns.phases.length ? `<div class="table-wrap"><table><thead><tr><th>Фаза</th><th>Ошибок</th><th>Грубых</th><th>Обычных</th><th>Ср. потеря</th></tr></thead><tbody>${plan.patterns.phases.map(p => `<tr><td>${esc(p[0])}</td><td class="num">${p[1].count}</td><td class="num">${p[1].blunders}</td><td class="num">${p[1].mistakes}</td><td class="num">${fmt(p[1].avg_drop)}%</td></tr>`).join('')}</tbody></table></div>` : '<p style="color:var(--c-text-muted)">Нет данных.</p>'}
       </div>
     </div>
     <div class="card">
@@ -916,7 +916,7 @@ async function viewProgress(app) {
     <div class="card-header"><h1>Прогресс</h1><span class="badge badge-blue">${esc(state.user.nick)}</span></div>
     <div class="card">
       <div class="card-header"><span class="card-title">Таблица окон (${pr.windows} окон, ${pr.games} партий)</span></div>
-      <table class="table-wrap">
+      <div class="table-wrap"><table>
         <thead><tr><th>№</th><th>Период</th><th>Партий</th><th>Счёт %</th><th title="Средняя потеря win% на ход игрока">Ср. потеря win%</th><th title="Средний win% перед ходом игрока">Win% до хода</th><th>Ошибок/партию</th><th>Неест. %</th><th>Ср. рейтинг</th></tr></thead>
         <tbody>
           ${pr.windows_rows.map(w => `<tr>
@@ -929,12 +929,12 @@ async function viewProgress(app) {
             <td class="num">${w.avg_rating != null ? w.avg_rating : '—'}</td>
           </tr>`).join('')}
         </tbody>
-      </table>
+      </table></div>
     </div>
     <div class="card">
       <div class="card-header"><span class="card-title">Тренд метрик</span></div>
       ${pr.trend ? `<div style="margin-bottom:8px"><span class="badge ${badgeClass}">${overall.toUpperCase()}</span></div>
-      <table class="table-wrap"><thead><tr><th>Метрика</th><th>Было</th><th>Стало</th><th>Δ</th><th>Направление</th><th>Вердикт</th></tr></thead><tbody>${trendRows}</tbody></table>
+      <div class="table-wrap"><table><thead><tr><th>Метрика</th><th>Было</th><th>Стало</th><th>Δ</th><th>Направление</th><th>Вердикт</th></tr></thead><tbody>${trendRows}</tbody></table></div>
       <div style="margin-top:12px;font-size:13px"><strong>Улучшается: </strong>${pr.trend.improving.length ? pr.trend.improving.join(', ') : '—'}<br><strong>Ухудшается: </strong>${pr.trend.worsening.length ? pr.trend.worsening.join(', ') : '—'}</div>` : '<p style="color:var(--c-text-muted)">Недостаточно данных для тренда.</p>'}
     </div>`;
 }
@@ -983,7 +983,7 @@ async function viewGameList(app) {
         <button class="btn btn-secondary ${state.gamesFilter === 'all' ? 'btn-active' : ''}" data-gfilter="all">Все</button>
         <button class="btn btn-secondary ${state.gamesFilter === 'analyzed' ? 'btn-active' : ''}" data-gfilter="analyzed">Только проанализированные</button>
       </div>
-      ${filtered.length ? `<table class="table-wrap"><thead><tr><th>Дата</th><th>Соперник</th><th>Цвет</th><th>Результат</th><th>Дебют</th><th class="num">Ходов</th><th>Анализ</th></tr></thead><tbody>${rows}</tbody></table>` : '<p style="color:var(--c-text-muted);padding:16px">Партий нет. Запусти анализ на странице «Анализ».</p>'}
+      ${filtered.length ? `<div class="table-wrap"><table><thead><tr><th>Дата</th><th>Соперник</th><th>Цвет</th><th>Результат</th><th>Дебют</th><th class="num">Ходов</th><th>Анализ</th></tr></thead><tbody>${rows}</tbody></table></div>` : '<p style="color:var(--c-text-muted);padding:16px">Партий нет. Запусти анализ на странице «Анализ».</p>'}
     </div>`;
 
   app.querySelectorAll('[data-gfilter]').forEach(btn => {
@@ -1229,7 +1229,7 @@ async function viewDrills(app) {
     ${summary ? `<div class="grid grid-3"><div class="card stat"><div class="stat-value">${summary.found}</div><div class="stat-label">Ошибок найдено</div></div><div class="card stat"><div class="stat-value">${summary.games}</div><div class="stat-label">Партий</div></div><div class="card stat"><div class="stat-value">${summary.avg_drop != null ? fmt(summary.avg_drop) + '%' : '—'}</div><div class="stat-label" title="Средняя потеря win% (процентов) на ход игрока (метрика avg_win_loss из анализа)">Ср. потеря win%</div></div></div>` : ''}
     <div class="card">
       <div class="card-header"><span class="card-title">Список ошибок (${items.length})</span><div><a href="/api/drills.pgn?${params}" class="btn btn-secondary" style="font-size:12px;padding:4px 10px">PGN</a> <a href="/api/drills.json?${params}" class="btn btn-secondary" style="font-size:12px;padding:4px 10px;margin-left:4px">JSON</a></div></div>
-      ${items.length ? `<table class="table-wrap"><thead><tr><th>#</th><th>Партия</th><th>Ход</th><th>Сыграно</th><th>Лучше</th><th>Класс</th><th>Потеря</th><th>Win% до/после</th><th>Дебют</th><th>Результат</th></tr></thead><tbody>${items.map((d, i) => `<tr class="drill-row"><td class="num">${i + 1}</td><td>${d.link ? '<a href="' + safeHttp(d.link) + '" target="_blank" rel="noopener" title="Открыть партию">' + esc(d.game_id.slice(0, 8)) + '</a>' : esc(d.game_id.slice(0, 8))}</td><td class="num">${d.ply}</td><td class="drill-san">${esc(d.san_played)}</td><td class="drill-best">${esc(d.best_move_san)}</td><td><span class="badge ${d.classification === 'blunder' ? 'badge-bad' : 'badge-neutral'}">${esc(d.classification)}</span></td><td class="num">${fmt(d.drop)}%</td><td class="num">${fmt(d.win_before)}% → ${fmt(d.win_after)}%</td><td>${esc(d.opening)}</td><td class="center"><span class="badge ${d.result_for_user === 'win' ? 'badge-good' : d.result_for_user === 'loss' ? 'badge-bad' : 'badge-neutral'}">${esc(d.result_for_user)}</span></td></tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted);padding:16px">Ошибок не найдено.</p>'}
+      ${items.length ? `<div class="table-wrap"><table><thead><tr><th>#</th><th>Партия</th><th>Ход</th><th>Сыграно</th><th>Лучше</th><th>Класс</th><th>Потеря</th><th>Win% до/после</th><th>Дебют</th><th>Результат</th></tr></thead><tbody>${items.map((d, i) => `<tr class="drill-row"><td class="num">${i + 1}</td><td>${d.link ? '<a href="' + safeHttp(d.link) + '" target="_blank" rel="noopener" title="Открыть партию">' + esc(d.game_id.slice(0, 8)) + '</a>' : esc(d.game_id.slice(0, 8))}</td><td class="num">${d.ply}</td><td class="drill-san">${esc(d.san_played)}</td><td class="drill-best">${esc(d.best_move_san)}</td><td><span class="badge ${d.classification === 'blunder' ? 'badge-bad' : 'badge-neutral'}">${esc(d.classification)}</span></td><td class="num">${fmt(d.drop)}%</td><td class="num">${fmt(d.win_before)}% → ${fmt(d.win_after)}%</td><td>${esc(d.opening)}</td><td class="center"><span class="badge ${d.result_for_user === 'win' ? 'badge-good' : d.result_for_user === 'loss' ? 'badge-bad' : 'badge-neutral'}">${esc(d.result_for_user)}</span></td></tr>`).join('')}</tbody></table></div>` : '<p style="color:var(--c-text-muted);padding:16px">Ошибок не найдено.</p>'}
     </div>`;
 
   document.getElementById('drills-filter').addEventListener('submit', e => {
@@ -1267,7 +1267,7 @@ async function viewDrillsWithParams(app, params) {
     ${summary ? `<div class="grid grid-3"><div class="card stat"><div class="stat-value">${summary.found}</div><div class="stat-label">Ошибок найдено</div></div><div class="card stat"><div class="stat-value">${summary.games}</div><div class="stat-label">Партий</div></div><div class="card stat"><div class="stat-value">${summary.avg_drop != null ? fmt(summary.avg_drop) + '%' : '—'}</div><div class="stat-label" title="Средняя потеря win% (процентов) на ход игрока (метрика avg_win_loss из анализа)">Ср. потеря win%</div></div></div>` : ''}
     <div class="card">
       <div class="card-header"><span class="card-title">Список ошибок (${items.length})</span><div><a href="/api/drills.pgn?${params}" class="btn btn-secondary" style="font-size:12px;padding:4px 10px">PGN</a> <a href="/api/drills.json?${params}" class="btn btn-secondary" style="font-size:12px;padding:4px 10px;margin-left:4px">JSON</a></div></div>
-      ${items.length ? `<table class="table-wrap"><thead><tr><th>#</th><th>Партия</th><th>Ход</th><th>Сыграно</th><th>Лучше</th><th>Класс</th><th>Потеря</th><th>Win% до/после</th><th>Дебют</th><th>Результат</th></tr></thead><tbody>${items.map((d, i) => `<tr class="drill-row"><td class="num">${i + 1}</td><td>${d.link ? '<a href="' + safeHttp(d.link) + '" target="_blank" rel="noopener" title="Открыть партию">' + esc(d.game_id.slice(0, 8)) + '</a>' : esc(d.game_id.slice(0, 8))}</td><td class="num">${d.ply}</td><td class="drill-san">${esc(d.san_played)}</td><td class="drill-best">${esc(d.best_move_san)}</td><td><span class="badge ${d.classification === 'blunder' ? 'badge-bad' : 'badge-neutral'}">${esc(d.classification)}</span></td><td class="num">${fmt(d.drop)}%</td><td class="num">${fmt(d.win_before)}% → ${fmt(d.win_after)}%</td><td>${esc(d.opening)}</td><td class="center"><span class="badge ${d.result_for_user === 'win' ? 'badge-good' : d.result_for_user === 'loss' ? 'badge-bad' : 'badge-neutral'}">${esc(d.result_for_user)}</span></td></tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted);padding:16px">Ошибок не найдено.</p>'}
+      ${items.length ? `<div class="table-wrap"><table><thead><tr><th>#</th><th>Партия</th><th>Ход</th><th>Сыграно</th><th>Лучше</th><th>Класс</th><th>Потеря</th><th>Win% до/после</th><th>Дебют</th><th>Результат</th></tr></thead><tbody>${items.map((d, i) => `<tr class="drill-row"><td class="num">${i + 1}</td><td>${d.link ? '<a href="' + safeHttp(d.link) + '" target="_blank" rel="noopener" title="Открыть партию">' + esc(d.game_id.slice(0, 8)) + '</a>' : esc(d.game_id.slice(0, 8))}</td><td class="num">${d.ply}</td><td class="drill-san">${esc(d.san_played)}</td><td class="drill-best">${esc(d.best_move_san)}</td><td><span class="badge ${d.classification === 'blunder' ? 'badge-bad' : 'badge-neutral'}">${esc(d.classification)}</span></td><td class="num">${fmt(d.drop)}%</td><td class="num">${fmt(d.win_before)}% → ${fmt(d.win_after)}%</td><td>${esc(d.opening)}</td><td class="center"><span class="badge ${d.result_for_user === 'win' ? 'badge-good' : d.result_for_user === 'loss' ? 'badge-bad' : 'badge-neutral'}">${esc(d.result_for_user)}</span></td></tr>`).join('')}</tbody></table></div>` : '<p style="color:var(--c-text-muted);padding:16px">Ошибок не найдено.</p>'}
     </div>`;
   document.getElementById('drills-filter').addEventListener('submit', e => {
     e.preventDefault();
@@ -1816,7 +1816,7 @@ async function loadOpeningRecent(app) {
   box.innerHTML = `
     <div class="card">
       <div class="card-header"><span class="card-title">Недавние партии</span></div>
-      ${sessions.length ? `<table class="table-wrap"><thead><tr><th>Статус</th><th>Стиль</th><th>Цвет</th><th class="num">Ходы</th><th class="num">Рейтинги</th></tr></thead><tbody>${rows}</tbody></table>` : '<p style="color:var(--c-text-muted);padding:8px">Пока нет партий — начни первую.</p>'}
+      ${sessions.length ? `<div class="table-wrap"><table><thead><tr><th>Статус</th><th>Стиль</th><th>Цвет</th><th class="num">Ходы</th><th class="num">Рейтинги</th></tr></thead><tbody>${rows}</tbody></table></div>` : '<p style="color:var(--c-text-muted);padding:8px">Пока нет партий — начни первую.</p>'}
     </div>`;
   box.querySelectorAll('.game-row').forEach(row => {
     row.addEventListener('click', () => {
@@ -3071,8 +3071,8 @@ async function viewCoach(app) {
         <div class="card stat"><div class="stat-value">${fmt(report.avg.avg_win_loss, 2)}</div><div class="stat-label" title="Средняя потеря win% (процентов) на ход игрока (метрика avg_win_loss из анализа)">Ср. потеря win%</div></div>
         <div class="card stat"><div class="stat-value">${report.total.blunders + report.total.mistakes}</div><div class="stat-label">Ошибок всего</div></div>
       </div>
-      ${report.worst_games.length ? `<div class="card" style="margin-top:12px"><h3 style="font-size:14px;margin-bottom:8px">Худшие партии</h3><table class="table-wrap" style="font-size:12px"><thead><tr><th>Партия</th><th>Соперник</th><th>Результат</th><th>Ср. потеря</th><th>Win% до</th><th>Грубых</th></tr></thead><tbody>${report.worst_games.slice(0, 5).map(g => `<tr><td>${esc(g.game_id.slice(0, 8))}</td><td>${esc(g.opponent)}</td><td>${esc(g.result)}</td><td class="num">${fmt(g.avg_win_loss)}%</td><td class="num">${fmt(g.avg_win_before)}%</td><td class="num">${g.blunders}</td></tr>`).join('')}</tbody></table></div>` : ''}
-      ${report.missed_wins.length ? `<div class="card" style="margin-top:12px"><h3 style="font-size:14px;margin-bottom:8px">Упущенные выигрыши (топ-5)</h3><table class="table-wrap" style="font-size:12px"><thead><tr><th>Партия</th><th>Ход</th><th>SAN</th><th>Win% до</th><th>Win% после</th><th>Лучший ход</th></tr></thead><tbody>${report.missed_wins.slice(0, 5).map(m => `<tr><td>${esc(m.game_id.slice(0, 8))}</td><td>${m.ply}</td><td class="drill-san">${esc(m.san)}</td><td class="num">${fmt(m.win_before)}%</td><td class="num">${fmt(m.win_after)}%</td><td class="drill-best">${esc(m.best_move_san)}</td></tr>`).join('')}</tbody></table></div>` : ''}
+      ${report.worst_games.length ? `<div class="card" style="margin-top:12px"><h3 style="font-size:14px;margin-bottom:8px">Худшие партии</h3><div class="table-wrap"><table style="font-size:12px"><thead><tr><th>Партия</th><th>Соперник</th><th>Результат</th><th>Ср. потеря</th><th>Win% до</th><th>Грубых</th></tr></thead><tbody>${report.worst_games.slice(0, 5).map(g => `<tr><td>${esc(g.game_id.slice(0, 8))}</td><td>${esc(g.opponent)}</td><td>${esc(g.result)}</td><td class="num">${fmt(g.avg_win_loss)}%</td><td class="num">${fmt(g.avg_win_before)}%</td><td class="num">${g.blunders}</td></tr>`).join('')}</tbody></table></div></div>` : ''}
+      ${report.missed_wins.length ? `<div class="card" style="margin-top:12px"><h3 style="font-size:14px;margin-bottom:8px">Упущенные выигрыши (топ-5)</h3><div class="table-wrap"><table style="font-size:12px"><thead><tr><th>Партия</th><th>Ход</th><th>SAN</th><th>Win% до</th><th>Win% после</th><th>Лучший ход</th></tr></thead><tbody>${report.missed_wins.slice(0, 5).map(m => `<tr><td>${esc(m.game_id.slice(0, 8))}</td><td>${m.ply}</td><td class="drill-san">${esc(m.san)}</td><td class="num">${fmt(m.win_before)}%</td><td class="num">${fmt(m.win_after)}%</td><td class="drill-best">${esc(m.best_move_san)}</td></tr>`).join('')}</tbody></table></div></div>` : ''}
       <div class="card" style="margin-top:12px"><h3 style="font-size:14px;margin-bottom:8px">Тайм-тробль</h3><div class="grid grid-3"><div class="stat"><div class="stat-value">${report.time_pressure.moves_count}</div><div class="stat-label">Ходов в ТТ</div></div><div class="stat"><div class="stat-value">${report.time_pressure.blunders_in_tp}</div><div class="stat-label">Грубых в ТТ</div></div><div class="stat"><div class="stat-value">${fmt(report.time_pressure.tp_blunder_rate_pct)}%</div><div class="stat-label">% грубых в ТТ</div></div></div></div>`;
   } else {
     reportHtml = '<p style="color:var(--c-text-muted)">Пока нет отчёта. Запусти анализ выше.</p>';
@@ -3505,19 +3505,19 @@ function renderRepertoire(d) {
         <span class="card-title">Линии репертуара (${lines.length}) · партий ${d.games}</span>
         <span class="badge ${weakTotal ? 'badge-bad' : 'badge-good'}">слабых: ${weakTotal}</span>
       </div>
-      ${lines.length ? `<table class="table-wrap">
+      ${lines.length ? `<div class="table-wrap"><table>
         <thead><tr>${both ? '<th>Цвет</th>' : ''}<th>Ходы</th><th class="num">Партий</th><th class="num">Хорошо</th><th class="num">Плохо</th><th class="num">Прочность</th></tr></thead>
         <tbody>${lines.map(l => `<tr>
           ${both ? `<td>${TOOL_COLOR_RU[l.color] || esc(l.color)}</td>` : ''}
           <td><code>${esc((l.moves || []).join(' '))}</code></td>
           <td class="num">${l.count}</td><td class="num">${l.ok}</td><td class="num">${l.bad}</td>
           <td class="num">${l.path_ok_rate != null ? Math.round(l.path_ok_rate * 100) + '%' : '—'}</td>
-        </tr>`).join('')}</tbody></table>`
+        </tr>`).join('')}</tbody></table></div>`
         : '<p style="color:var(--c-text-muted);padding:8px">Нет данных: запусти анализ партий.</p>'}
       ${openings.length ? `
         <h3 style="font-size:14px;margin:16px 0 8px">Дебюты — ошибки по названиям</h3>
-        <table class="table-wrap"><thead><tr><th>Дебют</th><th>ECO</th><th class="num">Партий</th><th class="num">Очков %</th><th class="num">Ошибок/партию</th><th class="num">Ср. потеря</th></tr></thead>
-        <tbody>${openings.map(o => `<tr><td>${esc(o.opening)}</td><td>${esc(o.eco || '—')}</td><td class="num">${o.games}</td><td class="num">${fmt(o.points_pct)}%</td><td class="num">${fmt(o.errors_per_game, 2)}</td><td class="num">${fmt(o.avg_drop)}%</td></tr>`).join('')}</tbody></table>` : ''}
+        <div class="table-wrap"><table><thead><tr><th>Дебют</th><th>ECO</th><th class="num">Партий</th><th class="num">Очков %</th><th class="num">Ошибок/партию</th><th class="num">Ср. потеря</th></tr></thead>
+        <tbody>${openings.map(o => `<tr><td>${esc(o.opening)}</td><td>${esc(o.eco || '—')}</td><td class="num">${o.games}</td><td class="num">${fmt(o.points_pct)}%</td><td class="num">${fmt(o.errors_per_game, 2)}</td><td class="num">${fmt(o.avg_drop)}%</td></tr>`).join('')}</tbody></table></div>` : ''}
     </div>`;
 }
 
@@ -3561,20 +3561,20 @@ function renderOpponent(d) {
         <div class="stat"><div class="stat-value" style="font-size:15px">${speed}</div><div class="stat-label">Контроль времени</div></div>
       </div>
       <h3 style="font-size:14px;margin:8px 0">Его дебюты</h3>
-      ${openRows.length ? `<table class="table-wrap"><thead><tr><th>Цвет</th><th>Дебют</th><th class="num">Партий</th><th class="num">Очков %</th><th class="num">Ошибок/партию</th><th class="num">Ср. потеря</th></tr></thead><tbody>${openRows.join('')}</tbody></table>`
+      ${openRows.length ? `<div class="table-wrap"><table><thead><tr><th>Цвет</th><th>Дебют</th><th class="num">Партий</th><th class="num">Очков %</th><th class="num">Ошибок/партию</th><th class="num">Ср. потеря</th></tr></thead><tbody>${openRows.join('')}</tbody></table></div>`
         : '<p style="color:var(--c-text-muted)">Нет данных о его дебютах.</p>'}
       <h3 style="font-size:14px;margin:16px 0 8px">Где он ошибается</h3>
-      ${weakRows.length ? `<table class="table-wrap"><thead><tr><th>Тип</th><th>Что</th><th class="num">Плохих ходов</th><th class="num">Ср. потеря</th></tr></thead><tbody>${weakRows.join('')}</tbody></table>`
+      ${weakRows.length ? `<div class="table-wrap"><table><thead><tr><th>Тип</th><th>Что</th><th class="num">Плохих ходов</th><th class="num">Ср. потеря</th></tr></thead><tbody>${weakRows.join('')}</tbody></table></div>`
         : '<p style="color:var(--c-text-muted)">Ошибок не найдено.</p>'}
       <h3 style="font-size:14px;margin:16px 0 8px">Точки встречи (его дебют → твой ответ)</h3>
-      ${conf.length ? `<table class="table-wrap"><thead><tr><th>Дебют</th><th>Он</th><th>Твой ответ</th><th class="num">Его ошибок/парт.</th><th class="num">Твоих ошибок/парт.</th></tr></thead>
+      ${conf.length ? `<div class="table-wrap"><table><thead><tr><th>Дебют</th><th>Он</th><th>Твой ответ</th><th class="num">Его ошибок/парт.</th><th class="num">Твоих ошибок/парт.</th></tr></thead>
         <tbody>${conf.map(c => `<tr>
           <td>${esc(c.opening)}</td>
           <td>${TOOL_COLOR_RU[c.his_color]}: ${c.his_games} парт.</td>
           <td><code>${esc(c.your_reply)}</code> (${c.your_reply_games} парт.)</td>
            <td class="num">${fmt(c.his_errors_per_game, 2)}</td>
            <td class="num">${fmt(c.your_errors_per_game, 2)}</td>
-        </tr>`).join('')}</tbody></table>`
+        </tr>`).join('')}</tbody></table></div>`
         : '<p style="color:var(--c-text-muted)">Пересечений с твоим репертуаром не нашлось: готовиться пока не к чему.</p>'}
     </div>`;
 }
@@ -3596,7 +3596,7 @@ function renderHumanity(d) {
         <div class="stat"><div class="stat-value">${s.borderline || 0}</div><div class="stat-label">Пограничные</div></div>
         <div class="stat"><div class="stat-value">${s.unnatural || 0}</div><div class="stat-label">Неестественные</div></div>
       </div>
-      ${items.length ? `<table class="table-wrap">
+      ${items.length ? `<div class="table-wrap"><table>
         <thead><tr><th>Партия</th><th class="num">П.</th><th>Ход</th><th>Класс</th><th class="num">Потеря</th><th class="num">β</th><th>Вердикт</th></tr></thead>
         <tbody>${items.map(i => `<tr>
           <td>${esc(String(i.game_id || '').slice(0, 8))}</td>
@@ -3606,7 +3606,7 @@ function renderHumanity(d) {
           <td class="num">${i.drop != null ? fmt(i.drop) + '%' : '—'}</td>
           <td class="num">${i.beta != null ? i.beta : '—'}</td>
           <td><span class="badge ${verdictBadge(i.verdict)}">${esc(i.verdict || '—')}</span></td>
-        </tr>`).join('')}</tbody></table>`
+        </tr>`).join('')}</tbody></table></div>`
         : '<p style="color:var(--c-text-muted);padding:8px">Ошибок нет.</p>'}
     </div>`;
 }
@@ -3625,7 +3625,7 @@ function renderTournament(r) {
         <div class="stat"><div class="stat-value">${deltaText}</div><div class="stat-label">Прирост рейтинга</div></div>
       </div>
       <p style="color:var(--c-text-muted);font-size:13px">Средний рейтинг соперника: ${r.avg_opponent != null ? r.avg_opponent : '—'}</p>
-      ${rows.length ? `<table class="table-wrap">
+      ${rows.length ? `<div class="table-wrap"><table>
         <thead><tr><th>Соперник</th><th>Цвет</th><th class="num">Рейтинг</th><th>Результат</th><th class="num">Очки</th></tr></thead>
         <tbody>${rows.map(row => `<tr>
           <td>${esc(row.opponent)}</td>
@@ -3633,7 +3633,7 @@ function renderTournament(r) {
           <td class="num">${row.opponent_rating != null ? row.opponent_rating : '—'}</td>
           <td><span class="badge ${row.result === 'Победа' ? 'badge-good' : row.result === 'Поражение' ? 'badge-bad' : 'badge-neutral'}">${esc(row.result)}</span></td>
           <td class="num">${row.points}</td>
-        </tr>`).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted)">Партий нет.</p>'}
+        </tr>`).join('')}</tbody></table></div>` : '<p style="color:var(--c-text-muted)">Партий нет.</p>'}
     </div>`;
 }
 
@@ -3679,11 +3679,11 @@ function renderFide(d) {
         <div class="stat"><div class="stat-value">${ratingOrDash(p.blitz)}</div><div class="stat-label">Блиц</div></div>
       </div>
       ${summaryRows ? `<h3 style="font-size:14px;margin:8px 0">Тренд по контролем</h3>
-        <table class="table-wrap"><thead><tr><th>Контроль</th><th class="num">Сейчас</th><th class="num">Δ за окна</th><th class="center">Направление</th><th class="num">Периодов</th></tr></thead>
-        <tbody>${summaryRows}</tbody></table>` : ''}
+        <div class="table-wrap"><table><thead><tr><th>Контроль</th><th class="num">Сейчас</th><th class="num">Δ за окна</th><th class="center">Направление</th><th class="num">Периодов</th></tr></thead>
+        <tbody>${summaryRows}</tbody></table></div>` : ''}
       ${winRows.length ? `<h3 style="font-size:14px;margin:16px 0 8px">Окна истории</h3>
-        <table class="table-wrap"><thead><tr><th>Контроль</th><th class="num">№</th><th class="num">Периодов</th><th>Период</th><th class="num">Было → стало</th><th class="num">Δ</th></tr></thead>
-        <tbody>${winRows.join('')}</tbody></table>` : '<p style="color:var(--c-text-muted)">История рейтингов пуста.</p>'}
+        <div class="table-wrap"><table><thead><tr><th>Контроль</th><th class="num">№</th><th class="num">Периодов</th><th>Период</th><th class="num">Было → стало</th><th class="num">Δ</th></tr></thead>
+        <tbody>${winRows.join('')}</tbody></table></div>` : '<p style="color:var(--c-text-muted)">История рейтингов пуста.</p>'}
     </div>`;
 }
 
@@ -3861,7 +3861,7 @@ async function viewUsers(app) {
     </div>
     <div class="card">
       <div class="card-header"><span class="card-title">Все пользователи (${list.length})</span></div>
-      ${list.length ? `<table class="table-wrap"><thead><tr><th>Ник</th><th>Lichess</th><th>FIDE</th><th>Партий</th><th>Анализов</th><th>Последний вход</th></tr></thead><tbody>${list.map(u => {
+      ${list.length ? `<div class="table-wrap"><table><thead><tr><th>Ник</th><th>Lichess</th><th>FIDE</th><th>Партий</th><th>Анализов</th><th>Последний вход</th></tr></thead><tbody>${list.map(u => {
         const isCurrent = String(u.nick || '').toLowerCase() === want;
         return `<tr>
           <td${isCurrent ? ' style="font-weight:600"' : ''}>${esc(u.nick)}${isCurrent ? ' <span class="badge badge-blue">это ты</span>' : ''}</td>
@@ -3871,7 +3871,7 @@ async function viewUsers(app) {
           <td class="num">${u.analyses}</td>
           <td>${u.last_seen_at ? new Date(u.last_seen_at * 1000).toLocaleDateString('ru-RU') : '—'}</td>
         </tr>`;
-      }).join('')}</tbody></table>` : '<p style="color:var(--c-text-muted);padding:16px">Пользователей нет.</p>'}
+      }).join('')}</tbody></table></div>` : '<p style="color:var(--c-text-muted);padding:16px">Пользователей нет.</p>'}
     </div>`;
 
   const rerender = async () => {

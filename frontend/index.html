@@ -1,10 +1,10 @@
-﻿<!doctype html>
+<!doctype html>
 <html lang="ru">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Chess Trainer</title>
-  <link rel="stylesheet" href="style.css?v=0.6.0">
+  <link rel="stylesheet" href="style.css?v=0.6.1">
 </head>
 <body>
 <header class="topbar">
@@ -40,10 +40,49 @@
   </div>
 </header>
 <main class="page" id="app">
-  <!-- Views will be rendered here -->
+  <div class="app-boot" role="status" aria-live="polite">Загрузка…</div>
 </main>
-<footer class="footer">Chess Trainer v0.6.0 · <a href="https://github.com/Tleukhanov/chess_trainig_app" target="_blank" rel="noopener">GitHub</a></footer>
+<noscript>
+  <div class="page">
+    <div class="alert alert-warn">Для работы Chess Trainer нужен JavaScript. Включите его в настройках браузера и обновите страницу.</div>
+  </div>
+</noscript>
+<footer class="footer">Chess Trainer v0.6.1 · <a href="https://github.com/Tleukhanov/chess_trainig_app" target="_blank" rel="noopener">GitHub</a></footer>
 
-  <script type="module" src="app.js?v=0.6.0"></script>
+  <script type="module" src="app.js?v=0.6.1"></script>
+  <script>
+    // Страховка: если приложение не отрисовалось, показать причину вместо пустой страницы.
+    (function () {
+      var app = document.getElementById('app');
+      if (!app) return;
+
+      function hasRenderedContent() {
+        for (var i = 0; i < app.children.length; i++) {
+          if (!app.children[i].classList.contains('app-boot')) return true;
+        }
+        return false;
+      }
+
+      function reportError(message) {
+        if (hasRenderedContent()) return;
+        app.innerHTML = '';
+        var box = document.createElement('div');
+        box.className = 'alert alert-error app-error';
+        box.textContent = 'Ошибка загрузки приложения: ' + message;
+        app.appendChild(box);
+      }
+
+      window.addEventListener('error', function (event) {
+        var message = event && event.message ? event.message : 'неизвестная ошибка';
+        reportError(message);
+      });
+
+      window.addEventListener('unhandledrejection', function (event) {
+        var reason = event && event.reason;
+        var message = reason && reason.message ? reason.message : String(reason || 'неизвестная ошибка');
+        reportError(message);
+      });
+    })();
+  </script>
 </body>
 </html>
