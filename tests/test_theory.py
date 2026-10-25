@@ -24,6 +24,7 @@ from app.api import create_api
 from app.config import settings
 from app.db import Database
 
+_BARE_KINGS_FEN = "8/8/8/8/8/8/8/K6k w - - 0 1"
 START_FEN = chess.Board().fen()
 
 
@@ -134,7 +135,7 @@ class TheoryProviderTests(unittest.TestCase):
         with patch.object(
             urllib.request, "urlopen", side_effect=TimeoutError("timed out")
         ):
-            empty = theory.main_line(_fen_after("a4"), 4, db_path=self.db_path)
+            empty = theory.main_line(_BARE_KINGS_FEN, 4, db_path=self.db_path)
         self.assertEqual(empty["source"], "none")
         self.assertEqual(empty["main_line"], [])
         self.assertIsNone(empty["setup_fen"])
@@ -179,10 +180,8 @@ class TheoryProviderTests(unittest.TestCase):
         self.assertEqual(len(result["main_line"]), 4)
         self.assertEqual(result["main_line"][0]["san"], "e4")
         self.assertEqual(result["main_line"][0]["fen"], _fen_after("e4"))
-        # Произвольный FEN вне книги — пустая линия, без падения.
-        other = chess.Board()
-        other.push_san("a4")
-        self.assertEqual(provider.position(other.fen(), 4)["main_line"], [])
+        # Произвольный FEN вне книги (голые короли) — пустая линия, без падения.
+        self.assertEqual(provider.position(_BARE_KINGS_FEN, 4)["main_line"], [])
 
     def test_invalid_fen_raises_value_error(self) -> None:
         with self.assertRaises(ValueError):

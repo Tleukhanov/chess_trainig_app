@@ -1,6 +1,6 @@
 // Chess Trainer Frontend — SPA на vanilla JS, потребляет /api/* эндпоинты.
 
-import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.6.9';
+import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.7.0';
 
 const state = {
   user: null,
@@ -2876,7 +2876,11 @@ async function loadOpeningTheory(app) {
   state.openingTheoryError = null;
   drawOpening(app);
   try {
-    const data = await api('/api/theory?fen=' + encodeURIComponent(fen) + '&plies=12');
+    const moves = Array.isArray(s.moves) ? s.moves.join(',') : '';
+    const data = await api(
+      '/api/theory?fen=' + encodeURIComponent(fen) + '&plies=12' +
+      (moves ? '&moves=' + encodeURIComponent(moves) : ''),
+    );
     if (!state.openingSession || state.openingSession.fen !== fen) return;
     state.openingTheory = data || null;
     state.openingTheoryRequestFen = fen;

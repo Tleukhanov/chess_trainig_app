@@ -138,6 +138,52 @@ def theory_moves(moves_san: list[str]) -> list[tuple[str, int]]:
     ]
 
 
+def _fen_key(board: chess.Board) -> str:
+    """Ключ позиции для индекса ECO: без счётчиков ходов (транспозиции)."""
+    return " ".join(board.fen().split()[:4])
+
+
+@lru_cache(maxsize=1)
+def _load_fen_index() -> dict[str, dict[str, int]]:
+    """Индекс ECO по позициям: FEN-ключ -> {SAN: вес}.
+
+    Строится из тех же TSV, что и триe, но позволяет находить продолжения
+    из произвольной позиции и через транспозиции (move order не важен).
+    """
+    index: dict[str, dict[str, int]] = {}
+    for filename in _TSV_FILES:
+        path = OPENINGS_DIR / filename
+        if not path.is_file():
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("eco"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            board = chess.Board()
+            for san in _pgn_to_sans(parts[2]):
+                try:
+                    move = board.parse_san(san)
+                except ValueError:
+                    break
+                key = _fen_key(board)
+                bucket = index.setdefault(key, {})
+                bucket[san] = bucket.get(san, 0) + 1
+                board.push(move)
+    return index
+
+
+def theory_moves_fen(fen: str) -> list[tuple[str, int]]:
+    """Ходы-продолжения из ECO для произвольного FEN (с транспозициями)."""
+    try:
+        board = chess.Board(fen)
+    except ValueError:
+        return []
+    return list(_load_fen_index().get(_fen_key(board), {}).items())
+
+
 def _pick_theory_move(board: chess.Board, moves_san: list[str], rng: random.Random) -> str | None:
     """Выбирает легальный ход из книги, взвешенно по популярности."""
     options: list[tuple[str, int]] = []

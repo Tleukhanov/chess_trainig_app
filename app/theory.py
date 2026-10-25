@@ -32,7 +32,7 @@ from .llm import (
     looks_like_refusal,
     looks_like_thinking,
 )
-from .openings import classify_opening, theory_moves
+from .openings import classify_opening, theory_moves, theory_moves_fen
 
 logger = logging.getLogger(__name__)
 
@@ -77,8 +77,19 @@ class TheoryProvider(Protocol):
 
     source: str
 
-    def position(self, fen: str, plies: int) -> dict[str, Any]:
+    def position(self, fen: str, plies: int, moves: list[str] | None = None) -> dict[str, Any]:
         ...
+
+
+def _history(moves: Any) -> list[str] | None:
+    """Нормализует историю SAN из запроса: список строк или None."""
+    if moves is None:
+        return None
+    if isinstance(moves, str):
+        return [part.strip() for part in moves.split(",") if part.strip()]
+    if isinstance(moves, list):
+        return [str(part).strip() for part in moves if str(part).strip()]
+    return None
 
 
 def _board(fen: str) -> chess.Board:
@@ -203,9 +214,13 @@ class LichessExplorerProvider:
             {"fen": fen, "topGames": 0, "moves": 12},
             quote_via=urllib.parse.quote,
         )
+        headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+        # С февраля 2026 explorer.lichess.ovh требует авторизацию.
+        if settings.lichess_token:
+            headers["Authorization"] = f"Bearer {settings.lichess_token}"
         request = urllib.request.Request(
             f"{self.base_url}?{query}",
-            headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+            headers=headers,
         )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
@@ -230,7 +245,7 @@ class LichessExplorerProvider:
             return []
         return [move for move in moves if isinstance(move, dict)]
 
-    def position(self, fen: str, plies: int) -> dict[str, Any]:
+    def position(self, fen: str, plies: int, moves: list[str] | None = None) -> dict[str, Any]:
         board = _board(fen)
         depth = _clamp_plies(plies)
         steps: list[dict[str, Any]] = []
@@ -287,27 +302,36 @@ class LichessExplorerProvider:
 
 
 class EcoProvider:
-    """Офлайн-fallback по книге ECO (``app.openings.theory_moves``).
+    """Офлайн-провайдер по локальной книге ECO.
 
-    Книга индексируется по истории SAN от начальной позиции, поэтому для
-    произвольного FEN линию построить нельзя (в FEN нет истории ходов) — в
-    этом случае возвращается пустая линия. Статистики у ECO нет.
+    Линия строится по FEN-индексу (``theory_moves_fen``), поэтому работает
+    из произвольной позиции и ловит транспозиции. Статистики партий у ECO
+    нет — только ходы. История SAN из запроса нужна лишь как проверка
+    согласованности и не обязательна.
     """
 
     source = "eco"
 
-    def position(self, fen: str, plies: int) -> dict[str, Any]:
+    def position(self, fen: str, plies: int, moves: list[str] | None = None) -> dict[str, Any]:
         board = _board(fen)
-        start_fen = chess.Board().fen()
-        if board.fen() != start_fen:
-            return {"source": self.source, "fen": board.fen(), "main_line": []}
+        history = _history(moves) or []
+        if history:
+            # Мягкая проверка: если история и FEN расходятся, доверяем FEN.
+            replay = chess.Board()
+            try:
+                for san in history:
+                    replay.push_san(san)
+                if replay.fen() != board.fen():
+                    logger.debug("theory: история SAN не совпала с FEN, использую FEN")
+            except ValueError:
+                logger.debug("theory: невалидная история SAN, использую FEN")
 
         depth = _clamp_plies(plies)
-        history: list[str] = []
         steps: list[dict[str, Any]] = []
 
         for _ in range(depth):
-            options = theory_moves(history)
+            # Сначала индекс по FEN (ловит транспозиции), затем префикс SAN.
+            options = theory_moves_fen(board.fen()) or theory_moves(history)
             if not options:
                 break
             ranked = sorted(options, key=lambda pair: pair[1], reverse=True)
@@ -343,7 +367,7 @@ class OffProvider:
 
     source = "off"
 
-    def position(self, fen: str, plies: int) -> dict[str, Any]:
+    def position(self, fen: str, plies: int, moves: list[str] | None = None) -> dict[str, Any]:
         board = _board(fen)
         return {"source": self.source, "fen": board.fen(), "main_line": []}
 
@@ -406,6 +430,7 @@ def main_line(
     plies: int | None = None,
     *,
     db_path: Any = None,
+    moves: list[str] | None = None,
 ) -> dict[str, Any]:
     """Главная линия позиции: провайдер → fallback ECO → пустой результат.
 
@@ -428,7 +453,7 @@ def main_line(
 
     if raw is None:
         try:
-            raw = provider.position(fen, depth)
+            raw = provider.position(fen, depth, _history(moves))
         except Exception as exc:  # noqa: BLE001 - любой сбой = fallback
             logger.debug("theory: провайдер %s недоступен: %s", provider.source, exc)
             raw = None
@@ -450,7 +475,7 @@ def main_line(
     # Lichess может ответить пустой позицией (редкий дебют) — пробуем ECO.
     if not steps and provider.source not in ("eco", "off"):
         try:
-            eco = EcoProvider().position(fen, depth)
+            eco = EcoProvider().position(fen, depth, _history(moves))
         except ValueError:
             eco = None
         if eco is not None:

@@ -3191,7 +3191,7 @@ def create_api(
     # --- Теория дебютов -----------------------------------------------------
 
     @app.get("/api/theory")
-    def api_theory(request: Request, fen: str = "", plies: int = 0):
+    def api_theory(request: Request, fen: str = "", plies: int = 0, moves: str = ""):
         """Главная линия позиции по выбранному провайдеру теории.
 
         Провайдер недоступен → 200 с line от ECO-fallback или ``source="none"``:
@@ -3203,7 +3203,10 @@ def create_api(
         _fen_board(fen)
         depth = plies if plies > 0 else settings.theory_max_plies
         try:
-            return theory.main_line(fen, depth, db_path=app.state.db_path)
+            history = [part.strip() for part in moves.split(",") if part.strip()]
+            return theory.main_line(
+                fen, depth, db_path=app.state.db_path, moves=history or None
+            )
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
 
