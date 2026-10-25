@@ -15,7 +15,25 @@ const PIECE_IMAGES = {
 };
 
 const PIECE_DIR = 'assets/pieces/cburnett';
+const BADGE_DIR = 'assets/badges';
 const SVG_NS = 'http://www.w3.org/2000/svg';
+
+// Виды значков для opts.errors. Имя файла — как в assets/badges, CSS-класс —
+// с дефисами вместо подчёркиваний (missed_win.svg → .sq-err-missed-win).
+const ERROR_KINDS = new Set([
+  'inaccuracy', 'mistake', 'blunder', 'missed_win',
+  'brilliant', 'great', 'best', 'book', 'excellent', 'good',
+]);
+
+// Приводим kind к каноническому виду: "missed-win"/"Missed Win" → "missed_win".
+function normalizeErrorKind(kind) {
+  const key = String(kind || '').trim().toLowerCase().replace(/[\s-]+/g, '_');
+  return ERROR_KINDS.has(key) ? key : '';
+}
+
+function errorBadgeHtml(kind) {
+  return `<span class="sq-err sq-err-${kind.replace(/_/g, '-')}"><img src="${BADGE_DIR}/${kind}.svg" alt=""></span>`;
+}
 
 export const PIECE_SET = PIECE_DIR;
 
@@ -89,6 +107,7 @@ function squarePoint(square, flip) {
  * opts.animFrom  — square the moving piece comes from (animation start)
  * opts.animTo    — destination square (animation end)
  * opts.animate   — set to false to render without the slide-in animation
+ * opts.errors    — [{square, kind}] badges in the square corner, e.g. {square: 'e4', kind: 'blunder'}
  */
 export function boardHtml(fen, opts = {}) {
   const pieces = fenPieces(fen);
@@ -97,6 +116,14 @@ export function boardHtml(fen, opts = {}) {
 
   const staticArrows = Array.isArray(opts.arrows) ? opts.arrows : [];
   const marks = Array.isArray(opts.marks) ? opts.marks : [];
+  const errors = Array.isArray(opts.errors) ? opts.errors : [];
+  const errorBySquare = new Map();
+  for (const err of errors) {
+    if (!err || !err.square) continue;
+    const kind = normalizeErrorKind(err.kind);
+    if (!kind || errorBySquare.has(err.square)) continue;
+    errorBySquare.set(err.square, kind);
+  }
   const animFrom = opts.animFrom || (lastMove.length === 2 ? lastMove[0] : '');
   const animTo = opts.animTo || (lastMove.length === 2 ? lastMove[1] : '');
   const animate = opts.animate !== false && animFrom && animTo && animFrom !== animTo;
@@ -132,7 +159,10 @@ export function boardHtml(fen, opts = {}) {
       const markHtml = mark
         ? `<span class="sq-mark sq-mark-${mark.kind === 'bad' ? 'bad' : 'good'}" aria-hidden="true">${mark.kind === 'bad' ? '✗' : '✓'}</span>`
         : '';
-      html += `<div class="${cls.join(' ')}" data-square="${square}" role="gridcell" aria-label="${square}" tabindex="-1">${coord}${pieceHtml}${markHtml}</div>`;
+      const errorKind = errorBySquare.get(square);
+      // Значок идёт после метки: при равном z-index он рисуется поверх ✓/✗.
+      const errorHtml = errorKind ? errorBadgeHtml(errorKind) : '';
+      html += `<div class="${cls.join(' ')}" data-square="${square}" role="gridcell" aria-label="${square}" tabindex="-1">${coord}${pieceHtml}${markHtml}${errorHtml}</div>`;
     }
   }
 

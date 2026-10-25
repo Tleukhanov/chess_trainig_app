@@ -765,7 +765,7 @@ td.center { text-align: center; }
   position: absolute;
   right: 2px;
   top: 1px;
-  z-index: 4;
+  z-index: 3;
   font-size: 13px;
   font-weight: 700;
   line-height: 1;
@@ -773,6 +773,25 @@ td.center { text-align: center; }
 }
 .sq-mark-good { color: #2e9e4a; }
 .sq-mark-bad { color: #c5221f; }
+
+/* Значки ошибок/оценок ходов в углу клетки (иконки assets/badges/*.svg).
+   Цвет и глиф даёт сама иконка — цветных подложек нет.
+   z-index выше метки ✓/✗: если на клетке оба, значок перекрывает метку. */
+.sq-err {
+  position: absolute;
+  top: 1px;
+  right: 1px;
+  z-index: 4;
+  width: 16px;
+  height: 16px;
+  pointer-events: none;
+  filter: drop-shadow(0 1px 1px rgba(0,0,0,.4));
+}
+.sq-err img { width: 100%; height: 100%; display: block; }
+
+@media (max-width: 720px) {
+  .sq-err { width: 13px; height: 13px; }
+}
 
 /* Просмотр решения задачи: шаги по лучшей линии */
 .task-line-controls {
