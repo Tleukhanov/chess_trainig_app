@@ -216,6 +216,27 @@ a:hover { color: var(--c-link-hover); text-decoration: underline; }
 .user-switch { color: var(--c-link); font-weight: 500; }
 .user-switch:hover { text-decoration: underline; }
 
+/* Глобальный индикатор идущего анализа в шапке */
+.global-job {
+  display: inline-block;
+  max-width: 340px;
+  min-width: 0;
+  padding: 4px 10px;
+  border: 1px solid var(--c-border);
+  border-radius: 999px;
+  background: var(--c-badge-blue-bg);
+  color: var(--c-link);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.5;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: middle;
+}
+.global-job:hover { text-decoration: none; color: var(--c-link-hover); background: var(--c-bg-hover); }
+.global-job[hidden] { display: none; }
+
 /* Переключатель темы */
 .theme-toggle {
   background: none;
@@ -322,6 +343,7 @@ h3 { font-size: 15px; font-weight: 600; margin-top: 16px; }
 .form-group textarea:focus { outline: none; border-color: var(--c-link); box-shadow: 0 0 0 2px rgba(54,146,231,0.15); }
 .form-row { display: flex; gap: 16px; flex-wrap: wrap; }
 .form-row .form-group { flex: 1; min-width: 180px; }
+.form-hint { font-size: 12px; line-height: 1.5; color: var(--c-text-muted); margin-top: 6px; }
 
 .checkbox { display: flex; align-items: center; gap: 8px; font-size: 13px; }
 .checkbox input { accent-color: var(--c-btn-primary); }
@@ -362,9 +384,19 @@ td.center { text-align: center; }
 .job-card { position: relative; }
 .job-progress { height: 6px; background: var(--c-border); border-radius: 3px; overflow: hidden; margin: 12px 0; }
 .job-progress-bar { height: 100%; background: var(--c-btn-primary); border-radius: 3px; transition: width 0.3s; }
+.job-progress-row { display: flex; align-items: center; gap: 12px; }
+.job-progress-row .job-progress { flex: 1; min-width: 120px; }
+.job-cancel-btn { flex: none; padding: 4px 10px; font-size: 12px; }
 .job-phase { font-size: 13px; color: var(--c-text-muted); margin-bottom: 4px; }
 .job-detail { font-size: 13px; color: var(--c-text); }
 .job-error { color: var(--c-badge-bad); margin-top: 8px; }
+
+/* Coach: что делать, пока идёт анализ */
+.job-training { border-left: 3px solid var(--c-btn-primary); }
+.job-training h3 { font-size: 14px; margin: 0 0 6px; }
+.job-training p { font-size: 13px; line-height: 1.6; color: var(--c-text-muted); margin: 0 0 10px; }
+.job-training-links { display: flex; gap: 8px; flex-wrap: wrap; }
+.job-training-links .btn { padding: 6px 12px; font-size: 13px; }
 
 /* LLM tools (review / mentor) */
 .mentor-reply { white-space: pre-wrap; line-height: 1.6; }
@@ -582,6 +614,7 @@ td.center { text-align: center; }
   .nav-group a { flex: 1 1 30%; text-align: center; padding: 8px 4px; }
   .nav a { flex: 1; text-align: center; padding: 8px 4px; }
   .topbar-right { order: 4; width: 100%; justify-content: center; }
+  .global-job { max-width: 100%; }
   .grid-2, .grid-3, .grid-4, .game-layout { grid-template-columns: 1fr; }
 }
 

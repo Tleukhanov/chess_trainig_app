@@ -20,7 +20,7 @@ from fastapi.testclient import TestClient
 
 import chess
 
-from app.api import create_api, _plan_llm_input, _task_done_key, _today, _JOBS
+from app.api import create_api, _plan_llm_input, _task_done_key, _today, _JOBS, CoachJob
 from app.db import Database
 from app.fide import FidePlayer, FideRatings
 from app.games import Game
@@ -338,6 +338,35 @@ class DataApiTests(ApiTestBase):
         self.assertEqual(resp.status_code, 404)
 
 
+class FakeEngine:
+    """Заглушка Stockfish для /api/coach/run: без процесса и реального анализа.
+
+    Журналы ``calls``/``game_ids`` — на классе, тесты их сбрасывают сами.
+    ``on_game`` позволяет смоделировать отмену посреди цикла.
+    """
+
+    calls: list[tuple[int, int]] = []
+    game_ids: list[str] = []
+    on_game = None
+
+    def __init__(self, depth: int = 14, multipv: int = 3, **kwargs) -> None:
+        type(self).calls.append((depth, multipv))
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        return False
+
+    def analyze_game(self, game):
+        type(self).game_ids.append(game.id)
+        if type(self).on_game is not None:
+            type(self).on_game(game)
+        fake = MagicMock()
+        fake.summary.return_value = {"game_id": game.id}
+        return fake
+
+
 class CoachApiTests(ApiTestBase):
     """Тесты /api/coach/run и /api/jobs/{id}."""
 
@@ -362,6 +391,23 @@ class CoachApiTests(ApiTestBase):
     def _engine_patch(self, path: str):
         """Патчит settings.stockfish_path (pre-flight движка в coach/run)."""
         return patch("app.api.settings", stockfish_path=path)
+
+    def _wait_job(self, job_id: str, timeout: float = 15.0) -> dict:
+        """Опрос /api/jobs/{id}, пока job не перестанет быть running."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            resp = self.client.get(f"/api/jobs/{job_id}")
+            self.assertEqual(resp.status_code, 200)
+            data = resp.json()
+            if data["status"] != "running":
+                return data
+            time.sleep(0.02)
+        self.fail(f"job {job_id} не завершился за {timeout}с")
+
+    def _reset_fake_engine(self) -> None:
+        FakeEngine.calls = []
+        FakeEngine.game_ids = []
+        FakeEngine.on_game = None
 
     def test_coach_run_creates_job(self):
         with tempfile.NamedTemporaryFile() as fh:
@@ -416,6 +462,184 @@ class CoachApiTests(ApiTestBase):
             resp = self.client.post("/api/coach/run", data={})
         self.assertEqual(resp.status_code, 503)
         self.assertIn("Stockfish", resp.json()["detail"])
+
+    def test_coach_profile_presets(self):
+        """profile=quick/standard/deep задаёт depth/multipv; пустой — как передали."""
+        self._register("tester")
+        cases = [
+            ({"profile": "quick"}, (10, 1)),
+            ({"profile": "standard"}, (12, 2)),
+            ({"profile": "deep"}, (14, 3)),
+            ({"depth": "7", "multipv": "2"}, (7, 2)),
+        ]
+        for extra, expected in cases:
+            with self.subTest(extra=extra):
+                self._reset_fake_engine()
+                with tempfile.NamedTemporaryFile() as fh:
+                    with self._engine_patch(fh.name), patch(
+                        "app.api.Engine", FakeEngine
+                    ):
+                        resp = self.client.post(
+                            "/api/coach/run",
+                            data={
+                                "max": "10",
+                                "cached_only": "on",
+                                "refresh": "on",
+                                **extra,
+                            },
+                        )
+                        self.assertEqual(resp.status_code, 200, resp.text)
+                        job = self._wait_job(resp.json()["job_id"])
+                self.assertEqual(job["status"], "done")
+                self.assertEqual(FakeEngine.calls, [expected])
+
+    def test_coach_profile_unknown_400(self):
+        resp = self.client.post(
+            "/api/coach/run", data={"profile": "turbo", "cached_only": "on"}
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("profile", resp.json()["detail"])
+        # Плохой профиль не должен создавать задачу.
+        self.assertFalse([j for j in _JOBS.values() if j.status == "running"])
+
+    def test_coach_newest_first_and_partial_results(self):
+        """target сортируется по created_at DESC, анализ сохраняется по партиям."""
+        self._register("tester")
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.save_games(
+                [
+                    mkgame_moves("old", ["e4"], created_at=100),
+                    mkgame_moves("newest", ["e4"], created_at=300),
+                    mkgame_moves("mid", ["e4"], created_at=200),
+                ],
+                "tester",
+            )
+        self._reset_fake_engine()
+        with tempfile.NamedTemporaryFile() as fh:
+            with self._engine_patch(fh.name), patch("app.api.Engine", FakeEngine):
+                resp = self.client.post(
+                    "/api/coach/run",
+                    data={"max": "10", "cached_only": "on", "refresh": "on"},
+                )
+                self.assertEqual(resp.status_code, 200, resp.text)
+                job_id = resp.json()["job_id"]
+                job = self._wait_job(job_id)
+        self.assertEqual(job["status"], "done")
+        # t1 из setUp имеет created_at=0 — он последний.
+        self.assertEqual(FakeEngine.game_ids, ["newest", "mid", "old", "t1"])
+        with Database(self.db_path) as db:
+            db.init_db()
+            for game_id in ("newest", "mid", "old", "t1"):
+                self.assertIsNotNone(
+                    db.get_analysis(game_id), f"нет анализа для {game_id}"
+                )
+
+
+class JobCancelApiTests(ApiTestBase):
+    """POST /api/jobs/{id}/cancel: только владелец, идемпотентность, остановка."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        _JOBS.clear()
+
+    def tearDown(self) -> None:
+        _JOBS.clear()
+
+    def _tokens(self) -> dict[str, str]:
+        conn = Database(self.db_path).connect()
+        try:
+            rows = conn.execute("SELECT nick, token FROM sessions").fetchall()
+            return {row["nick"]: row["token"] for row in rows}
+        finally:
+            conn.close()
+
+    def _as(self, token: str) -> None:
+        self.client.cookies.set("ct_session", token)
+
+    def _insert_job(self, nick: str, job_id: str, status: str = "running") -> CoachJob:
+        job = CoachJob(id=job_id, user=nick)
+        job.status = status
+        _JOBS[job_id] = job
+        return job
+
+    def test_cancel_own_running_idempotent(self):
+        self._register("alice")
+        job = self._insert_job("alice", "job-cancel-1")
+        resp = self.client.post("/api/jobs/job-cancel-1/cancel")
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json(), {"ok": True})
+        self.assertEqual(job.status, "cancelled")
+        self.assertIsNotNone(job.finished)
+        # Повторная отмена не падает и отдаёт текущий статус.
+        resp = self.client.post("/api/jobs/job-cancel-1/cancel")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json(), {"ok": True, "status": "cancelled"})
+
+    def test_cancel_done_is_idempotent(self):
+        self._register("alice")
+        self._insert_job("alice", "job-done-1", status="done")
+        resp = self.client.post("/api/jobs/job-done-1/cancel")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json(), {"ok": True, "status": "done"})
+
+    def test_cancel_other_user_404(self):
+        self._register("alice")
+        self._register("bob")
+        tokens = self._tokens()
+        job = self._insert_job("alice", "job-alice-1")
+        self._as(tokens["bob"])
+        resp = self.client.post("/api/jobs/job-alice-1/cancel")
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(job.status, "running")
+
+    def test_cancel_stops_analysis_loop(self):
+        """Статус cancelled в цикле _run_coach_job останавливает новые партии."""
+        self._register("tester")
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.save_games(
+                [
+                    mkgame_moves("c1", ["e4"], created_at=10),
+                    mkgame_moves("c2", ["e4"], created_at=20),
+                    mkgame_moves("c3", ["e4"], created_at=30),
+                ],
+                "tester",
+            )
+
+        def _cancel(game) -> None:
+            for job in _JOBS.values():
+                if job.status == "running":
+                    job.status = "cancelled"
+
+        FakeEngine.calls = []
+        FakeEngine.game_ids = []
+        FakeEngine.on_game = _cancel
+        try:
+            with tempfile.NamedTemporaryFile() as fh:
+                with patch("app.api.settings", stockfish_path=fh.name), patch(
+                    "app.api.Engine", FakeEngine
+                ):
+                    resp = self.client.post(
+                        "/api/coach/run",
+                        data={"max": "10", "cached_only": "on", "refresh": "on"},
+                    )
+                    self.assertEqual(resp.status_code, 200, resp.text)
+                    job_id = resp.json()["job_id"]
+                    deadline = time.time() + 15.0
+                    data = None
+                    while time.time() < deadline:
+                        data = self.client.get(f"/api/jobs/{job_id}").json()
+                        if data["status"] == "cancelled" and data["finished"]:
+                            break
+                        time.sleep(0.02)
+        finally:
+            FakeEngine.on_game = None
+
+        self.assertIsNotNone(data)
+        self.assertEqual(data["status"], "cancelled")
+        self.assertEqual(data["done"], 1)
+        self.assertEqual(len(FakeEngine.game_ids), 1)
 
 
 class GameApiTests(ApiTestBase):
@@ -2285,7 +2509,7 @@ class FrontendTests(ApiTestBase):
         html = resp.text
         self.assertIn("app.js?v=", html)
         self.assertIn("style.css?v=", html)
-        self.assertIn("v0.6.5", html)
+        self.assertIn("v0.6.6", html)
 
     def test_api_version(self):
         self.assertEqual(self.app.version, "0.4.8")

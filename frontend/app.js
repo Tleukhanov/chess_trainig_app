@@ -1,6 +1,6 @@
 // Chess Trainer Frontend — SPA на vanilla JS, потребляет /api/* эндпоинты.
 
-import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.6.5';
+import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.6.6';
 
 const state = {
   user: null,
@@ -229,6 +229,7 @@ function viewAuth(app) {
       showNav();
       await loadUser();
       navigate('dashboard');
+      startGlobalJobPolling();
     } catch (err) {
       fail(err.message);
     } finally {
@@ -245,6 +246,7 @@ function viewAuth(app) {
       showNav();
       await loadUser();
       navigate('dashboard');
+      startGlobalJobPolling();
     } catch (err) {
       fail(err.message);
     } finally {
@@ -267,6 +269,8 @@ function renderUserbox() {
       } catch { /* всё равно выходим */ }
       state.user = null;
       state.authMode = 'login';
+      stopGlobalJobPolling();
+      hideGlobalJobIndicator();
       Object.assign(state, {
         gameId: null, gameData: null, task: null, taskKey: null, taskResult: null,
         taskRevealed: false, taskExplanation: null, planLlmJobId: null,
@@ -283,6 +287,137 @@ function renderUserbox() {
     });
   } else {
     box.innerHTML = '';
+  }
+}
+
+// --- Глобальный индикатор анализа (в шапке, рядом с никнеймом) ---
+
+let globalJobTimer = null;
+let globalJobId = null;
+let globalJobSeenAt = 0;
+let globalJobToken = 0;
+let cancelledJobId = null;
+
+function formatEta(seconds) {
+  if (seconds == null || !isFinite(seconds) || seconds < 0) return '';
+  const total = Math.max(0, Math.round(seconds));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+// Elapsed по серверному старту задачи; при рассинхроне часов — локальный таймер.
+function jobElapsedSeconds(job, fallbackStart) {
+  const started = job && Number(job.started);
+  if (started && started > 0) {
+    const sec = Date.now() / 1000 - started;
+    if (sec >= 0 && sec < 7 * 24 * 3600) return sec;
+  }
+  return Math.max(0, (Date.now() - fallbackStart) / 1000);
+}
+
+// ETA по текущему темпу: прошло / сделано * осталось.
+function jobEtaSeconds(done, total, elapsedSeconds) {
+  const d = Number(done) || 0;
+  const t = Number(total) || 0;
+  if (d <= 0 || t <= d) return null;
+  return Math.max(0, Math.round((elapsedSeconds / d) * (t - d)));
+}
+
+function ensureGlobalJobIndicator() {
+  let el = document.getElementById('global-job-indicator');
+  if (el) return el;
+  const right = document.querySelector('.topbar-right');
+  if (!right) return null;
+  el = document.createElement('a');
+  el.id = 'global-job-indicator';
+  el.className = 'global-job';
+  el.href = '#';
+  el.hidden = true;
+  el.setAttribute('role', 'status');
+  el.setAttribute('aria-live', 'polite');
+  el.title = 'Открыть экран анализа';
+  el.addEventListener('click', e => {
+    e.preventDefault();
+    navigate('coach');
+  });
+  const userbox = document.getElementById('userbox');
+  if (userbox && userbox.parentNode === right) right.insertBefore(el, userbox);
+  else right.appendChild(el);
+  return el;
+}
+
+function hideGlobalJobIndicator() {
+  const el = document.getElementById('global-job-indicator');
+  if (el) {
+    el.hidden = true;
+    el.textContent = '';
+  }
+  globalJobId = null;
+  globalJobSeenAt = 0;
+}
+
+function paintGlobalJobIndicator(job) {
+  const el = ensureGlobalJobIndicator();
+  if (!el) return;
+  if (job.id !== globalJobId) {
+    globalJobId = job.id;
+    globalJobSeenAt = Date.now();
+  }
+  const done = Number(job.done) || 0;
+  const total = Number(job.total) || 0;
+  const parts = [`Анализ: ${done}/${total}`];
+  if (job.phase) parts.push(job.phase);
+  const eta = jobEtaSeconds(done, total, jobElapsedSeconds(job, globalJobSeenAt));
+  if (eta != null) parts.push('~' + formatEta(eta));
+  el.textContent = parts.join(' · ');
+  el.hidden = false;
+}
+
+async function pollGlobalJob() {
+  if (!state.user) {
+    stopGlobalJobPolling();
+    hideGlobalJobIndicator();
+    return;
+  }
+  const token = globalJobToken;
+  let job;
+  try {
+    job = await api('/api/jobs/active');
+  } catch (err) {
+    // 404 = активной задачи нет (или сессия кончилась) — гасим индикатор.
+    if (token !== globalJobToken) return;
+    if (err && (err.status === 404 || isSessionError(err))) {
+      stopGlobalJobPolling();
+      hideGlobalJobIndicator();
+    }
+    return;
+  }
+  // Пока шёл запрос, индикатор могли погасить (задача завершилась/отменена).
+  if (token !== globalJobToken) return;
+  if (!job || !job.id || job.status !== 'running') {
+    stopGlobalJobPolling();
+    hideGlobalJobIndicator();
+    return;
+  }
+  paintGlobalJobIndicator(job);
+}
+
+function startGlobalJobPolling() {
+  if (!state.user) return;
+  ensureGlobalJobIndicator();
+  if (globalJobTimer) return;
+  pollGlobalJob();
+  globalJobTimer = setInterval(pollGlobalJob, 3000);
+}
+
+function stopGlobalJobPolling() {
+  globalJobToken++;
+  if (globalJobTimer) {
+    clearInterval(globalJobTimer);
+    globalJobTimer = null;
   }
 }
 
@@ -3642,16 +3777,23 @@ async function viewCoach(app) {
             <div class="form-group"><label>Тип <select name="perf"><option value="rapid" selected>rapid</option><option value="blitz">blitz</option><option value="classical">classical</option><option value="bullet">bullet</option></select></label></div>
           </div>
           <div class="form-row">
-            <div class="form-group"><label>Глубина <input type="number" name="depth" value="14" min="1" max="30"></label></div>
-            <div class="form-group"><label>Multipv <input type="number" name="multipv" value="3" min="1" max="10"></label></div>
+            <div class="form-group">
+              <label for="coach-profile">Профиль анализа</label>
+              <select name="profile" id="coach-profile">
+                <option value="quick" selected>Быстро (10 / 1)</option>
+                <option value="standard">Стандарт (12 / 2)</option>
+                <option value="deep">Глубоко (14 / 3)</option>
+              </select>
+              <div class="form-hint">Быстро — рекомендуем для массового анализа; Глубоко — для разбора одной партии.</div>
+            </div>
           </div>
           <div class="checkbox"><input type="checkbox" name="cached_only" id="cached_only"><label for="cached_only">Только из кеша (не ходить в сеть)</label></div>
           <div class="checkbox"><input type="checkbox" name="refresh" id="refresh"><label for="refresh">Переанализировать всё заново</label></div>
           <div class="card" style="background:var(--c-bg-soft);font-size:13px;line-height:1.6">
-            <b>💡 Какую глубину выбрать?</b><br>
-            До 1500 — хватит глубины 8: ищи зевки и висячие фигуры.<br>
-            1500–2000 — ставь 10–12: уже видна тактика и слабые поля.<br>
-            2000+ — бери 12–14 и Multipv 2: сравнивай свою идею с первой линией.<br>
+            <b>💡 Какой профиль выбрать?</b><br>
+            <b>Быстро</b> (глубина 10, 1 линия) — 50 партий примерно за 2–5 минут.<br>
+            <b>Стандарт</b> (глубина 12, 2 линии) — баланс скорости и точности.<br>
+            <b>Глубоко</b> (глубина 14, 3 линии) — для разбора одной партии.<br>
             <span style="color:var(--c-text-muted)">Глубже 14 на облаке не уедет — для этого будет воркер на VPS.</span>
           </div>
           <button type="submit" class="btn btn-primary" style="width:fit-content">Запустить</button>
@@ -3671,6 +3813,7 @@ async function viewCoach(app) {
     const fd = new FormData(e.target);
     try {
       const result = await apiPost('/api/coach/run', fd);
+      startGlobalJobPolling();
       showJob(app, result.job_id);
       document.getElementById('job-container').scrollIntoView({ behavior: 'smooth', block: 'start' });
     } catch (err) {
@@ -3694,6 +3837,7 @@ async function viewCoach(app) {
           btn.disabled = true;
           btn.textContent = 'Идёт анализ…';
         }
+        startGlobalJobPolling();
         showJob(app, active.id);
       }
       break;
@@ -3719,17 +3863,34 @@ function unlockCoachButton() {
 function showJob(app, jobId) {
   const container = document.getElementById('job-container');
   if (!container) return;
+  if (cancelledJobId !== jobId) cancelledJobId = null;
   container.innerHTML = `
     <div class="card job-card" id="job-card" style="margin-top:16px">
       <h3>Задача <code>${jobId.slice(0, 8)}</code> — <span id="job-status">RUNNING</span></h3>
-      <div class="job-progress"><div class="job-progress-bar" id="progress-bar" style="width:0%"></div></div>
+      <div class="job-progress-row" id="job-progress-row">
+        <div class="job-progress"><div class="job-progress-bar" id="progress-bar" style="width:0%"></div></div>
+        <button type="button" class="btn btn-secondary job-cancel-btn" id="job-cancel">Отменить</button>
+      </div>
       <div class="job-phase" id="job-phase">Загрузка...</div>
       <div class="job-detail" id="job-detail">0 / 0</div>
       <div id="job-eta" style="color:var(--c-text-muted);font-size:13px"></div>
       <div id="job-quote" style="margin-top:10px;font-style:italic;color:var(--c-text-muted);font-size:13px;line-height:1.6"></div>
       <div id="job-error"></div>
       <div id="job-summary"></div>
+    </div>
+    <div class="card job-training" id="job-training" style="margin-top:12px">
+      <h3>Пока идёт анализ, можно тренироваться</h3>
+      <p>План и слабые дебюты строятся по уже проанализированным партиям — результаты сохраняются после каждой партии, так что можно не ждать конца анализа.</p>
+      <div class="job-training-links">
+        <a href="#" class="btn btn-secondary" data-view="opening">Дебюты</a>
+        <a href="#" class="btn btn-secondary" data-view="middlegame">Миттельшпиль</a>
+        <a href="#" class="btn btn-secondary" data-view="task">Задача</a>
+      </div>
     </div>`;
+  bindLinks(container);
+
+  const cancelBtn = document.getElementById('job-cancel');
+  if (cancelBtn) cancelBtn.addEventListener('click', () => cancelCoachJob(jobId));
 
   // Цитаты, пока движок считает — чтобы не было скучно.
   const QUOTES = [
@@ -3767,6 +3928,12 @@ function showJob(app, jobId) {
     if (state.currentView !== 'coach') { clearInterval(state.timers.coach); state.timers.coach = null; stopQuote(); return; }
     try {
       const j = await api('/api/jobs/' + jobId);
+      if (cancelledJobId === jobId) {
+        clearInterval(state.timers.coach);
+        state.timers.coach = null;
+        stopQuote();
+        return;
+      }
       pollFails = 0;
       const bar = document.getElementById('progress-bar');
       const phase = document.getElementById('job-phase');
@@ -3781,10 +3948,9 @@ function showJob(app, jobId) {
       const etaBox = document.getElementById('job-eta');
       if (etaBox) {
         if (j.done > 0 && j.total > j.done && j.status === 'running') {
-          const elapsed = (Date.now() - startedAt) / 1000;
-          const remain = Math.round(elapsed / j.done * (j.total - j.done));
-          const mm = Math.floor(remain / 60), ss = remain % 60;
-          etaBox.textContent = `⏳ Прошло ${Math.floor(elapsed / 60)}:${String(Math.floor(elapsed % 60)).padStart(2, '0')} · осталось примерно ${mm}:${String(ss).padStart(2, '0')}`;
+          const elapsed = jobElapsedSeconds(j, startedAt);
+          const remain = jobEtaSeconds(j.done, j.total, elapsed);
+          etaBox.textContent = `⏳ Прошло ${formatEta(elapsed)} · осталось примерно ${formatEta(remain)}`;
         } else if (j.total > 0 && j.done === 0) {
           etaBox.textContent = `⏳ Греем движок, первая партия почти готова…`;
         } else {
@@ -3799,13 +3965,27 @@ function showJob(app, jobId) {
         state.timers.coach = null;
         stopQuote();
         unlockCoachButton();
+        hideJobTrainingHint();
+        stopGlobalJobPolling();
+        hideGlobalJobIndicator();
         document.getElementById('job-summary').innerHTML = `<div class="alert alert-success" style="margin-top:12px">${esc(j.summary)}</div>`;
         if (state.currentView === 'coach') setTimeout(() => navigate('coach'), 1500);
+      } else if (j.status === 'cancelled') {
+        clearInterval(state.timers.coach);
+        state.timers.coach = null;
+        stopQuote();
+        unlockCoachButton();
+        markJobCancelled();
+        stopGlobalJobPolling();
+        hideGlobalJobIndicator();
       } else if (j.status === 'error') {
         clearInterval(state.timers.coach);
         state.timers.coach = null;
         stopQuote();
         unlockCoachButton();
+        hideJobTrainingHint();
+        stopGlobalJobPolling();
+        hideGlobalJobIndicator();
       }
     } catch (pollErr) {
       const msg = String((pollErr && pollErr.message) || '');
@@ -3815,6 +3995,9 @@ function showJob(app, jobId) {
         state.timers.coach = null;
         stopQuote();
         unlockCoachButton();
+        hideJobTrainingHint();
+        stopGlobalJobPolling();
+        hideGlobalJobIndicator();
         const errBox = document.getElementById('job-error');
         if (errBox) errBox.innerHTML = `<div class="job-error">Задача потеряна (сервер перезапустился). Можно запускать заново.</div>`;
         const st = document.getElementById('job-status');
@@ -3835,6 +4018,65 @@ function showJob(app, jobId) {
       }
     }
   }, 1000);
+}
+
+// Отмена задачи анализа из карточки: сервер помечает job cancelled,
+// рабочий поток останавливается после текущей партии.
+async function cancelCoachJob(jobId) {
+  const btn = document.getElementById('job-cancel');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Отменяем…';
+  }
+  try {
+    await apiPost('/api/jobs/' + jobId + '/cancel', new FormData());
+  } catch (err) {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = 'Отменить';
+    }
+    showToast((err && err.message) || 'Не удалось отменить анализ', 'error');
+    return;
+  }
+  cancelledJobId = jobId;
+  if (state.timers.coach) {
+    clearInterval(state.timers.coach);
+    state.timers.coach = null;
+  }
+  if (state.timers.quote) {
+    clearInterval(state.timers.quote);
+    state.timers.quote = null;
+  }
+  unlockCoachButton();
+  markJobCancelled();
+  stopGlobalJobPolling();
+  hideGlobalJobIndicator();
+  showToast('Анализ отменён');
+}
+
+function markJobCancelled() {
+  const row = document.getElementById('job-progress-row');
+  if (row) row.style.display = 'none';
+  const status = document.getElementById('job-status');
+  if (status) status.textContent = 'CANCELLED';
+  const phase = document.getElementById('job-phase');
+  if (phase) phase.textContent = 'Анализ отменён';
+  const detail = document.getElementById('job-detail');
+  if (detail) detail.textContent = '';
+  const eta = document.getElementById('job-eta');
+  if (eta) eta.textContent = '';
+  const errBox = document.getElementById('job-error');
+  if (errBox) errBox.innerHTML = '';
+  hideJobTrainingHint();
+  const summary = document.getElementById('job-summary');
+  if (summary) {
+    summary.innerHTML = '<div class="alert alert-info" style="margin-top:12px">Анализ отменён. Уже проанализированные партии сохранены.</div>';
+  }
+}
+
+function hideJobTrainingHint() {
+  const hint = document.getElementById('job-training');
+  if (hint) hint.remove();
 }
 
 // --- Tools (репертуар / соперник / человечность / турнир / FIDE) ---
@@ -4604,6 +4846,7 @@ async function init() {
   await loadUser();
   startTrackPing();
   navigate('dashboard');
+  startGlobalJobPolling();
 }
 
 init();

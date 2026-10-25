@@ -178,6 +178,14 @@ def _load_job_meta(db_path: Path, job_id: str) -> dict[str, Any] | None:
 JOBS_GLOBAL_LIMIT = 1
 JOBS_PER_USER_LIMIT = 1
 
+#: Пресеты глубины анализа: профиль -> (depth, multipv). Default-профиль
+#: «quick» экономит время на 50 партиях, «deep» — прежнее поведение (14/3).
+_COACH_PROFILES: dict[str, tuple[int, int]] = {
+    "quick": (10, 1),
+    "standard": (12, 2),
+    "deep": (14, 3),
+}
+
 
 def _running_jobs_count() -> int:
     with _JOBS_LOCK:
@@ -231,12 +239,20 @@ def _run_coach_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None:
                 unanalyzed = set(db.get_unanalyzed(ids))
                 target = [g for g in qualified if g.id in unanalyzed]
 
+            # Свежие партии анализируем первыми: пользователь быстрее видит
+            # результаты последних игр, а старые догоняются в фоне.
+            target.sort(key=lambda g: g.created_at or 0, reverse=True)
+
             job.total = len(target)
             job.phase = "Анализ движком"
 
             if target:
                 failed = 0
                 for i, game in enumerate(target, 1):
+                    # Отмена из /api/jobs/{id}/cancel: проверяем статус перед
+                    # каждой партией, чтобы не начинать новую порцию работы.
+                    if job.status != "running":
+                        break
                     # Движок открываем заново на каждую партию: свежий процесс
                     # не тащит утечки памяти/состояния от прошлой партии, а
                     # try/except гарантирует, что одна битая партия (NaN, обрыв
@@ -2788,6 +2804,7 @@ def create_api(
         perf: str = Form("rapid"),
         depth: int = Form(14),
         multipv: int = Form(3),
+        profile: str = Form(""),
         cached_only: str | None = Form(None),
         refresh: str | None = Form(None),
         since: int | None = Form(None),
@@ -2795,6 +2812,16 @@ def create_api(
         user = _current_user(app.state.db_path, request)
         if not user:
             raise HTTPException(404, "No current user")
+        profile = (profile or "").strip().lower()
+        if profile:
+            preset = _COACH_PROFILES.get(profile)
+            if preset is None:
+                raise HTTPException(
+                    400,
+                    "profile должен быть quick, standard или deep "
+                    f"(получено {profile!r})",
+                )
+            depth, multipv = preset
         if not 1 <= max <= 200:
             raise HTTPException(400, "max должен быть от 1 до 200")
         if not 1 <= depth <= 30:
@@ -2864,6 +2891,31 @@ def create_api(
             stale["error"] = "Анализ прерван: сервер перезапустился"
             return stale
         return meta
+
+    @app.post("/api/jobs/{job_id}/cancel")
+    def api_job_cancel(job_id: str, request: Request):
+        """Отмена фоновой задачи: только владелец, идемпотентно.
+
+        Помечает job как ``cancelled``; рабочий поток проверяет статус перед
+        каждой партией и выходит из цикла. Уже завершённая задача возвращает
+        текущий статус без ошибки.
+        """
+        user = _current_user(app.state.db_path, request)
+        job = _get_job(job_id)
+        if job is None or user is None or job.user != user["nick"]:
+            raise HTTPException(404, "Job not found")
+        with _JOBS_LOCK:
+            was_running = job.status == "running"
+            if was_running:
+                job.status = "cancelled"
+                job.finished = time.time()
+                if not job.summary:
+                    job.summary = "Анализ отменён"
+            current = job.status
+        if was_running:
+            _persist_job(app.state.db_path, job)
+            return {"ok": True}
+        return {"ok": True, "status": current}
 
     # --- Games (просмотр партий) ---
     def _game_summary(g) -> dict:
