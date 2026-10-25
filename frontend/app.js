@@ -1,10 +1,15 @@
 // Chess Trainer Frontend — SPA на vanilla JS, потребляет /api/* эндпоинты.
 
-import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.7.1';
+import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.7.2';
 
 const state = {
   user: null,
+  isAdmin: false,
   currentView: 'dashboard',
+  // План дня: грузится один раз при открытии дашборда, toggle обновляет
+  // только карточку (см. bindDayPlan/repaintDayPlan).
+  dayplan: null,
+  dayplanError: false,
   timers: { coach: null, task: null, llm: null, tool: null, opening: null, middlegame: null, quote: null, theory: null },
   gamesFilter: 'all',
   gameId: null,
@@ -142,7 +147,7 @@ function setupTheme() {
 
 // --- Navigation ---
 
-const views = ['dashboard', 'overview', 'plan', 'progress', 'games', 'drills', 'task', 'opening', 'middlegame', 'coach', 'tools', 'users'];
+const views = ['dashboard', 'overview', 'plan', 'progress', 'games', 'drills', 'task', 'opening', 'middlegame', 'coach', 'tools', 'users', 'admin'];
 
 function clearAllTimers() {
   if (state.taskPlayTimer) { clearInterval(state.taskPlayTimer); state.taskPlayTimer = null; }
@@ -202,6 +207,12 @@ function hideNav() {
 function showNav() {
   const nav = document.getElementById('nav');
   if (nav) nav.style.display = '';
+}
+
+// Пункт «Админ» показываем только администратору (is_admin из /api/user/current).
+function syncAdminNav() {
+  const link = document.getElementById('nav-admin');
+  if (link) link.hidden = !state.isAdmin;
 }
 
 function viewAuth(app) {
@@ -293,9 +304,11 @@ function renderUserbox() {
         await apiPost('/api/auth/logout', new FormData());
       } catch { /* всё равно выходим */ }
       state.user = null;
+      state.isAdmin = false;
       state.authMode = 'login';
       stopGlobalJobPolling();
       hideGlobalJobIndicator();
+      syncAdminNav();
       Object.assign(state, {
         gameId: null, gameData: null, task: null, taskKey: null, taskResult: null,
         taskRevealed: false, taskExplanation: null, planLlmJobId: null,
@@ -455,12 +468,14 @@ async function render(view) {
   const auth = await authStatus();
   if (!auth.logged_in) {
     state.user = null;
+    state.isAdmin = false;
     hideNav();
     renderUserbox();
     viewAuth(app);
     return;
   }
   showNav();
+  syncAdminNav();
   app.innerHTML = '<div class="card"><p>Загрузка...</p></div>';
 
   try {
@@ -477,6 +492,7 @@ async function render(view) {
       case 'coach': await viewCoach(app); break;
       case 'tools': await viewTools(app); break;
       case 'users': await viewUsers(app); break;
+      case 'admin': await viewAdmin(app); break;
       default: app.innerHTML = '<div class="card"><p>Неизвестная страница</p></div>';
     }
   } catch (err) {
@@ -486,6 +502,188 @@ async function render(view) {
     }
     app.innerHTML = `<div class="alert alert-error">${esc(err.message)}</div>`;
   }
+}
+
+// --- План дня (дашборд) ---
+
+const DAYPLAN_KIND_RU = {
+  opening: 'дебют',
+  middlegame: 'миттельшпиль',
+  endgame: 'эндшпиль',
+  task: 'задача',
+  review: 'разбор',
+};
+
+// Один запрос на открытие дашборда; toggle обновляет state.dayplan.
+async function fetchDayPlan() {
+  state.dayplanError = false;
+  try {
+    state.dayplan = await api('/api/dayplan');
+  } catch (err) {
+    if (isSessionError(err)) throw err;
+    state.dayplan = null;
+    state.dayplanError = true;
+  }
+  return state.dayplan;
+}
+
+function dayPlanTaskHtml(task) {
+  const done = !!task.done;
+  const kind = DAYPLAN_KIND_RU[task.kind] || task.kind || '';
+  return `
+    <div class="dayplan-task" style="display:flex;gap:10px;align-items:flex-start;padding:10px 0;border-top:1px solid var(--c-border)">
+      <input type="checkbox" data-dayplan-toggle="${esc(task.id)}" ${done ? 'checked' : ''}
+             aria-label="Отметить задачу: ${esc(task.title || '')}"
+             style="margin-top:3px;width:18px;height:18px;flex:none;cursor:pointer">
+      <div style="flex:1;min-width:0">
+        <div style="font-weight:600;${done ? 'text-decoration:line-through;opacity:.65' : ''}">
+          ${kind ? `<span class="badge badge-neutral" style="margin-right:6px">${esc(kind)}</span>` : ''}${esc(task.title || '')}
+        </div>
+        ${task.why ? `<div style="font-size:12px;color:var(--c-text-muted);margin-top:2px">${esc(task.why)}</div>` : ''}
+      </div>
+      <button type="button" class="btn btn-secondary" data-dayplan-start="${esc(task.id)}"
+              style="font-size:12px;padding:4px 10px;flex:none">Начать</button>
+    </div>`;
+}
+
+function dayPlanCardHtml(dp) {
+  if (!dp) return '';
+  const total = Number(dp.total) || 0;
+  const done = Number(dp.done) || 0;
+  const minutes = Number(dp.minutes) || 0;
+  const streak = Number(dp.streak_days) || 0;
+  const pct = total ? Math.max(0, Math.min(100, Math.round(done / total * 100))) : 0;
+  const tasks = Array.isArray(dp.tasks) ? dp.tasks : [];
+  const empty = `
+    <p style="color:var(--c-text-muted);font-size:13px;margin:10px 0 0">
+      На сегодня задач нет — запусти анализ, и тренер соберёт план.
+      <a href="#" data-view="coach">Запустить анализ →</a>
+    </p>`;
+  return `
+    <div class="card" id="dayplan-card">
+      <div class="card-header">
+        <span class="card-title">План на день</span>
+        <span class="badge badge-neutral">${esc(dp.date || '')}</span>
+      </div>
+      <div style="display:flex;align-items:baseline;gap:16px;flex-wrap:wrap">
+        <div style="font-size:26px;font-weight:700">${done} / ${total}</div>
+        <div style="color:var(--c-text-muted);font-size:13px">${minutes} мин</div>
+        <span class="badge ${streak > 0 ? 'badge-good' : 'badge-neutral'}">серия: ${streak} дн.</span>
+        <div style="margin-left:auto;font-size:12px;color:var(--c-text-muted)">выполнено ${pct}%</div>
+      </div>
+      <div class="job-progress" style="margin:8px 0 4px"><div class="job-progress-bar" style="width:${pct}%"></div></div>
+      ${tasks.length ? tasks.map(dayPlanTaskHtml).join('') : empty}
+    </div>`;
+}
+
+// Перерисовываем только карточку плана — без перезагрузки страницы.
+function repaintDayPlan(app) {
+  const el = app.querySelector('#dayplan-card');
+  if (!el) return;
+  const holder = document.createElement('div');
+  holder.innerHTML = dayPlanCardHtml(state.dayplan);
+  const fresh = holder.firstElementChild;
+  if (!fresh) { el.remove(); return; }
+  el.replaceWith(fresh);
+  bindLinks(fresh);
+  bindDayPlan(app);
+}
+
+async function toggleDayPlanTask(app, taskId, done) {
+  if (!state.dayplan || !taskId) return;
+  try {
+    state.dayplan = await api('/api/dayplan/toggle', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ date: state.dayplan.date, task_id: taskId, done }),
+    });
+  } catch (err) {
+    if (isSessionError(err)) { handleSessionExpired(); return; }
+    showToast(err.message, 'error');
+  }
+  repaintDayPlan(app);
+}
+
+async function startDayPlanTask(btn, task) {
+  const action = (task && task.action) || {};
+  const target = String(action.view || '');
+  if (target === 'opening') {
+    const color = action.player_color === 'чёрные' || action.color === 'black' ? 'black' : 'white';
+    const old = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = '…';
+    try {
+      const res = await api('/api/opening/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ style: 'universal', color, human: true }),
+      });
+      startOpeningSession(res);
+      navigate('opening');
+    } catch (err) {
+      if (isSessionError(err)) { handleSessionExpired(); return; }
+      showToast(err.message, 'error');
+      btn.disabled = false;
+      btn.textContent = old;
+    }
+    return;
+  }
+  // action.view = review — это не отдельный экран, а вкладка «Разбор» в Инструментах.
+  if (target === 'review') {
+    state.tool = 'review';
+    navigate('tools');
+    return;
+  }
+  if (views.includes(target)) {
+    navigate(target);
+    return;
+  }
+  showToast('Для этой задачи пока нет экрана', 'error');
+}
+
+function bindDayPlan(app) {
+  app.querySelectorAll('[data-dayplan-toggle]').forEach(box => {
+    box.addEventListener('change', () => {
+      box.disabled = true;
+      toggleDayPlanTask(app, box.dataset.dayplanToggle, box.checked)
+        .catch(err => showToast(err.message, 'error'));
+    });
+  });
+  app.querySelectorAll('[data-dayplan-start]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const id = btn.dataset.dayplanStart;
+      const tasks = (state.dayplan && Array.isArray(state.dayplan.tasks)) ? state.dayplan.tasks : [];
+      const task = tasks.find(item => String(item.id) === id);
+      if (!task) return;
+      startDayPlanTask(btn, task).catch(err => showToast(err.message, 'error'));
+    });
+  });
+}
+
+// Компактный онбординг: ника нет/партий нет/плана нет.
+function onboardingStepsHtml(plan, dayplan) {
+  const noGames = !plan || !Number(plan.games);
+  const noPlan = !state.dayplanError && (!dayplan || !Number(dayplan.total));
+  if (!noGames && !noPlan) return '';
+  const hasNick = !!(state.user && state.user.lichess);
+  const hasAnalysis = !!(plan && Number(plan.games) > 0);
+  const hasPlan = !!(dayplan && Number(dayplan.total) > 0);
+  const step = (num, title, ok, text, view, action) => `
+    <div style="flex:1;min-width:150px;padding:10px;border:1px solid var(--c-border);border-radius:6px;${ok ? 'background:var(--c-badge-good-bg)' : ''}">
+      <div style="font-size:11px;color:var(--c-text-muted)">шаг ${num}</div>
+      <div style="font-weight:600">${title}${ok ? ' ✓' : ''}</div>
+      <div style="font-size:12px;color:var(--c-text-muted);margin:2px 0 6px">${text}</div>
+      ${ok ? '' : `<a href="#" class="btn btn-link" data-view="${view}" style="font-size:12px">${action} →</a>`}
+    </div>`;
+  return `
+    <div class="card">
+      <div class="card-header"><span class="card-title">С чего начать</span><span class="badge badge-blue">3 шага</span></div>
+      <div style="display:flex;gap:12px;flex-wrap:wrap">
+        ${step(1, 'Lichess-ник', hasNick, hasNick ? 'ник привязан' : 'укажи ник в профиле', 'users', 'Профили')}
+        ${step(2, 'Анализ партий', hasAnalysis, hasAnalysis ? 'партии разобраны' : 'загрузи и разбери партии', 'coach', 'Анализ')}
+        ${step(3, 'План дня', hasPlan, hasPlan ? 'план собран' : 'получи задачи на день', 'plan', 'План')}
+      </div>
+    </div>`;
 }
 
 async function viewDashboard(app) {
@@ -501,14 +699,17 @@ async function viewDashboard(app) {
     return;
   }
 
-  const [plan, progress, task] = await Promise.all([
+  const [plan, progress, task, dayplan] = await Promise.all([
     api('/api/plan').catch(() => null),
     api('/api/progress?windows=5').catch(() => null),
     api('/api/task/today').catch(() => null),
+    fetchDayPlan(),
   ]);
 
   if (!plan) {
     app.innerHTML = `
+      ${onboardingStepsHtml(plan, dayplan)}
+      ${dayPlanCardHtml(dayplan)}
       <div class="onboarding card">
         <div class="empty-icon">🏁</div>
         <h1>Пока нет данных</h1>
@@ -516,6 +717,7 @@ async function viewDashboard(app) {
         <a href="#" class="btn btn-primary" data-view="coach">Запустить анализ</a>
       </div>`;
     bindLinks(app);
+    bindDayPlan(app);
     return;
   }
 
@@ -615,6 +817,8 @@ async function viewDashboard(app) {
 
   app.innerHTML = `
     <div class="card-header"><h1>Дашборд</h1><span class="badge badge-blue">${esc(state.user.nick)}</span></div>
+    ${onboardingStepsHtml(plan, dayplan)}
+    ${dayPlanCardHtml(dayplan)}
     ${taskCardHtml}
     <div class="grid grid-4">
       <div class="card stat"><div class="stat-value">${plan.games}</div><div class="stat-label">Партий</div></div>
@@ -655,6 +859,7 @@ async function viewDashboard(app) {
       <a href="#" class="btn btn-primary" data-view="coach">Запустить анализ →</a>
     </div>`;
   bindLinks(app);
+  bindDayPlan(app);
 
   // Кнопка «Тренировать» у слабого дебюта: стартует тренажёр дебютов
   // с нужным цветом, а не перекидывает автоматически.
@@ -1046,20 +1251,65 @@ function planLlmPoll(app, jobId) {
   }, 700);
 }
 
+// История активности по дням: две тонкие полоски на день (минуты и задачи).
+function dailyHistoryCardHtml(days) {
+  const items = (Array.isArray(days) ? days : []).slice(-14);
+  if (!items.length) return '';
+  const maxMinutes = Math.max(1, ...items.map(d => Number(d.minutes) || 0));
+  const totalMinutes = items.reduce((sum, d) => sum + (Number(d.minutes) || 0), 0);
+  const totalDone = items.reduce((sum, d) => sum + (Number(d.tasks_done) || 0), 0);
+  const activeDays = items.filter(d => (Number(d.tasks_done) || 0) > 0 || (Number(d.minutes) || 0) > 0).length;
+  const columns = items.map(day => {
+    const minutes = Number(day.minutes) || 0;
+    const done = Number(day.tasks_done) || 0;
+    const total = Number(day.tasks_total) || 0;
+    const minHeight = minutes > 0 ? Math.max(3, Math.round(minutes / maxMinutes * 56)) : 2;
+    const taskHeight = total > 0 ? Math.max(done > 0 ? 3 : 2, Math.round(done / total * 56)) : 2;
+    const label = day.date ? `${day.date.slice(8, 10)}.${day.date.slice(5, 7)}` : '';
+    const tip = `${day.date || ''}: ${minutes} мин, задачи ${done}/${total}`;
+    return `
+      <div style="flex:1;min-width:0;display:flex;flex-direction:column;align-items:center;gap:3px" title="${esc(tip)}">
+        <div style="width:100%;height:56px;display:flex;align-items:flex-end;justify-content:center;gap:2px">
+          <div style="width:45%;max-width:9px;height:${minHeight}px;background:${minutes > 0 ? 'var(--c-btn-primary)' : 'var(--c-border)'};border-radius:2px 2px 0 0"></div>
+          <div style="width:45%;max-width:9px;height:${taskHeight}px;background:${total > 0 ? 'var(--c-link)' : 'var(--c-border)'};border-radius:2px 2px 0 0"></div>
+        </div>
+        <div style="font-size:9px;color:var(--c-text-muted);white-space:nowrap">${esc(label)}</div>
+      </div>`;
+  }).join('');
+  return `
+    <div class="card">
+      <div class="card-header"><span class="card-title">Последние 14 дней</span>
+        <span class="badge badge-neutral">${totalMinutes} мин · задач ${totalDone}</span></div>
+      <div style="display:flex;gap:4px;align-items:flex-end">${columns}</div>
+      <div style="display:flex;gap:14px;margin-top:8px;font-size:11px;color:var(--c-text-muted);flex-wrap:wrap">
+        <span><span style="display:inline-block;width:8px;height:8px;background:var(--c-btn-primary);border-radius:2px;margin-right:4px"></span>минуты</span>
+        <span><span style="display:inline-block;width:8px;height:8px;background:var(--c-link);border-radius:2px;margin-right:4px"></span>задачи</span>
+        <span>активных дней: ${activeDays} / ${items.length}</span>
+      </div>
+    </div>`;
+}
+
 async function viewProgress(app) {
   if (!state.user) {
     app.innerHTML = '<div class="onboarding card"><div class="empty-icon">📈</div><h1>Нет данных</h1><p>Профиль не выбран.</p></div>';
     return;
   }
-  const pr = await api('/api/progress?windows=5').catch(() => null);
+  const [pr, daily] = await Promise.all([
+    api('/api/progress?windows=5').catch(() => null),
+    api('/api/progress/daily?days=14').catch(() => null),
+  ]);
   if (!pr) {
+    const hasActivity = Array.isArray(daily) && daily.some(
+      d => (Number(d.tasks_done) || 0) > 0 || (Number(d.minutes) || 0) > 0
+    );
     app.innerHTML = `
       <div class="onboarding card">
         <div class="empty-icon">📈</div>
         <h1>Пока нет данных</h1>
         <p>Зарегистрировался — запусти анализ, чтобы увидеть прогресс по окнам.</p>
         <a href="#" class="btn btn-primary" data-view="coach">Запустить анализ</a>
-      </div>`;
+      </div>
+      ${hasActivity ? dailyHistoryCardHtml(daily) : ''}`;
     bindLinks(app);
     return;
   }
@@ -1078,6 +1328,7 @@ async function viewProgress(app) {
 
   app.innerHTML = `
     <div class="card-header"><h1>Прогресс</h1><span class="badge badge-blue">${esc(state.user.nick)}</span></div>
+    ${dailyHistoryCardHtml(daily)}
     <div class="card">
       <div class="card-header"><span class="card-title">Таблица окон (${pr.windows} окон, ${pr.games} партий)</span></div>
       <div class="table-wrap"><table>
@@ -1278,6 +1529,13 @@ function drawGameDetail(app) {
   const animFrom = lastMove[0] || '';
   const animTo = lastMove[1] || '';
 
+  // Значок ошибки/лучшего хода на клетке последнего полухода (данные /review).
+  const lastReviewEntry = ply > 0 ? reviewMoves[ply - 1] : null;
+  const lastReviewBadge = lastReviewEntry ? reviewBadge(lastReviewEntry.badge) : '';
+  const boardErrors = lastReviewBadge && lastMove[1] && BOARD_ERROR_BADGES.has(lastReviewBadge)
+    ? [{ square: lastMove[1], kind: lastReviewBadge }]
+    : [];
+
   const res = game.result_for_user || 'draw';
   const resBadge = res === 'win' ? 'badge-good' : res === 'loss' ? 'badge-bad' : 'badge-neutral';
   const resLabel = res === 'win' ? 'Победа' : res === 'loss' ? 'Поражение' : 'Ничья';
@@ -1346,7 +1604,7 @@ function drawGameDetail(app) {
     <div style="margin-bottom:16px"><a href="#" class="btn btn-secondary" data-view="games">← К списку партий</a></div>
     <div class="grid game-layout">
       <div class="card">
-        ${boardHtml(fens[ply], { lastMove, animFrom, animTo, flip: game.user_color === 'black' })}
+        ${boardHtml(fens[ply], { lastMove, animFrom, animTo, flip: game.user_color === 'black', errors: boardErrors })}
         <div class="board-meta">
           <span class="badge badge-neutral">Ходят: ${turnLabel}</span>
           <span class="badge badge-blue">${esc(posLabel)}</span>
@@ -1534,6 +1792,12 @@ const REVIEW_CATEGORIES = [
 ];
 
 const REVIEW_BADGE_SET = new Set(REVIEW_BADGES);
+
+// Значки, которые доска рисует прямо на клетке (opts.errors в boardHtml).
+const BOARD_ERROR_BADGES = new Set([
+  'inaccuracy', 'mistake', 'blunder', 'missed_win',
+  'brilliant', 'great', 'best', 'book',
+]);
 
 function reviewBadge(badge) {
   return typeof badge === 'string' && REVIEW_BADGE_SET.has(badge) ? badge : '';
@@ -2023,7 +2287,7 @@ function clearGameKeyboard() {
 
 async function viewDrills(app) {
   if (!state.user) {
-    app.innerHTML = '<div class="onboarding card"><div class="empty-icon">🎯</div><h1>Нет ошибок</h1><p>Профиль не выбран.</p></div>';
+    app.innerHTML = '<div class="onboarding card"><div class="empty-icon">🎯</div><h1>Нет упражнений</h1><p>Профиль не выбран.</p></div>';
     return;
   }
   const params = new URLSearchParams({ min_drop: 15, min_win: 50 });
@@ -2033,7 +2297,7 @@ async function viewDrills(app) {
   const items = dr.items;
 
   app.innerHTML = `
-    <div class="card-header"><h1>Ваши ошибки</h1><span class="badge badge-blue">${esc(state.user.nick)}</span></div>
+    <div class="card-header"><h1>Упражнения</h1><span class="badge badge-blue">${esc(state.user.nick)}</span></div>
     <div class="card">
       <form id="drills-filter" class="form-row" style="gap:16px;align-items:flex-end">
         <div class="form-group"><label>Мин. потеря win% <input type="number" name="min_drop" step="0.1" value="${dr.min_drop}"></label></div>
@@ -2071,7 +2335,7 @@ async function viewDrillsWithParams(app, params) {
   const summary = dr.summary;
   const items = dr.items;
   app.innerHTML = `
-    <div class="card-header"><h1>Ваши ошибки</h1><span class="badge badge-blue">${esc(state.user.nick)}</span></div>
+    <div class="card-header"><h1>Упражнения</h1><span class="badge badge-blue">${esc(state.user.nick)}</span></div>
     <div class="card">
       <form id="drills-filter" class="form-row" style="gap:16px;align-items:flex-end">
         <div class="form-group"><label>Мин. потеря win% <input type="number" name="min_drop" step="0.1" value="${dr.min_drop}"></label></div>
@@ -2253,6 +2517,18 @@ function drawTask(app) {
       marks.push({ square: lineLast[1], kind: 'good' });
     }
   }
+  // После ответа: значок классификации на сыгранном ходе и «best» на клетке
+  // лучшего хода (если это не та же клетка). Без цифр.
+  const boardErrors = [];
+  if (answered && !explore && !inLine) {
+    const cls = String(task.classification || '');
+    if (playedMove && (cls === 'blunder' || cls === 'mistake' || cls === 'inaccuracy')) {
+      boardErrors.push({ square: playedMove[1], kind: cls });
+    }
+    if (bestMove && (!playedMove || bestMove[1] !== playedMove[1])) {
+      boardErrors.push({ square: bestMove[1], kind: 'best' });
+    }
+  }
   const colorLabel = task.user_color === 'white' ? 'белые' : 'чёрные';
   const clsBadge = answered && task.classification
     ? `<span class="badge ${task.classification === 'blunder' ? 'badge-bad' : 'badge-neutral'}">${esc(task.classification)}</span>`
@@ -2310,6 +2586,7 @@ function drawTask(app) {
           animTo: lineLast[1],
           arrows,
           marks,
+          errors: boardErrors,
         })}
         <div class="board-meta">
           <span class="badge badge-blue">${esc(task.date)}</span>
@@ -5425,6 +5702,80 @@ function openLichessManual() {
   form.querySelector('.track-manual-cancel').addEventListener('click', closeLichessManual);
 }
 
+// --- Админка: когорта игроков ---
+
+function cohortDeltaHtml(value) {
+  if (value == null || !Number.isFinite(Number(value))) return '<span style="color:var(--c-text-muted)">—</span>';
+  const num = Number(value);
+  const cls = num > 0 ? 'badge-good' : num < 0 ? 'badge-bad' : 'badge-neutral';
+  return `<span class="badge ${cls}">${num > 0 ? '+' : ''}${num}</span>`;
+}
+
+function cohortLastSeen(value) {
+  if (!value) return '—';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value).slice(0, 10);
+  return `${date.toLocaleDateString('ru-RU')} ${date.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })}`;
+}
+
+async function viewAdmin(app) {
+  if (!state.isAdmin) {
+    app.innerHTML = `
+      <div class="onboarding card">
+        <div class="empty-icon">🔒</div>
+        <h1>Только для админа</h1>
+        <p>Раздел с когортой игроков доступен администратору.</p>
+        <a href="#" class="btn btn-secondary" data-view="dashboard">На дашборд</a>
+      </div>`;
+    bindLinks(app);
+    return;
+  }
+
+  const cohort = await api('/api/admin/cohort?days=30');
+  const users = Array.isArray(cohort.users) ? cohort.users : [];
+  const s = cohort.summary || {};
+  const days = Number(cohort.days) || 30;
+
+  const summaryHtml = `
+    <div class="grid grid-3">
+      <div class="card stat"><div class="stat-value">${s.users != null ? s.users : users.length}</div><div class="stat-label">Участников</div></div>
+      <div class="card stat"><div class="stat-value">${s.active_users != null ? s.active_users : '—'}</div><div class="stat-label">Активных</div></div>
+      <div class="card stat"><div class="stat-value">${s.improved != null ? s.improved : '—'}</div><div class="stat-label">Улучшились</div></div>
+      <div class="card stat"><div class="stat-value">${s.avg_rating_delta != null ? (s.avg_rating_delta > 0 ? '+' : '') + fmt(s.avg_rating_delta, 1) : '—'}</div><div class="stat-label">Ср. Δ рейтинга</div></div>
+      <div class="card stat"><div class="stat-value">${s.avg_completion_pct != null ? fmt(s.avg_completion_pct, 1) + '%' : '—'}</div><div class="stat-label">Ср. план</div></div>
+      <div class="card stat"><div class="stat-value">${s.avg_minutes_per_day != null ? fmt(s.avg_minutes_per_day, 1) : '—'}</div><div class="stat-label">Мин/день</div></div>
+    </div>`;
+
+  const rows = users.map(row => {
+    const start = row.rating_start != null ? row.rating_start : '—';
+    const end = row.rating_end != null ? row.rating_end : '—';
+    const improved = row.improved ? ' <span class="badge badge-good">рост</span>' : '';
+    return `<tr>
+      <td>${esc(row.nick || '—')}${improved}</td>
+      <td class="num">${row.days_active != null ? row.days_active : '—'}</td>
+      <td class="num">${row.avg_minutes_per_day != null ? fmt(row.avg_minutes_per_day, 1) : '—'}</td>
+      <td class="num">${row.completion_pct != null ? fmt(row.completion_pct, 1) + '%' : '—'}</td>
+      <td class="num">${start} → ${end} ${cohortDeltaHtml(row.rating_delta)}</td>
+      <td class="num">${row.games_analyzed != null ? row.games_analyzed : '—'}</td>
+      <td>${esc(cohortLastSeen(row.last_seen))}</td>
+    </tr>`;
+  }).join('');
+
+  app.innerHTML = `
+    <div class="card-header"><h1>Админ</h1><span class="badge badge-neutral">когорта за ${days} дн.</span></div>
+    ${summaryHtml}
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Игроки (${users.length})</span>
+        <a class="btn btn-secondary" href="/api/admin/cohort.csv?days=${days}" style="font-size:12px;padding:4px 10px">CSV</a>
+      </div>
+      ${users.length ? `<div class="table-wrap"><table>
+        <thead><tr><th>Ник</th><th>Дней</th><th>Мин/день</th><th>План %</th><th>Рейтинг</th><th>Партий</th><th>Последняя активность</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>` : '<p style="color:var(--c-text-muted);padding:16px">Игроков пока нет.</p>'}
+    </div>`;
+}
+
 async function viewUsers(app) {
   const status = await authStatus();
   if (!status.logged_in) {
@@ -5561,6 +5912,7 @@ async function viewUsers(app) {
       await apiPost('/api/auth/logout', new FormData());
     } catch { /* всё равно выходим */ }
     state.user = null;
+    state.isAdmin = false;
     state.authMode = 'login';
     Object.assign(state, {
       gameId: null, gameData: null, task: null, taskKey: null, taskResult: null,
@@ -5573,6 +5925,7 @@ async function viewUsers(app) {
     });
     clearMiddlegameSessionId();
     hideNav();
+    syncAdminNav();
     renderUserbox();
     render(state.currentView);
   });
@@ -5605,7 +5958,9 @@ function isSessionError(err) {
 
 function handleSessionExpired() {
   state.user = null;
+  state.isAdmin = false;
   hideNav();
+  syncAdminNav();
   renderUserbox();
   viewAuth(document.getElementById('app'));
 }
@@ -5630,6 +5985,8 @@ async function loadUser() {
   }
   if (!status || !status.logged_in) {
     state.user = null;
+    state.isAdmin = false;
+    syncAdminNav();
     renderUserbox();
     return;
   }
@@ -5643,6 +6000,13 @@ async function loadUser() {
   } catch {
     state.user = { nick: status.nick };
   }
+  try {
+    const current = await api('/api/user/current');
+    state.isAdmin = !!(current && current.is_admin);
+  } catch {
+    state.isAdmin = false;
+  }
+  syncAdminNav();
   renderUserbox();
 }
 

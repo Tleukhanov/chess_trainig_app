@@ -2850,8 +2850,14 @@ def create_api(
     def api_current_user(request: Request):
         user = _current_user(app.state.db_path, request)
         if user:
+            with Database(app.state.db_path) as db:
+                db.init_db()
+                admin = is_admin(db, user["nick"])
             # Только публичные поля: хеш пароля и служебные колонки наружу не идут.
-            return {"user": {k: user.get(k) for k in ("nick", "lichess", "fide_id")}}
+            return {
+                "user": {k: user.get(k) for k in ("nick", "lichess", "fide_id")},
+                "is_admin": admin,
+            }
         raise HTTPException(status_code=404, detail="No current user")
 
     @app.get("/api/users")
