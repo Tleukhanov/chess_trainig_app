@@ -2534,7 +2534,7 @@ class FrontendTests(ApiTestBase):
         html = resp.text
         self.assertIn("app.js?v=", html)
         self.assertIn("style.css?v=", html)
-        self.assertIn("v0.7.2", html)
+        self.assertIn("v0.7.3", html)
 
     def test_api_version(self):
         self.assertEqual(self.app.version, "0.4.8")
@@ -3081,6 +3081,25 @@ class GameCausesNotesApiTests(ApiTestBase):
         resp = self.client.get("/api/games/cn_plain/causes")
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json(), {"causes": {}})
+
+    def test_intent_review_and_cache(self):
+        self._seed_game()
+        note = self.client.post(
+            "/api/games/cn1/notes", json={"ply": 4, "intent": "хотел рокировать"}
+        )
+        self.assertEqual(note.status_code, 200, note.text)
+        with patch("app.api.review_intents", return_value="Р" * 120) as mocked:
+            first = self.client.post("/api/games/cn1/intent-review")
+            self.assertEqual(first.status_code, 200, first.text)
+            self.assertFalse(first.json()["cached"])
+            second = self.client.post("/api/games/cn1/intent-review")
+            self.assertTrue(second.json()["cached"])
+            self.assertEqual(mocked.call_count, 1)
+
+    def test_intent_review_requires_notes(self):
+        self._seed_game()
+        resp = self.client.post("/api/games/cn1/intent-review")
+        self.assertEqual(resp.status_code, 400, resp.text)
 
     def test_review_payload(self):
         self._seed_game()

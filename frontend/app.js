@@ -1,6 +1,6 @@
 // Chess Trainer Frontend — SPA на vanilla JS, потребляет /api/* эндпоинты.
 
-import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.7.2';
+import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.7.3';
 
 const state = {
   user: null,
@@ -1706,7 +1706,12 @@ function drawGameDetail(app) {
         const res = await api('/api/opening/start', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ style: 'universal', color: trainFromGame.dataset.color || 'white', human: true }),
+          body: JSON.stringify({
+            style: 'universal',
+            color: trainFromGame.dataset.color || 'white',
+            human: true,
+            start_moves: (game.moves || []).slice(0, 8),
+          }),
         });
         startOpeningSession(res);
         navigate('opening');
@@ -2064,6 +2069,7 @@ function ensureGameExtras(gameId) {
     saving: {},
     causesLoading: true,
     causesError: false,
+    intentReview: null,
   };
   state.gameExtras = extras;
   loadGameExtras(extras);
@@ -2154,15 +2160,23 @@ function gameErrorsInnerHtml(analysis, game, extras) {
         ${explanation}
         <div class="form-group" style="margin:0">
           <textarea class="err-note" data-ply="${e.ply}" rows="2" maxlength="500" placeholder="Твоя идея: что ты хотел сделать этим ходом?">${esc(value)}</textarea>
-          <div class="err-save-status" style="font-size:12px;color:var(--c-text-muted);min-height:14px">${esc(status)}</div>
+          <div style="display:flex;align-items:center;gap:8px;margin-top:4px">
+            <button type="button" class="btn btn-secondary err-save" data-ply="${e.ply}" style="padding:3px 10px;font-size:12px">Сохранить</button>
+            <div class="err-save-status" style="font-size:12px;color:var(--c-text-muted);min-height:14px">${esc(status)}</div>
+          </div>
         </div>
       </div>`;
   }).join('');
   const more = errors.length > shown.length
     ? `<p style="color:var(--c-text-muted);font-size:12px">Показаны первые ${shown.length} из ${errors.length}.</p>`
     : '';
-  return `<div class="card-header" style="margin-top:12px"><span class="card-title">Ошибки: причина и твоя идея</span></div>
-    <div class="game-errors-list">${rows}</div>${more}`;
+  const intentHtml = extras && extras.intentReview
+    ? `<div class="card" style="margin-top:10px"><div class="card-header"><span class="card-title">Разбор идей</span></div><div style="font-size:13px;line-height:1.5">${esc(extras.intentReview)}</div></div>`
+    : '';
+  return `<div class="card-header" style="margin-top:12px"><span class="card-title">Ошибки: причина и твоя идея</span>
+      <button type="button" class="btn btn-secondary" id="intent-review-btn" style="font-size:12px;padding:4px 10px">Разобрать мои идеи</button>
+    </div>
+    <div class="game-errors-list">${rows}</div>${more}${intentHtml}`;
 }
 
 function renderGameErrors(root) {
@@ -2192,6 +2206,16 @@ function renderGameErrors(root) {
 }
 
 function bindGameErrors(box) {
+  box.querySelectorAll('.err-save').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const ta = box.querySelector('.err-note[data-ply="' + btn.dataset.ply + '"]');
+      if (ta) saveGameNote(ta);
+    });
+  });
+  const intentBtn = box.querySelector('#intent-review-btn');
+  if (intentBtn) {
+    intentBtn.addEventListener('click', () => reviewIntents(box));
+  }
   box.querySelectorAll('.err-note').forEach(ta => {
     ta.addEventListener('input', () => {
       if (state.gameExtras) state.gameExtras.drafts[ta.dataset.ply] = ta.value;
@@ -2218,6 +2242,27 @@ function setNoteStatus(ta, text, isError) {
   if (!el) return;
   el.textContent = text;
   el.style.color = isError ? 'var(--c-err-blunder)' : 'var(--c-text-muted)';
+}
+
+async function reviewIntents(box) {
+  const data = state.gameData;
+  const extras = state.gameExtras;
+  if (!data || !extras) return;
+  const btn = box.querySelector('#intent-review-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Разбираю…'; }
+  try {
+    const res = await api(
+      '/api/games/' + encodeURIComponent(data.game.id) + '/intent-review',
+      { method: 'POST' },
+    );
+    extras.intentReview = (res && res.review) || null;
+    renderGameErrors(document.getElementById('app'));
+    if (res && res.cached) showToast('Разбор из кеша', 'info');
+  } catch (err) {
+    if (isSessionError(err)) { handleSessionExpired(); return; }
+    if (btn) { btn.disabled = false; btn.textContent = 'Разобрать мои идеи'; }
+    showToast(err.message, 'error');
+  }
 }
 
 async function saveGameNote(ta) {

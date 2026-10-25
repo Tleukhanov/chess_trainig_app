@@ -51,6 +51,7 @@ from .fide import (
 )
 from .games import Game, fetch_lichess_rating, fetch_user_games
 from .humanize import humanize_report
+from .intent_review import intent_cache_key, review_intents
 from .review import repeated_mistakes
 from .llm import ChatMessage, LLMClient, _is_local_host, clean_llm_text, looks_like_refusal, looks_like_thinking
 from .maia import MaiaLitePolicy
@@ -676,6 +677,8 @@ class OpeningStartBody(BaseModel):
     opp_elo: int | None = None
     my_elo: int | None = None
     human: bool = False
+    #: Стартовая линия (SAN): тренировать конкретный дебют, а не рандом.
+    start_moves: list[str] | None = None
 
 
 class OpeningMoveBody(BaseModel):
@@ -3868,6 +3871,38 @@ def create_api(
             notes = _notes_payload(db, user["nick"], game_id)
         return {"notes": notes}
 
+    @app.post("/api/games/{game_id}/intent-review")
+    def api_game_intent_review(game_id: str, request: Request):
+        """LLM-разбор замыслов игрока к ошибочным ходам (по заметкам)."""
+        user = _current_user(app.state.db_path, request)
+        if not user:
+            raise HTTPException(404, "No current user")
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            game = db.get_game(game_id, user["nick"])
+            if game is None:
+                raise HTTPException(404, "Партия не найдена")
+            analysis = db.get_analysis(game_id)
+            if not isinstance(analysis, dict):
+                raise HTTPException(400, "Сначала проанализируй партию")
+            notes = db.get_move_notes(game_id, user["nick"])
+            if not notes:
+                raise HTTPException(400, "Сначала сохрани хотя бы одну идею хода")
+            key = "intent_review:" + user["nick"] + ":" + intent_cache_key(
+                game_id, notes, analysis
+            )
+            cached = db.get_meta(key)
+        if cached:
+            return {"review": cached, "cached": True}
+        try:
+            text = review_intents(game, analysis, notes)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(503, f"LLM недоступна: {exc}") from exc
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            db.set_meta(key, text)
+        return {"review": text, "cached": False}
+
     @app.post("/api/games/{game_id}/notes")
     def api_game_note_save(game_id: str, body: MoveNoteBody, request: Request):
         """Сохраняет идею хода; пустой intent удаляет заметку."""
@@ -4332,6 +4367,20 @@ def create_api(
             db.init_db()
             my_elo, opp_elo = _opening_resolve_elos(db, nick, body)
             game = new_game(my_elo, opp_elo, style, color)
+            requested = [str(x).strip() for x in (body.start_moves or []) if str(x).strip()]
+            if requested:
+                board = chess.Board()
+                normalized: list[str] = []
+                for san in requested[:24]:
+                    try:
+                        move = board.parse_san(san)
+                    except ValueError as exc:
+                        raise HTTPException(
+                            400, f"Нелегальный ход в стартовой линии: {san}"
+                        ) from exc
+                    normalized.append(board.san(move))
+                    board.push(move)
+                game.moves = normalized
             db.save_opening_session(
                 session_id,
                 nick,
@@ -4339,14 +4388,14 @@ def create_api(
                 opp_elo=opp_elo,
                 style=style,
                 color=color,
-                moves=[],
+                moves=list(game.moves),
                 status=_OPENING_IN_PROGRESS,
             )
 
         engine_name: str | None = None
         last_reply: dict[str, Any] | None = None
-        if game.color == "black":
-            # Соперник — белые: его первый ход считаем сразу и сохраняем.
+        if _opening_need_reply(game):
+            # Соперник ходит первым (чёрный старт или линия закончилась на его ход).
             if body.human:
                 time.sleep(random.uniform(1.0, 3.0))
             policy, engine_name = _opening_policy(opp_elo, my_elo)

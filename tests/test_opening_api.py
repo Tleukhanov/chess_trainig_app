@@ -265,6 +265,26 @@ class OpeningStartTests(OpeningApiTestBase):
         self.assertEqual(state["my_elo"], 1500)
         self.assertEqual(state["opp_elo"], 1600)
 
+    def test_start_from_line(self):
+        self._register(self.client, "tester")
+        line = ["e4", "c5", "Nf3"]
+        state = self._start("white", start_moves=line)
+        self.assertEqual(state["moves"][:3], line)
+        # После 3 полуходов ход чёрных — соперник должен ответить.
+        self.assertGreaterEqual(len(state["moves"]), 4)
+
+    def test_start_from_line_rejects_illegal(self):
+        self._register(self.client, "tester")
+        resp = self.client.post(
+            "/api/opening/start",
+            json={
+                "style": "universal",
+                "color": "white",
+                "start_moves": ["e4", "e5", "Nf6"],
+            },
+        )
+        self.assertEqual(resp.status_code, 400, resp.text)
+
     def test_start_black_opponent_first(self):
         self._register(self.client, "tester")
         state = self._start("black", my_elo=1500, opp_elo=1600)
