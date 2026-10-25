@@ -113,23 +113,21 @@ class PhaseStatsTests(unittest.TestCase):
         self.assertEqual(stats["opening"]["errors"], 1)
         self.assertEqual(stats["opening"]["avg_drop"], 6.0)  # (0 + 12) / 2
 
-    def test_empty_phase_has_zeroes(self) -> None:
+    def test_empty_phase_is_none(self) -> None:
+        # Фазы без ходов — None, а не 0%: 0 выглядел бы как «сыграл ужасно».
         stats = phase_stats(_SHORT_GAME, _analysis(_SHORT_GAME, {}), "white")
         for key in ("middlegame", "endgame"):
             self.assertEqual(
                 stats[key],
-                {"moves": 0, "errors": 0, "avg_drop": 0.0, "accuracy": 0.0},
+                {"moves": 0, "errors": 0, "avg_drop": None, "accuracy": None},
             )
 
         empty = phase_stats([], {"moves": []}, "white")
-        self.assertEqual(
-            empty,
-            {
-                "opening": {"moves": 0, "errors": 0, "avg_drop": 0.0, "accuracy": 0.0},
-                "middlegame": {"moves": 0, "errors": 0, "avg_drop": 0.0, "accuracy": 0.0},
-                "endgame": {"moves": 0, "errors": 0, "avg_drop": 0.0, "accuracy": 0.0},
-            },
-        )
+        for key in ("opening", "middlegame", "endgame"):
+            self.assertEqual(
+                empty[key],
+                {"moves": 0, "errors": 0, "avg_drop": None, "accuracy": None},
+            )
 
     def test_middlegame_and_endgame_detected(self) -> None:
         long_analysis = _analysis(
@@ -169,10 +167,10 @@ class CategoryStatsTests(unittest.TestCase):
         self.assertEqual(stats["opening"], 63.58)
         self.assertEqual(stats["middlegame"], 40.02)
         self.assertEqual(stats["endgame"], 91.4)
-        self.assertEqual(stats["tactics"], 0.0)
+        self.assertIsNone(stats["tactics"])  # без мотивов тактики нет
         self.assertEqual(stats["strategy"], 40.02)
         self.assertEqual(stats["positional"], 51.8)  # (63.58 + 40.02) / 2
-        self.assertTrue(all(0.0 <= value <= 100.0 for value in stats.values()))
+        self.assertTrue(all(value is None or 0.0 <= value <= 100.0 for value in stats.values()))
 
     def test_tactics_share_reduces_strategy(self) -> None:
         motifs = {
@@ -189,7 +187,7 @@ class CategoryStatsTests(unittest.TestCase):
     def test_unknown_phase_and_empty_input(self) -> None:
         stats = category_stats({})
         self.assertEqual(set(stats), set(CATEGORY_KEYS))
-        self.assertTrue(all(value == 0.0 for value in stats.values()))
+        self.assertTrue(all(value is None for value in stats.values()))
 
         only_mid = category_stats(
             {"middlegame": {"moves": 5, "errors": 1, "avg_drop": 20.0, "accuracy": 40.02}}

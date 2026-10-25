@@ -1,11 +1,11 @@
 // Chess Trainer Frontend — SPA на vanilla JS, потребляет /api/* эндпоинты.
 
-import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.6.8';
+import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.6.9';
 
 const state = {
   user: null,
   currentView: 'dashboard',
-  timers: { coach: null, task: null, llm: null, tool: null, opening: null, middlegame: null, quote: null },
+  timers: { coach: null, task: null, llm: null, tool: null, opening: null, middlegame: null, quote: null, theory: null },
   gamesFilter: 'all',
   gameId: null,
   gameData: null,
@@ -50,6 +50,18 @@ const state = {
   openingJobId: null,
   openingError: null,
   openingLastReply: null,
+  // Панель «Теория» в тренере дебютов: линия Lichess/ECO и идеи LLM.
+  openingTheory: null,
+  openingTheoryRequestFen: null,
+  openingTheoryLoading: false,
+  openingTheoryError: null,
+  openingTheoryLine: null,
+  openingTheorySetup: false,
+  openingTheoryIdeas: null,
+  openingTheoryIdeasLoading: false,
+  openingTheoryIdeasDone: false,
+  openingTheoryIdeasCached: false,
+  openingTheoryIdeasError: null,
   middlegameSession: null,
   middlegameMeta: null,
   middlegameStrength: 'equal',
@@ -1125,7 +1137,7 @@ async function viewGameList(app) {
       <td class="center"><span class="badge ${resBadge}">${resLabel}</span></td>
       <td>${opening}</td>
       <td class="num">${g.moves}</td>
-      <td class="center">${g.analyzed ? '<span class="badge badge-good">анализ</span>' : '<span class="badge badge-neutral">нет</span>'}</td>
+      <td class="center">${g.analyzed ? '<span class="badge badge-good">анализ</span>' : `<button type="button" class="btn btn-secondary analyze-game" data-id="${esc(g.id)}" style="font-size:12px;padding:3px 8px">Анализ</button>`}</td>
     </tr>`;
   }).join('');
 
@@ -1149,6 +1161,21 @@ async function viewGameList(app) {
     row.addEventListener('click', () => {
       state.gameId = row.dataset.id;
       viewGames(app);
+    });
+  });
+  app.querySelectorAll('.analyze-game').forEach(btn => {
+    btn.addEventListener('click', async e => {
+      e.stopPropagation();
+      btn.disabled = true;
+      btn.textContent = '…';
+      try {
+        await api('/api/games/' + encodeURIComponent(btn.dataset.id) + '/analyze', { method: 'POST' });
+        viewGameList(app);
+      } catch (err) {
+        showToast(err.message, 'error');
+        btn.disabled = false;
+        btn.textContent = 'Анализ';
+      }
     });
   });
 }
@@ -1291,6 +1318,9 @@ function drawGameDetail(app) {
         <div class="card">
           <div class="card-header"><span class="card-title">Анализ</span></div>
           ${analysis ? gameMetricsHtml(analysis) : '<p style="color:var(--c-text-muted)">Не проанализирована.</p>'}
+          <div style="margin-top:10px">
+            <button type="button" class="btn btn-primary" id="analyze-game-btn">${analysis ? 'Переанализировать' : 'Проанализировать'}</button>
+          </div>
           ${analysis ? '<div id="game-errors"></div>' : ''}
           <div id="game-repeats"></div>
           ${analysis ? `<div style="margin-top:10px"><button class="btn btn-primary" id="train-from-game" data-color="${esc(game.user_color || 'white')}">Тренировать этот дебют</button></div>` : ''}
@@ -1326,6 +1356,30 @@ function drawGameDetail(app) {
           </ul>
         </div>`;
     }
+  }
+  const analyzeGameBtn = document.getElementById('analyze-game-btn');
+  if (analyzeGameBtn) {
+    analyzeGameBtn.addEventListener('click', async () => {
+      const oldText = analyzeGameBtn.textContent;
+      analyzeGameBtn.disabled = true;
+      analyzeGameBtn.textContent = 'Анализирую…';
+      try {
+        await api(
+          '/api/games/' + encodeURIComponent(game.id) + '/analyze' + (analysis ? '?refresh=1' : ''),
+          { method: 'POST' },
+        );
+        const fresh = await api('/api/games/' + encodeURIComponent(game.id));
+        state.gameData = fresh;
+        state.gameReview = null;
+        state.gameExtras = null;
+        state.gameRepeats = null;
+        drawGameDetail(document.getElementById('app'));
+      } catch (err) {
+        showToast(err.message, 'error');
+        analyzeGameBtn.disabled = false;
+        analyzeGameBtn.textContent = oldText;
+      }
+    });
   }
   const trainFromGame = document.getElementById('train-from-game');
   if (trainFromGame) {
@@ -1620,11 +1674,13 @@ function reviewReportCardHtml(review, status) {
 
   const categories = review.categories || {};
   const catRows = REVIEW_CATEGORIES.map(([key, label]) => {
-    const value = reviewLimit(categories[key]) || 0;
+    const raw = categories[key];
+    const has = typeof raw === 'number' && Number.isFinite(raw);
+    const value = has ? Math.max(0, Math.min(100, raw)) : 0;
     return `<div class="review-cat" style="margin-top:8px">
-      <div style="display:flex;justify-content:space-between;gap:8px;font-size:12px"><span>${label}</span><span>${Math.round(value)}</span></div>
-      <div class="review-cat-bar" style="height:6px;margin-top:3px;border-radius:3px;overflow:hidden;background:var(--c-border)">
-        <div style="width:${value.toFixed(1)}%;height:100%;border-radius:3px;background:var(--c-btn-primary)"></div>
+      <div style="display:flex;justify-content:space-between;gap:8px;font-size:12px"><span>${label}</span><span>${has ? Math.round(value) : '—'}</span></div>
+      <div class="review-cat-bar" style="height:6px;margin-top:3px;border-radius:3px;overflow:hidden;background:var(--c-border)" title="${has ? '' : 'нет ходов в этой фазе'}">
+        <div style="width:${has ? value.toFixed(1) : 0}%;height:100%;border-radius:3px;background:var(--c-btn-primary)"></div>
       </div>
     </div>`;
   }).join('');
@@ -2600,6 +2656,359 @@ function openingMoveRowsHtml(moves) {
     </div>`).join('');
 }
 
+// --- Теория для тренера дебютов ---
+
+function resetOpeningTheory() {
+  stopOpeningTheoryPlay();
+  state.openingTheory = null;
+  state.openingTheoryRequestFen = null;
+  state.openingTheoryLoading = false;
+  state.openingTheoryError = null;
+  state.openingTheoryLine = null;
+  state.openingTheorySetup = false;
+  state.openingTheoryIdeas = null;
+  state.openingTheoryIdeasLoading = false;
+  state.openingTheoryIdeasDone = false;
+  state.openingTheoryIdeasCached = false;
+  state.openingTheoryIdeasError = null;
+}
+
+function stopOpeningTheoryPlay() {
+  if (state.timers.theory) {
+    clearInterval(state.timers.theory);
+    state.timers.theory = null;
+  }
+}
+
+function openingTheorySourceBadge(source) {
+  if (source === 'lichess-masters' || source === 'lichess') return '<span class="badge badge-blue">Lichess masters</span>';
+  if (source === 'eco') return '<span class="badge badge-neutral">ECO (офлайн)</span>';
+  if (source === 'none' || source === 'off') return '<span class="badge badge-neutral">теория не найдена</span>';
+  return '<span class="badge badge-neutral">источник неизвестен</span>';
+}
+
+function openingTheoryGamesLabel(games) {
+  const v = Number(games);
+  if (!Number.isFinite(v) || v <= 0) return '';
+  const trim = s => s.replace(/,0$/, '');
+  if (v >= 1e6) return trim((v / 1e6).toFixed(v >= 1e7 ? 0 : 1).replace('.', ',')) + 'M';
+  if (v >= 1e3) return trim((v / 1e3).toFixed(v >= 1e4 ? 0 : 1).replace('.', ',')) + 'k';
+  return String(Math.round(v));
+}
+
+function openingTheoryGamesWord(games) {
+  const n = Math.round(Math.abs(Number(games) || 0));
+  const mod100 = n % 100;
+  if (mod100 >= 11 && mod100 <= 14) return 'партий';
+  const mod10 = mod100 % 10;
+  if (mod10 === 1) return 'партия';
+  if (mod10 >= 2 && mod10 <= 4) return 'партии';
+  return 'партий';
+}
+
+function openingTheoryStatsLabel(move) {
+  const games = Number(move && move.games);
+  const total = Number.isFinite(games) && games > 0 ? games : 0;
+  const pct = value => {
+    const n = Number(value);
+    if (!total || !Number.isFinite(n)) return null;
+    return Math.round((n / total) * 100);
+  };
+  const parts = [];
+  const titleParts = [];
+  if (total) {
+    const w = pct(move.white);
+    const d = pct(move.draws);
+    const b = pct(move.black);
+    if (w != null && d != null && b != null) {
+      parts.push(`${w}/${d}/${b}%`);
+      titleParts.push(`белые ${w}% · ничьи ${d}% · чёрные ${b}%`);
+    }
+  }
+  const gamesLabel = openingTheoryGamesLabel(total);
+  if (gamesLabel) {
+    parts.push(`${gamesLabel} ${total >= 1000 ? 'партий' : openingTheoryGamesWord(total)}`);
+    titleParts.push(`${Math.round(total)} ${openingTheoryGamesWord(total)}`);
+  }
+  return { text: parts.join(' · '), title: titleParts.join(' · ') };
+}
+
+function openingTheorySetupFen() {
+  const t = state.openingTheory;
+  if (!t) return null;
+  const line = Array.isArray(t.main_line) ? t.main_line : [];
+  if (typeof t.setup_fen === 'string' && t.setup_fen) return t.setup_fen;
+  const last = line.length ? line[line.length - 1] : null;
+  return last && last.fen ? last.fen : null;
+}
+
+// Что показать на доске вместо текущей позиции партии: шаг линии или расстановку.
+function openingTheoryPreview() {
+  const t = state.openingTheory;
+  if (!t) return null;
+  const line = Array.isArray(t.main_line) ? t.main_line : [];
+  const base = state.openingTheoryRequestFen || t.fen || '';
+  let fen = null;
+  let prev = null;
+  let label = '';
+  if (state.openingTheorySetup) {
+    fen = openingTheorySetupFen();
+    if (!fen) return null;
+    const last = line.length ? line[line.length - 1] : null;
+    if (last && last.fen === fen) {
+      prev = line.length > 1 && line[line.length - 2] && line[line.length - 2].fen
+        ? line[line.length - 2].fen
+        : base;
+    } else {
+      prev = last && last.fen ? last.fen : base;
+    }
+    label = 'setup';
+  } else if (typeof state.openingTheoryLine === 'number') {
+    const step = line[state.openingTheoryLine];
+    if (!step || !step.fen) return null;
+    fen = step.fen;
+    const before = state.openingTheoryLine > 0 ? line[state.openingTheoryLine - 1] : null;
+    prev = before && before.fen ? before.fen : base;
+    label = 'line';
+  } else {
+    return null;
+  }
+  let lastMove = [];
+  try {
+    lastMove = prev && fen && prev !== fen ? lastMoveSquares(prev, fen) : [];
+  } catch {
+    lastMove = [];
+  }
+  const arrows = lastMove.length >= 2 ? [{ from: lastMove[0], to: lastMove[1], color: 'good' }] : [];
+  return { fen, lastMove, arrows, label };
+}
+
+function openingTheoryIdeasNote() {
+  const t = state.openingTheory;
+  const base = t && (t.source === 'lichess-masters' || t.source === 'lichess') ? 'по данным Lichess masters' : 'объяснение LLM';
+  return base + (state.openingTheoryIdeasCached ? ' · из кеша' : '');
+}
+
+function openingTheoryNavHtml(total, idx) {
+  const last = Math.max(0, total - 1);
+  const pos = Math.max(0, Math.min(last, idx == null ? 0 : idx));
+  return `
+    <div class="theory-nav">
+      <button type="button" class="btn btn-secondary" id="theory-prev" ${pos <= 0 ? 'disabled' : ''}>◀</button>
+      <input type="range" id="theory-range" min="0" max="${last}" value="${pos}" ${total < 2 ? 'disabled' : ''}>
+      <button type="button" class="btn btn-secondary" id="theory-next" ${pos >= last ? 'disabled' : ''}>▶</button>
+      <span class="theory-pos">${pos + 1} / ${total}</span>
+    </div>`;
+}
+
+function openingTheoryCardHtml() {
+  const t = state.openingTheory;
+  const loading = !!state.openingTheoryLoading;
+  const line = t && Array.isArray(t.main_line) ? t.main_line : [];
+  const activeIdx = typeof state.openingTheoryLine === 'number' ? state.openingTheoryLine : null;
+  const setupActive = !!state.openingTheorySetup;
+  const canSetup = !!openingTheorySetupFen();
+  const source = t && t.source;
+  const badge = t ? openingTheorySourceBadge(source) : '';
+
+  let body = '';
+  if (!t) {
+    body = `
+      <p class="theory-card-note">Статистика ходов из базы Lichess masters и офлайн-дебютов ECO для текущей позиции.</p>
+      <button type="button" class="btn btn-primary" id="theory-load" ${loading ? 'disabled' : ''}>${loading ? 'Загружаю…' : 'Показать теорию'}</button>
+      ${state.openingTheoryError ? `<div class="alert alert-error" style="margin-top:8px">${esc(state.openingTheoryError)}</div>` : ''}`;
+  } else {
+    const chips = line.map((m, i) => {
+      if (!m) return '';
+      const stats = openingTheoryStatsLabel(m);
+      const title = `Показать позицию после ${m.san || m.uci || '—'}${stats.title ? ' · ' + stats.title : ''}`;
+      return `<button type="button" class="theory-chip ${i === activeIdx && !setupActive ? 'theory-chip-active' : ''}"
+        data-theory-ply="${i}" title="${esc(title)}">
+        <span class="theory-chip-san">${esc(m.san || m.uci || '—')}</span>
+        ${stats.text ? `<span class="theory-chip-stats">${esc(stats.text)}</span>` : ''}
+      </button>`;
+    }).join('');
+
+    let ideasHtml = '';
+    if (state.openingTheoryIdeasError) {
+      ideasHtml += `<div class="alert alert-error" style="margin-top:8px">${esc(state.openingTheoryIdeasError)}</div>`;
+    }
+    if (state.openingTheoryIdeas) {
+      ideasHtml += `<div class="theory-ideas">
+        <div class="theory-ideas-source">${esc(openingTheoryIdeasNote())}</div>
+        <div class="mentor-reply">${esc(state.openingTheoryIdeas)}</div>
+      </div>`;
+    } else if (state.openingTheoryIdeasDone && !state.openingTheoryIdeasError) {
+      ideasHtml += '<p class="theory-card-note" style="margin-top:8px">Идеи для этой позиции недоступны.</p>';
+    } else if (!state.openingTheoryIdeasLoading && !state.openingTheoryIdeasError) {
+      ideasHtml += '<p class="theory-card-note" style="margin-top:8px">«Идеи вкратце» — короткое объяснение плана (LLM или база).</p>';
+    }
+
+    body = `
+      ${line.length
+        ? `<div class="theory-chips">${chips}</div>`
+        : `<p class="theory-empty">${source === 'none' || source === 'off' ? 'Для этой позиции теории не найдено.' : 'Главная линия пуста.'}</p>`}
+      <div class="theory-controls">
+        <button type="button" class="btn btn-secondary" id="theory-play" ${line.length < 1 || loading ? 'disabled' : ''}>▶ Показать линию</button>
+        <button type="button" class="btn btn-secondary" id="theory-setup" ${canSetup && !loading ? '' : 'disabled'}>Расстановка</button>
+        <button type="button" class="btn btn-secondary" id="theory-ideas" ${state.openingTheoryIdeasLoading ? 'disabled' : ''}>${state.openingTheoryIdeasLoading ? 'Идеи…' : 'Идеи вкратце'}</button>
+        <button type="button" class="btn btn-secondary" id="theory-back" ${activeIdx != null || setupActive ? '' : 'disabled'}>Вернуться</button>
+        <button type="button" class="btn btn-link" id="theory-load" ${loading ? 'disabled' : ''}>${loading ? 'Обновляю…' : 'Обновить'}</button>
+      </div>
+      ${activeIdx != null && !setupActive ? openingTheoryNavHtml(line.length, activeIdx) : ''}
+      ${setupActive ? '<p class="theory-card-note" style="margin-top:8px">Расстановка — позиция в конце линии; последний ход подсвечен.</p>' : ''}
+      ${ideasHtml}`;
+  }
+
+  return `
+    <div class="card theory-card">
+      <div class="card-header"><span class="card-title">Теория</span>${badge}</div>
+      ${body}
+    </div>`;
+}
+
+async function loadOpeningTheory(app) {
+  const s = state.openingSession;
+  if (!s || !s.fen || state.openingTheoryLoading) return;
+  const fen = s.fen;
+  stopOpeningTheoryPlay();
+  state.openingTheoryLoading = true;
+  state.openingTheoryError = null;
+  drawOpening(app);
+  try {
+    const data = await api('/api/theory?fen=' + encodeURIComponent(fen) + '&plies=12');
+    if (!state.openingSession || state.openingSession.fen !== fen) return;
+    state.openingTheory = data || null;
+    state.openingTheoryRequestFen = fen;
+    state.openingTheoryLine = null;
+    state.openingTheorySetup = false;
+    state.openingTheoryIdeas = null;
+    state.openingTheoryIdeasDone = false;
+    state.openingTheoryIdeasCached = false;
+    state.openingTheoryIdeasError = null;
+  } catch (err) {
+    if (isSessionError(err)) { handleSessionExpired(); return; }
+    state.openingTheory = null;
+    state.openingTheoryError = err.message;
+    showToast(err.message, 'error');
+  } finally {
+    state.openingTheoryLoading = false;
+    if (state.user && state.currentView === 'opening' && state.openingSession && state.openingSession.fen === fen) {
+      drawOpening(app);
+    }
+  }
+}
+
+async function loadOpeningTheoryIdeas(app) {
+  const t = state.openingTheory;
+  if (!t || state.openingTheoryIdeasLoading) return;
+  const fen = state.openingTheoryRequestFen || t.fen;
+  const line = (Array.isArray(t.main_line) ? t.main_line : [])
+    .filter(m => m && m.san && m.fen);
+  state.openingTheoryIdeasLoading = true;
+  state.openingTheoryIdeasError = null;
+  drawOpening(app);
+  try {
+    const data = await api('/api/theory/ideas', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fen, line }),
+    });
+    if (state.openingTheory !== t) return;
+    state.openingTheoryIdeas = data && typeof data.ideas === 'string' && data.ideas ? data.ideas : null;
+    state.openingTheoryIdeasCached = !!(data && data.cached);
+    state.openingTheoryIdeasDone = true;
+  } catch (err) {
+    if (isSessionError(err)) { handleSessionExpired(); return; }
+    state.openingTheoryIdeasError = err.message;
+    showToast(err.message, 'error');
+  } finally {
+    state.openingTheoryIdeasLoading = false;
+    if (state.user && state.currentView === 'opening' && state.openingTheory === t) drawOpening(app);
+  }
+}
+
+function startOpeningTheoryPlay(app) {
+  const t = state.openingTheory;
+  const total = t && Array.isArray(t.main_line) ? t.main_line.length : 0;
+  if (!total) return;
+  stopOpeningTheoryPlay();
+  state.openingTheorySetup = false;
+  state.openingTheoryLine = 0;
+  drawOpening(app);
+  if (total < 2) return;
+  state.timers.theory = setInterval(() => {
+    if (!state.user || state.currentView !== 'opening') { stopOpeningTheoryPlay(); return; }
+    const current = typeof state.openingTheoryLine === 'number' ? state.openingTheoryLine : 0;
+    if (current >= total - 1) { stopOpeningTheoryPlay(); return; }
+    state.openingTheoryLine = current + 1;
+    drawOpening(app);
+  }, 700);
+}
+
+function openingTheoryStep(app, delta) {
+  const t = state.openingTheory;
+  const total = t && Array.isArray(t.main_line) ? t.main_line.length : 0;
+  if (!total) return;
+  stopOpeningTheoryPlay();
+  const current = typeof state.openingTheoryLine === 'number' ? state.openingTheoryLine : (delta > 0 ? -1 : 0);
+  state.openingTheorySetup = false;
+  state.openingTheoryLine = Math.max(0, Math.min(total - 1, current + delta));
+  drawOpening(app);
+}
+
+function bindOpeningTheory(app) {
+  const loadBtn = document.getElementById('theory-load');
+  if (loadBtn) loadBtn.addEventListener('click', () => loadOpeningTheory(app));
+
+  app.querySelectorAll('[data-theory-ply]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const t = state.openingTheory;
+      const line = t && Array.isArray(t.main_line) ? t.main_line : [];
+      const idx = Number(btn.dataset.theoryPly);
+      if (!Number.isInteger(idx) || idx < 0 || idx >= line.length) return;
+      stopOpeningTheoryPlay();
+      state.openingTheorySetup = false;
+      state.openingTheoryLine = idx;
+      drawOpening(app);
+    });
+  });
+
+  const backBtn = document.getElementById('theory-back');
+  if (backBtn) backBtn.addEventListener('click', () => {
+    stopOpeningTheoryPlay();
+    state.openingTheoryLine = null;
+    state.openingTheorySetup = false;
+    drawOpening(app);
+  });
+  const playBtn = document.getElementById('theory-play');
+  if (playBtn) playBtn.addEventListener('click', () => startOpeningTheoryPlay(app));
+  const setupBtn = document.getElementById('theory-setup');
+  if (setupBtn) setupBtn.addEventListener('click', () => {
+    if (!openingTheorySetupFen()) return;
+    stopOpeningTheoryPlay();
+    state.openingTheoryLine = null;
+    state.openingTheorySetup = true;
+    drawOpening(app);
+  });
+  const ideasBtn = document.getElementById('theory-ideas');
+  if (ideasBtn) ideasBtn.addEventListener('click', () => loadOpeningTheoryIdeas(app));
+  const prevBtn = document.getElementById('theory-prev');
+  if (prevBtn) prevBtn.addEventListener('click', () => openingTheoryStep(app, -1));
+  const nextBtn = document.getElementById('theory-next');
+  if (nextBtn) nextBtn.addEventListener('click', () => openingTheoryStep(app, 1));
+  const range = document.getElementById('theory-range');
+  if (range) range.addEventListener('input', e => {
+    const t = state.openingTheory;
+    const total = t && Array.isArray(t.main_line) ? t.main_line.length : 0;
+    if (!total) return;
+    stopOpeningTheoryPlay();
+    state.openingTheorySetup = false;
+    state.openingTheoryLine = Math.max(0, Math.min(total - 1, Number(e.target.value) || 0));
+    drawOpening(app);
+  });
+}
+
 async function viewOpening(app) {
   if (!state.user) {
     app.innerHTML = '<div class="onboarding card"><div class="empty-icon">♟</div><h1>Тренер дебютов</h1><p>Профиль не выбран — выбери его на странице Профили.</p><a href="#" class="btn btn-primary" data-view="users">Профили</a></div>';
@@ -2627,7 +3036,10 @@ async function loadOpeningSession(app, id) {
     return;
   }
   state.openingSession = s;
-  if (prevId !== s.id) state.openingFens = null;
+  if (prevId !== s.id) {
+    state.openingFens = null;
+    resetOpeningTheory();
+  }
   drawOpening(app);
   if (state.openingAnalyzing && !state.timers.opening && state.openingJobId) {
     openingPoll(app, state.openingJobId);
@@ -2797,6 +3209,7 @@ async function drawOpeningSetup(app, errorMsg) {
 
 function startOpeningSession(res) {
   if (state.timers.opening) { clearInterval(state.timers.opening); state.timers.opening = null; }
+  resetOpeningTheory();
   state.openingSession = res;
   state.openingLastReply = res.last_reply || null;
   state.openingThinking = false;
@@ -2846,6 +3259,9 @@ function drawOpening(app) {
   const yourTurn = !finished && s.turn === s.color;
   const colorLabel = s.color === 'black' ? 'чёрные' : 'белые';
   const report = s.report;
+  // Просмотр теории (шаг линии или расстановка) заменяет позицию на доске,
+  // но не трогает саму партию: ходы и ответы Maia продолжают работать.
+  const theoryPreview = openingTheoryPreview();
 
   const engineNote = s.engine
     ? `<span class="badge badge-neutral" title="движок соперника">движок: ${s.engine === 'maia2' ? 'Maia-2' : 'MaiaLite'}</span>`
@@ -2877,9 +3293,11 @@ function drawOpening(app) {
         <div class="card-header"><span class="card-title">Твой ход</span></div>
         ${state.openingThinking
           ? '<p style="color:var(--c-text-muted);font-size:13px;margin-top:0">соперник думает…</p>'
-          : yourTurn
-            ? '<p style="color:var(--c-text-muted);font-size:13px;margin-top:0">кликни или перетащи фигуру — точки показывают доступные поля; ПКМ-протяжка рисует стрелку</p>'
-            : '<p style="color:var(--c-text-muted);font-size:13px;margin-top:0">ждём соперника…</p>'}
+          : theoryPreview
+            ? '<p style="color:var(--c-text-muted);font-size:13px;margin-top:0">просмотр теории: доска только для просмотра — нажми «Вернуться», чтобы вернуться к партии</p>'
+            : yourTurn
+              ? '<p style="color:var(--c-text-muted);font-size:13px;margin-top:0">кликни или перетащи фигуру — точки показывают доступные поля; ПКМ-протяжка рисует стрелку</p>'
+              : '<p style="color:var(--c-text-muted);font-size:13px;margin-top:0">ждём соперника…</p>'}
       </div>`;
   }
 
@@ -2888,13 +3306,19 @@ function drawOpening(app) {
     ${state.openingError ? `<div class="alert alert-error">${esc(state.openingError)}</div>` : ''}
     <div class="grid game-layout">
       <div class="card">
-        ${boardHtml(s.fen, { lastMove: openingHighlight(), flip, animate: yourTurn && !state.openingThinking && moves.length > 0 })}
+        ${boardHtml(theoryPreview ? theoryPreview.fen : s.fen, {
+          lastMove: theoryPreview ? theoryPreview.lastMove : openingHighlight(),
+          flip,
+          animate: theoryPreview ? true : (yourTurn && !state.openingThinking && moves.length > 0),
+          arrows: theoryPreview ? theoryPreview.arrows : [],
+        })}
         <div class="board-meta">
           <span class="badge badge-neutral">${esc(openingStyleLabel(s.style))}</span>
           <span class="badge badge-blue">ты: ${colorLabel}</span>
           <span class="badge ${finished ? 'badge-good' : 'badge-neutral'}">${moves.length} / ${s.plies}</span>
           ${engineNote}
           ${state.openingThinking ? '<span class="badge badge-neutral">соперник думает…</span>' : ''}
+          ${theoryPreview ? `<span class="badge badge-blue">${theoryPreview.label === 'setup' ? 'расстановка' : 'просмотр линии'}</span>` : ''}
         </div>
         ${replyHtml}
         <div style="margin-top:12px"><button class="btn btn-secondary" id="opening-new">Новая партия</button></div>
@@ -2904,14 +3328,17 @@ function drawOpening(app) {
           <div class="card-header"><span class="card-title">Ходы</span></div>
           <div class="moves-list">${openingMoveRowsHtml(moves)}</div>
         </div>
+        ${openingTheoryCardHtml()}
         ${panel}
       </div>
     </div>`;
 
   bindBoard(app.querySelector('.board'));
+  bindOpeningTheory(app);
   const newBtn = document.getElementById('opening-new');
   if (newBtn) newBtn.addEventListener('click', () => {
     if (state.timers.opening) { clearInterval(state.timers.opening); state.timers.opening = null; }
+    resetOpeningTheory();
     state.openingSession = null;
     state.openingFens = null;
     state.openingLastReply = null;
@@ -2925,7 +3352,7 @@ function drawOpening(app) {
   if (state.openingAnalyzing && !state.timers.opening && state.openingJobId) {
     openingPoll(app, state.openingJobId);
   }
-  if (!finished && yourTurn && !state.openingThinking) {
+  if (!finished && yourTurn && !state.openingThinking && !theoryPreview) {
     bindOpeningBoard(app, s.id);
   }
 }
@@ -2937,7 +3364,7 @@ function bindOpeningBoard(app, sessionId) {
     // Доска могла перерисоваться, пока шёл запрос: берём актуальную ноду.
     const board = app.querySelector('.board');
     if (!board) return;
-    if (s.finished || s.turn !== s.color || state.openingThinking) { bindBoard(board); return; }
+    if (s.finished || s.turn !== s.color || state.openingThinking || openingTheoryPreview()) { bindBoard(board); return; }
     const moves = ((legal && legal.moves) || []).filter(m => m && m.from && m.to && m.san);
     if (!moves.length) { bindBoard(board); return; }
     bindBoard(board, {
@@ -2978,6 +3405,7 @@ async function submitOpeningMove(app, san) {
   // Ход игрока показываем сразу, не дожидаясь ответа соперника.
   if (state.openingFens) state.openingFens.push(moveState.fen);
   state.openingSession = moveState;
+  resetOpeningTheory();
   state.openingLastReply = null;
   state.openingThinking = false;
   drawOpening(app);
@@ -2994,6 +3422,7 @@ async function submitOpeningMove(app, san) {
     });
     if (state.openingFens) state.openingFens.push(replyState.fen);
     state.openingSession = replyState;
+    resetOpeningTheory();
     state.openingLastReply = replyState.last_reply || null;
   } catch (err) {
     if (isSessionError(err)) { handleSessionExpired(); return; }

@@ -32,6 +32,7 @@ from pydantic import BaseModel, Field
 
 from . import data as shared_data
 from . import middlegame as mg
+from . import theory
 from .analyzer import Engine, win_percent
 from .coach import _extract_json, build_request, run_coach
 from .config import settings
@@ -742,6 +743,13 @@ class ChessEvalBody(BaseModel):
 
     fen: str
     depth: int = 10
+
+
+class TheoryIdeasBody(BaseModel):
+    """Тело POST /api/theory/ideas: FEN и главная линия (шаги Explorer)."""
+
+    fen: str = ""
+    line: list[Any] = Field(default_factory=list)
 
 
 #: Границы глубины быстрой оценки позиции (экран разбора задачи дня).
@@ -3180,6 +3188,45 @@ def create_api(
             "best_line": best_line,
         }
 
+    # --- Теория дебютов -----------------------------------------------------
+
+    @app.get("/api/theory")
+    def api_theory(request: Request, fen: str = "", plies: int = 0):
+        """Главная линия позиции по выбранному провайдеру теории.
+
+        Провайдер недоступен → 200 с line от ECO-fallback или ``source="none"``:
+        экран дебюта не должен падать из-за внешнего сервиса.
+        """
+        user = _current_user(app.state.db_path, request)
+        if not user:
+            raise HTTPException(404, "No current user")
+        _fen_board(fen)
+        depth = plies if plies > 0 else settings.theory_max_plies
+        try:
+            return theory.main_line(fen, depth, db_path=app.state.db_path)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/api/theory/ideas")
+    def api_theory_ideas(body: TheoryIdeasBody, request: Request):
+        """LLM-объяснение идеи линии: факты Explorer/ECO, без выдумок.
+
+        Если идеи выключены или LLM недоступен — ``ideas: null`` и 200.
+        """
+        user = _current_user(app.state.db_path, request)
+        if not user:
+            raise HTTPException(404, "No current user")
+        _fen_board(body.fen)
+        if not body.line:
+            return {"ideas": None, "cached": False}
+        try:
+            text, cached = theory.ideas_with_cache(
+                body.fen, body.line, db_path=app.state.db_path
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return {"ideas": text, "cached": cached}
+
     @app.get("/api/games")
     def api_games(request: Request, limit: int = 100):
         user = _current_user(app.state.db_path, request)
@@ -3199,6 +3246,34 @@ def create_api(
             lambda db: _game_detail_payload(db, user["nick"], game_id),
             app.state.db_path,
         )
+
+    @app.post("/api/games/{game_id}/analyze")
+    def api_game_analyze(game_id: str, request: Request, refresh: bool = False):
+        """Быстрый анализ одной партии по кнопке (depth 10, без фоновой задачи)."""
+        user = _current_user(app.state.db_path, request)
+        if not user:
+            raise HTTPException(404, "No current user")
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            game = db.get_game(game_id, user["nick"])
+            if game is None:
+                raise HTTPException(404, "Партия не найдена")
+            if not game.moves:
+                raise HTTPException(400, "В партии нет ходов")
+            existing = db.get_analysis(game_id)
+            if isinstance(existing, dict) and not refresh:
+                return {"analysis": existing, "cached": True}
+        if _running_jobs_count() > 0:
+            raise HTTPException(409, "Идёт фоновый анализ — дождись его окончания")
+        try:
+            with Engine(depth=10, multipv=1, time_ms=800) as engine:
+                summary = engine.analyze_game(game).summary()
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(503, f"Не удалось проанализировать партию: {exc}") from exc
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            db.save_analysis(game_id, summary, depth=10)
+        return {"analysis": summary, "cached": False}
 
     @app.get("/api/games/{game_id}/repeats")
     def api_game_repeats(game_id: str, request: Request):

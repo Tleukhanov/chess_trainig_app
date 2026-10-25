@@ -175,12 +175,19 @@ def phase_stats(moves: list[str], analysis: dict, user_color: str) -> dict[str, 
 
     result: dict[str, dict] = {}
     for key in PHASE_KEYS:
-        avg_drop = round(drop_sum[key] / drop_n[key], 2) if drop_n[key] else 0.0
+        # Нет ходов/данных -> None, а не 0: 0% точности выглядит как «сыграл
+        # ужасно», хотя фазы в партии просто не было.
+        if drop_n[key]:
+            avg_drop: float | None = round(drop_sum[key] / drop_n[key], 2)
+            acc: float | None = accuracy(avg_drop)
+        else:
+            avg_drop = None
+            acc = None
         result[key] = {
             "moves": counts[key]["moves"],
             "errors": counts[key]["errors"],
             "avg_drop": avg_drop,
-            "accuracy": accuracy(avg_drop) if drop_n[key] else 0.0,
+            "accuracy": acc,
         }
     return result
 
@@ -194,19 +201,19 @@ def _motif_count(value: Any) -> float:
     return number if number is not None else 0.0
 
 
-def _phase_accuracy(phases: dict, key: str) -> float:
-    """Accuracy фазы 0..100; 0.0, если фазы нет или в ней нет ходов."""
+def _phase_accuracy(phases: dict, key: str) -> float | None:
+    """Accuracy фазы 0..100; None, если фазы нет или в ней нет ходов."""
     row = phases.get(key)
     if not isinstance(row, dict):
-        return 0.0
+        return None
     moves = _finite(row.get("moves"))
     if moves is None or moves <= 0:
-        return 0.0
+        return None
     value = _finite(row.get("accuracy"))
-    return 0.0 if value is None else _clamp(value)
+    return None if value is None else _clamp(value)
 
 
-def category_stats(phase: dict, motifs: dict | None = None) -> dict[str, float]:
+def category_stats(phase: dict, motifs: dict | None = None) -> dict[str, float | None]:
     """Оценки 0..100 по категориям разбора: фазы плюс тактика/стратегия.
 
     ``phase`` — результат :func:`phase_stats`. Категории фаз берутся из
@@ -233,34 +240,31 @@ def category_stats(phase: dict, motifs: dict | None = None) -> dict[str, float]:
         total_motifs += count
         if name.strip().lower() in TACTICAL_MOTIFS:
             tactical += count
-    tactical_share = tactical / total_motifs if total_motifs > 0 else 0.0
+    tactical_share = tactical / total_motifs if total_motifs > 0 else None
 
     opening = _phase_accuracy(phases, "opening")
     middlegame = _phase_accuracy(phases, "middlegame")
     endgame = _phase_accuracy(phases, "endgame")
 
-    strategy = _clamp(middlegame * (1.0 - tactical_share))
+    strategy = None if middlegame is None else _clamp(middlegame * (1.0 - (tactical_share or 0.0)))
 
     positional_parts: list[float] = []
     for key in ("opening", "middlegame"):
-        row = phases.get(key)
-        if not isinstance(row, dict):
-            continue
-        moves = _finite(row.get("moves"))
-        if moves is None or moves <= 0:
-            continue
-        positional_parts.append(_phase_accuracy(phases, key))
-    positional = (
-        sum(positional_parts) / len(positional_parts) if positional_parts else 0.0
-    )
+        value = _phase_accuracy(phases, key)
+        if value is not None:
+            positional_parts.append(value)
+    positional = sum(positional_parts) / len(positional_parts) if positional_parts else None
+
+    def _r(value: float | None) -> float | None:
+        return None if value is None else round(_clamp(value), 2)
 
     return {
-        "opening": round(_clamp(opening), 2),
-        "middlegame": round(_clamp(middlegame), 2),
-        "endgame": round(_clamp(endgame), 2),
-        "tactics": round(_clamp(tactical_share * 100.0), 2),
-        "strategy": round(strategy, 2),
-        "positional": round(_clamp(positional), 2),
+        "opening": _r(opening),
+        "middlegame": _r(middlegame),
+        "endgame": _r(endgame),
+        "tactics": None if tactical_share is None else round(_clamp(tactical_share * 100.0), 2),
+        "strategy": _r(strategy),
+        "positional": _r(positional),
     }
 
 
