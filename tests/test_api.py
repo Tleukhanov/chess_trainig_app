@@ -85,6 +85,11 @@ class ApiTestBase(unittest.TestCase):
         self.data_dir.mkdir()
         self.app = create_api(db_path=self.db_path, data_dir=self.data_dir)
         self.client = TestClient(self.app)
+        # Снапшоты рейтинга ходят в Lichess: в тестах не запускаем фоновой
+        # поток с сетью (тесты снапшота патчат fetch точечно).
+        rating_patch = patch("app.api._RATING_SNAPSHOT_ENABLED", False)
+        rating_patch.start()
+        self.addCleanup(rating_patch.stop)
 
     def _seed_user(self, nick: str, prefix: str) -> None:
         """Одна проанализированная партия."""
@@ -1770,6 +1775,20 @@ class TrackApiTests(ApiTestBase):
         self.assertEqual(data["manual_sec"], 10 * 60)
         self.assertEqual(data["total_sec"], before + 10 * 60)
 
+    def test_ping_updates_daily_log_minutes(self):
+        """total секунд трекера → целые минуты в daily_log за дату."""
+        clock = {"t": 5_000_000.0}
+        with patch("app.api._now", new=lambda: clock["t"]):
+            self.client.post("/api/track/ping")
+            clock["t"] += 150
+            self.client.post("/api/track/ping")
+        with Database(self.db_path) as db:
+            db.init_db()
+            log = db.get_daily_log("tester", _today())
+        self.assertIsNotNone(log)
+        self.assertEqual(log["minutes"], 2)  # 150 сек → 2 мин (округление)
+        self.assertEqual(log["tasks_total"], 0)
+
 
 class PlanGoalTests(ApiTestBase):
     """GET/POST /api/plan/goal: цель, минуты, фокус."""
@@ -3329,6 +3348,142 @@ class GameImportApiTests(ApiTestBase):
         fresh = TestClient(self.app)
         self.assertEqual(
             fresh.post("/api/games/import", data={"pgn": self.PGN}).status_code, 404
+        )
+
+
+class DayPlanApiTests(ApiTestBase):
+    """GET /api/dayplan, POST /api/dayplan/toggle, GET /api/progress/daily."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._set_current("tester")
+
+    def test_dayplan_builds_and_repeat_is_stable(self) -> None:
+        self._seed_user("tester", "dp")
+        first = self.client.get("/api/dayplan")
+        self.assertEqual(first.status_code, 200, first.text)
+        data = first.json()
+        self.assertEqual(
+            set(data),
+            {"date", "tasks", "done", "total", "minutes", "streak_days"},
+        )
+        self.assertEqual(data["date"], _today())
+        self.assertGreaterEqual(data["total"], 1)
+        self.assertEqual(data["total"], len(data["tasks"]))
+        self.assertEqual(data["done"], 0)
+        kinds = {task["kind"] for task in data["tasks"]}
+        self.assertIn("opening", kinds)
+        self.assertIn("review", kinds)
+        for task in data["tasks"]:
+            self.assertEqual(
+                set(task), {"id", "kind", "title", "why", "action", "done"}
+            )
+
+        second = self.client.get("/api/dayplan")
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.json(), data)
+
+    def test_dayplan_toggle_updates_done_and_daily_progress(self) -> None:
+        self._seed_user("tester", "dp")
+        data = self.client.get("/api/dayplan").json()
+        day = data["date"]
+        task_id = data["tasks"][0]["id"]
+
+        resp = self.client.post(
+            "/api/dayplan/toggle",
+            json={"date": day, "task_id": task_id, "done": True},
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        toggled = resp.json()
+        self.assertEqual(toggled["done"], 1)
+        self.assertTrue(
+            next(t for t in toggled["tasks"] if t["id"] == task_id)["done"]
+        )
+        self.assertEqual(toggled["streak_days"], 1)
+
+        history = self.client.get("/api/progress/daily?days=1").json()
+        self.assertEqual(
+            history,
+            [
+                {
+                    "date": day,
+                    "tasks_done": 1,
+                    "tasks_total": data["total"],
+                    "minutes": 0,
+                }
+            ],
+        )
+
+        missing = self.client.post(
+            "/api/dayplan/toggle",
+            json={"date": day, "task_id": "no-such-task", "done": True},
+        )
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(
+            self.client.get("/api/dayplan?date=not-a-date").status_code, 400
+        )
+
+    def test_progress_daily_is_dense_and_validates_days(self) -> None:
+        from app.timeutil import dates_back
+
+        dates = dates_back(3, _today())
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.upsert_daily_log(
+                "tester", dates[1], minutes=15, tasks_done=1, tasks_total=3
+            )
+        items = self.client.get("/api/progress/daily?days=3").json()
+        self.assertEqual([item["date"] for item in items], dates)
+        self.assertEqual(items[0]["minutes"], 0)
+        self.assertEqual(items[1]["minutes"], 15)
+        self.assertEqual(items[1]["tasks_done"], 1)
+        self.assertEqual(items[2]["minutes"], 0)
+        for item in items:
+            self.assertEqual(
+                set(item), {"date", "tasks_done", "tasks_total", "minutes"}
+            )
+        self.assertEqual(
+            self.client.get("/api/progress/daily?days=0").status_code, 400
+        )
+
+
+class AdminCohortTests(ApiTestBase):
+    """Админ-когорта: обычный игрок получает 403, админ — цифры и CSV."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._set_current("tester")
+
+    def _make_admin(self, nick: str) -> None:
+        with Database(self.db_path) as db:
+            db.init_db()
+            with db._connection() as conn:
+                conn.execute(
+                    "UPDATE users SET role = 'admin' WHERE nick_lower = ?",
+                    (nick.lower(),),
+                )
+
+    def test_admin_cohort_403_then_200_and_csv(self) -> None:
+        self.assertEqual(
+            self.client.get("/api/admin/cohort").status_code, 403
+        )
+        self.assertEqual(
+            self.client.get("/api/admin/cohort.csv").status_code, 403
+        )
+
+        self._make_admin("tester")
+        payload = self.client.get("/api/admin/cohort?days=30").json()
+        self.assertEqual(payload["days"], 30)
+        self.assertEqual(payload["summary"]["users"], 1)
+        self.assertIn("improved", payload["summary"])
+        self.assertIn("avg_rating_delta", payload["summary"])
+        self.assertEqual(payload["users"][0]["nick"], "tester")
+
+        csv_resp = self.client.get("/api/admin/cohort.csv?days=30")
+        self.assertEqual(csv_resp.status_code, 200)
+        self.assertIn("text/csv", csv_resp.headers["content-type"])
+        self.assertTrue(
+            csv_resp.text.startswith("nick,rating_start,rating_end")
         )
 
 

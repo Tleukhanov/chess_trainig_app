@@ -33,6 +33,13 @@ def _cfg(name: str, default: str) -> str:
     return value if value not in (None, "") else default
 
 
+def _csv_list(name: str, default: str = "") -> tuple[str, ...]:
+    """Список из env через запятую (пустые элементы отбрасываются)."""
+    return tuple(
+        part.strip() for part in _cfg(name, default).split(",") if part.strip()
+    )
+
+
 def _is_heroku() -> bool:
     """True, если процесс запущен на Heroku (есть DYNO в окружении, напр. web.1)."""
     return bool(os.environ.get("DYNO"))
@@ -126,6 +133,13 @@ class Settings:
     data_dir: Path = PROJECT_ROOT / "data"
     db_path: Path = PROJECT_ROOT / "data" / "trainer.db"
 
+    # --- календарь и админка демо ---
+    # Все «даты дня» (задача дня, трекер, план, прогресс) считаются в этом
+    # поясе, а не в поясе сервера (Heroku живёт в UTC).
+    app_tz: str = _cfg("APP_TZ", "Asia/Almaty")
+    # Ники, которые видят админку, даже если role в БД не выставлена.
+    admin_nicks: tuple[str, ...] = _csv_list("ADMIN_NICKS", "")
+
     # --- Maia-2 (тренер дебютов) ---
     maia_onnx_path: Path = Path(
         _cfg("MAIA_ONNX_PATH", str(PROJECT_ROOT / "data" / "maia" / "maia2-rapid.onnx"))
@@ -138,6 +152,15 @@ class Settings:
     )
     maia_default_elo: int = int(_cfg("MAIA_DEFAULT_ELO", "1500"))
     opening_plies: int = int(_cfg("OPENING_PLIES", "40"))
+
+    # --- гибридный соперник Maia + фильтр Stockfish ---
+    # Порог потери в cp: ходы хуже лучшей оценки больше чем на threshold
+    # отбрасываются. min_candidates — сколько ходов Maia минимум оставить,
+    # чтобы соперник не играл всегда один и тот же лучший ход движка.
+    hybrid_threshold_cp: int = int(_cfg("HYBRID_THRESHOLD_CP", "80"))
+    hybrid_depth: int = int(_cfg("HYBRID_DEPTH", "12"))
+    hybrid_time_ms: int = int(_cfg("HYBRID_TIME_MS", "800"))
+    hybrid_min_candidates: int = int(_cfg("HYBRID_MIN_CANDIDATES", "2"))
 
     # --- теория дебютов (explorer/ECO) ---
     # "lichess" | "eco" | "off": источник главной линии. Провайдер можно

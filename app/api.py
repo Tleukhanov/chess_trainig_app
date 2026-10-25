@@ -6,9 +6,11 @@
 
 from __future__ import annotations
 
+import csv
 import datetime
 import gc
 import hashlib
+import io
 import json
 import logging
 import os
@@ -33,10 +35,12 @@ from pydantic import BaseModel, Field
 from . import data as shared_data
 from . import middlegame as mg
 from . import theory
+from . import timeutil
 from .analyzer import Engine, win_percent
 from .coach import _extract_json, build_request, run_coach
 from .config import settings
-from .db import Database, hash_password, verify_password
+from .dayplan import build_tasks
+from .db import Database, hash_password, is_admin, verify_password
 from .drills import drills_to_json, drills_to_pgn
 from .fide import (
     TournamentGame,
@@ -712,6 +716,14 @@ class MoveNoteBody(BaseModel):
 
     ply: int
     intent: str = ""
+
+
+class DayPlanToggleBody(BaseModel):
+    """Тело POST /api/dayplan/toggle: дата, задача и новое состояние."""
+
+    date: str
+    task_id: str
+    done: bool = True
 
 
 # --- Шахматные утилиты: свободный разбор позиции (stateless) -----------------
@@ -1535,8 +1547,8 @@ _TASK_EXPLAIN_SYSTEM = """Ты — шахматный тренер сильно�
 
 
 def _today() -> str:
-    """Сегодняшняя локальная дата сервера в формате YYYY-MM-DD."""
-    return time.strftime("%Y-%m-%d")
+    """Сегодняшняя дата приложения (``APP_TZ``, по умолчанию Asia/Almaty)."""
+    return timeutil.today()
 
 
 def _task_choice_key(date: str, user: str) -> str:
@@ -1699,6 +1711,286 @@ def _task_payload(db: Database, user: str, date: str | None = None) -> dict[str,
         "explained": explanation is not None,
         "done": db.get_meta(_task_done_key(day, user)) == "1",
     }
+
+
+# --- План дня, снапшоты рейтинга и админ-когорта ---------------------------
+
+# Снапшоты рейтинга ходят в сеть; тесты API выключают флаг, чтобы не
+# обращаться к Lichess и не плодить фоновые потоки.
+_RATING_SNAPSHOT_ENABLED = True
+
+
+def _rating_try_key(day: str, user: str) -> str:
+    """Ключ meta: попытка снапшота рейтинга за день уже была."""
+    return f"rating_snapshot_try_{day}_{user}"
+
+
+def _snapshot_rating_worker(db_path: Path, nick: str, day: str) -> None:
+    """Фоновый снапшот рейтинга Lichess; любые ошибки молча глотаем."""
+    try:
+        with Database(db_path) as db:
+            db.init_db()
+            data = fetch_lichess_rating(_lichess_of(db, nick))
+            if isinstance(data, dict):
+                rating = data.get("rating")
+                if (
+                    isinstance(rating, int)
+                    and not isinstance(rating, bool)
+                    and rating > 0
+                ):
+                    db.save_rating_snapshot(nick, day, rating)
+    except Exception:  # noqa: BLE001 — фоновый путь не должен ронять запрос
+        logger.debug("rating snapshot failed for %s/%s", nick, day, exc_info=True)
+
+
+def _maybe_snapshot_rating(db: Database, nick: str, day: str) -> None:
+    """Запускает снапшот не чаще раза в день (успех и ошибка считаются).
+
+    Маркер попытки в meta ставится до потока: если Lichess недоступен,
+    каждый ping не будет заново ждать таймаут.
+    """
+    if not _RATING_SNAPSHOT_ENABLED:
+        return
+    try:
+        if db.get_rating_snapshot(nick, day) is not None:
+            return
+        marker = _rating_try_key(day, nick)
+        if db.get_meta(marker) == "1":
+            return
+        db.set_meta(marker, "1")
+        threading.Thread(
+            target=_snapshot_rating_worker,
+            args=(db.path, nick, day),
+            daemon=True,
+        ).start()
+    except Exception:  # noqa: BLE001 — трекер времени важнее рейтинга
+        logger.debug("cannot start rating snapshot for %s", nick, exc_info=True)
+
+
+def _parse_day(raw: str | None) -> str:
+    """Дата из query/body строго ``YYYY-MM-DD``; пусто — сегодня."""
+    text = (raw or "").strip()
+    if not text:
+        return _today()
+    try:
+        return datetime.date.fromisoformat(text).isoformat()
+    except ValueError:
+        raise HTTPException(400, "Дата: формат YYYY-MM-DD") from None
+
+
+def _dayplan_payload(
+    db: Database, nick: str, day: str, data_dir: Path
+) -> dict[str, Any]:
+    """День плана: строит и сохраняет задачи при первом запросе.
+
+    Повторный вызов читает сохранённое, поэтому ``done`` и порядок задач
+    стабильны. Если аналитики ещё нет, план пустой: останутся задача дня
+    (если есть ошибки) и разбор.
+    """
+    tasks = db.get_daily_plan(nick, day)
+    if not tasks:
+        plan: dict[str, Any] = {}
+        try:
+            plan = shared_data.plan(db, nick, root=data_dir)
+        except (RuntimeError, ValueError):
+            plan = {}
+        task = None
+        try:
+            task = _task_payload(db, nick, day)
+        except (RuntimeError, ValueError):
+            task = None
+        built = build_tasks(plan, task, day)
+        if built:
+            db.save_daily_plan(nick, day, built)
+            tasks = db.get_daily_plan(nick, day) or built
+
+    # Задача дня решается на своей странице (/api/task/answer) — meta
+    # daily_done становится источником правды, отмечаем её и в плане.
+    if db.get_meta(_task_done_key(day, nick)) == "1":
+        for item in tasks:
+            if item.get("kind") == "task" and not item.get("done"):
+                if db.toggle_daily_task(nick, day, str(item.get("id")), True):
+                    item["done"] = True
+
+    done = sum(1 for item in tasks if item.get("done"))
+    total = len(tasks)
+    log = db.get_daily_log(nick, day) or {}
+    if (
+        int(log.get("tasks_done") or 0) != done
+        or int(log.get("tasks_total") or 0) != total
+    ):
+        db.upsert_daily_log(nick, day, tasks_done=done, tasks_total=total)
+        log = db.get_daily_log(nick, day) or log
+    return {
+        "date": day,
+        "tasks": tasks,
+        "done": int(log.get("tasks_done") or done),
+        "total": int(log.get("tasks_total") or total),
+        "minutes": int(log.get("minutes") or 0),
+        "streak_days": db.streak_days(nick, day),
+    }
+
+
+def _admin_user(request: Request, db_path: Path) -> dict | None:
+    """Текущий пользователь, если он админ; иначе HTTP 403."""
+    user = _current_user(db_path, request)
+    if not user:
+        raise HTTPException(403, "Доступ только для админа")
+    with Database(db_path) as db:
+        db.init_db()
+        if not is_admin(db, user["nick"]):
+            raise HTTPException(403, "Доступ только для админа")
+    return user
+
+
+def _last_seen_iso(value: Any) -> str | None:
+    """``users.last_seen_at`` (секунды) → ISO с поясом приложения."""
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    if seconds <= 0:
+        return None
+    try:
+        return datetime.datetime.fromtimestamp(
+            seconds, timeutil.timezone_for()
+        ).isoformat(timespec="seconds")
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _mean(values: list[float]) -> float:
+    return round(sum(values) / len(values), 1) if values else 0.0
+
+
+def _cohort_payload(db: Database, days: int) -> dict[str, Any]:
+    """Когорта за окно ``days``: рейтинг, активность, задачи, анализы."""
+    end_day = timeutil.today()
+    count = min(3650, max(1, int(days)))
+    rows: list[dict[str, Any]] = []
+    for record in db.list_users():
+        nick = str(record.get("nick") or "").strip()
+        if not nick:
+            continue
+        snapshots = [
+            item
+            for item in db.list_rating_snapshots(nick, count, end_day)
+            if item.get("rating") is not None
+        ]
+        rating_start = snapshots[0]["rating"] if snapshots else None
+        rating_end = snapshots[-1]["rating"] if snapshots else None
+        rating_delta = (
+            int(rating_end) - int(rating_start)
+            if rating_start is not None and rating_end is not None
+            else None
+        )
+
+        logs = db.list_daily_logs(nick, count, end_day)
+        active = [
+            item
+            for item in logs
+            if int(item.get("tasks_done") or 0) > 0 or int(item.get("minutes") or 0) > 0
+        ]
+        days_active = len(active)
+        minutes_total = sum(int(item.get("minutes") or 0) for item in logs)
+        tasks_done = sum(int(item.get("tasks_done") or 0) for item in logs)
+        tasks_total = sum(int(item.get("tasks_total") or 0) for item in logs)
+        completion_pct = (
+            round(tasks_done / tasks_total * 100.0, 1) if tasks_total else 0.0
+        )
+        improved_rating = rating_delta is not None and rating_delta >= 30
+        improved_activity = completion_pct >= 60.0 and days_active >= 10
+        rows.append(
+            {
+                "nick": nick,
+                "rating_start": rating_start,
+                "rating_end": rating_end,
+                "rating_delta": rating_delta,
+                "days_active": days_active,
+                "minutes_total": minutes_total,
+                "avg_minutes_per_day": (
+                    round(minutes_total / days_active, 1) if days_active else 0.0
+                ),
+                "tasks_done": tasks_done,
+                "tasks_total": tasks_total,
+                "completion_pct": completion_pct,
+                "games_analyzed": sum(
+                    int(item.get("games_analyzed") or 0) for item in logs
+                ),
+                "analyses": sum(int(item.get("analyses") or 0) for item in logs),
+                "last_seen": _last_seen_iso(record.get("last_seen_at")),
+                "improved_rating": improved_rating,
+                "improved_activity": improved_activity,
+                "improved": improved_rating or improved_activity,
+            }
+        )
+
+    return {
+        "days": count,
+        "users": rows,
+        "summary": {
+            "users": len(rows),
+            "active_users": sum(1 for row in rows if row["days_active"] > 0),
+            "improved": sum(1 for row in rows if row["improved"]),
+            "improved_by_rating": sum(
+                1 for row in rows if row["improved_rating"]
+            ),
+            "improved_by_activity": sum(
+                1 for row in rows if row["improved_activity"]
+            ),
+            "avg_rating_delta": _mean(
+                [
+                    float(row["rating_delta"])
+                    for row in rows
+                    if row["rating_delta"] is not None
+                ]
+            ),
+            "avg_completion_pct": _mean(
+                [float(row["completion_pct"]) for row in rows]
+            ),
+            "avg_minutes_per_day": _mean(
+                [float(row["avg_minutes_per_day"]) for row in rows]
+            ),
+            "avg_days_active": _mean([float(row["days_active"]) for row in rows]),
+        },
+    }
+
+
+_COHORT_CSV_COLUMNS = (
+    "nick",
+    "rating_start",
+    "rating_end",
+    "rating_delta",
+    "days_active",
+    "minutes_total",
+    "avg_minutes_per_day",
+    "tasks_done",
+    "tasks_total",
+    "completion_pct",
+    "games_analyzed",
+    "analyses",
+    "improved",
+    "improved_rating",
+    "improved_activity",
+    "last_seen",
+)
+
+
+def _cohort_csv(rows: list[dict[str, Any]]) -> str:
+    """CSV когорты (RFC 4180, UTF-8, перевод строки ``\\n``)."""
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
+    writer.writerow(_COHORT_CSV_COLUMNS)
+    for row in rows:
+        writer.writerow(
+            [
+                int(row[column])
+                if isinstance(row.get(column), bool)
+                else ("" if row.get(column) is None else row.get(column))
+                for column in _COHORT_CSV_COLUMNS
+            ]
+        )
+    return buffer.getvalue()
 
 
 def _fmt_win(value: Any) -> str:
@@ -2113,7 +2405,7 @@ def _plan_week_payload(db: Database, nick: str, data_dir: Any) -> dict[str, Any]
             )
         lichess_sec = 0.0
         for game in games:
-            if time.strftime("%Y-%m-%d", time.localtime(game.created_at / 1000)) != day:
+            if timeutil.date_of_ms(game.created_at) != day:
                 continue
             lichess_sec += _clock_seconds(game.clocks)
         time_sec = int(site_sec + lichess_sec + manual_sec)
@@ -2657,6 +2949,95 @@ def create_api(
                 db, user["nick"], root=app.state.data_dir, windows=windows
             ),
             app.state.db_path,
+        )
+
+    @app.get("/api/progress/daily")
+    def api_progress_daily(request: Request, days: int = 30):
+        """История активности по дням (плотная, пустые дни — нули)."""
+        if not 1 <= days <= 3650:
+            raise HTTPException(400, "days: целое число от 1 до 3650")
+        user = _current_user(app.state.db_path, request)
+        if not user:
+            raise HTTPException(404, "No current user")
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            logs = db.list_daily_logs(user["nick"], days)
+        return [
+            {
+                "date": item["date"],
+                "tasks_done": item["tasks_done"],
+                "tasks_total": item["tasks_total"],
+                "minutes": item["minutes"],
+            }
+            for item in logs
+        ]
+
+    # --- План дня ---
+    @app.get("/api/dayplan")
+    def api_dayplan(request: Request, date: str = ""):
+        day = _parse_day(date)
+        user = _current_user(app.state.db_path, request)
+        if not user:
+            raise HTTPException(404, "No current user")
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            return _dayplan_payload(db, user["nick"], day, app.state.data_dir)
+
+    @app.post("/api/dayplan/toggle")
+    def api_dayplan_toggle(request: Request, body: DayPlanToggleBody):
+        day = _parse_day(body.date)
+        task_id = body.task_id.strip()
+        if not task_id:
+            raise HTTPException(400, "task_id не может быть пустым")
+        user = _current_user(app.state.db_path, request)
+        if not user:
+            raise HTTPException(404, "No current user")
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            tasks = db.get_daily_plan(user["nick"], day)
+            kind = next(
+                (task.get("kind") for task in tasks if task.get("id") == task_id),
+                None,
+            )
+            if not db.toggle_daily_task(user["nick"], day, task_id, body.done):
+                raise HTTPException(404, "Задача дня не найдена")
+            # Задача дня имеет второй счётчик в meta (/api/task/answer);
+            # ручная отметка в плане должна совпадать с ним.
+            if kind == "task":
+                db.set_meta(
+                    _task_done_key(day, user["nick"]),
+                    "1" if body.done else "0",
+                )
+            return _dayplan_payload(
+                db, user["nick"], day, app.state.data_dir
+            )
+
+    # --- Админка демо: когорта игроков ---
+    @app.get("/api/admin/cohort")
+    def api_admin_cohort(request: Request, days: int = 30):
+        if not 1 <= days <= 3650:
+            raise HTTPException(400, "days: целое число от 1 до 3650")
+        _admin_user(request, app.state.db_path)
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            return _cohort_payload(db, days)
+
+    @app.get("/api/admin/cohort.csv")
+    def api_admin_cohort_csv(request: Request, days: int = 30):
+        if not 1 <= days <= 3650:
+            raise HTTPException(400, "days: целое число от 1 до 3650")
+        _admin_user(request, app.state.db_path)
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            payload = _cohort_payload(db, days)
+        return Response(
+            _cohort_csv(payload["users"]),
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="cohort_{days}d.csv"'
+                )
+            },
         )
 
     def _drills_payload(
@@ -3832,7 +4213,9 @@ def create_api(
         if not user:
             raise HTTPException(404, "No current user")
         now = _now()
-        key = _track_key(_today(), user["nick"])
+        day = _today()
+        nick = user["nick"]
+        key = _track_key(day, nick)
         with Database(app.state.db_path) as db:
             state = _track_state(db, key)
             if state is None:
@@ -3841,6 +4224,16 @@ def create_api(
                 gap = now - state["last"]
                 total = state["total"] + gap if 0.0 <= gap <= 300.0 else state["total"]
             db.set_meta(key, json.dumps({"last": now, "total": total}))
+            # Дневной лог: минуты сайта (total/60) и активность по партиям/анализам.
+            activity = db.daily_activity_counts(nick, day)
+            db.upsert_daily_log(
+                nick,
+                day,
+                minutes=int(round(total / 60.0)),
+                games_analyzed=activity["games_analyzed"],
+                analyses=activity["analyses"],
+            )
+        _maybe_snapshot_rating(db, nick, day)
         return {"ok": True, "total": int(total)}
 
     @app.post("/api/track/lichess_manual")
@@ -3873,7 +4266,7 @@ def create_api(
         lichess_sec = 0.0
         games_today = 0
         for game in games:
-            if time.strftime("%Y-%m-%d", time.localtime(game.created_at / 1000)) != day:
+            if timeutil.date_of_ms(game.created_at) != day:
                 continue
             games_today += 1
             lichess_sec += _clock_seconds(game.clocks)

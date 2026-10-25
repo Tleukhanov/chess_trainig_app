@@ -17,11 +17,12 @@ import os
 import sqlite3
 import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
 from . import pgdb
+from . import timeutil
 from .config import settings
 from .games import Game
 from .middlegame import MiddlegameSession
@@ -164,6 +165,47 @@ CREATE TABLE IF NOT EXISTS {table}(
 )
 """
 
+# План дня: строки-задачи, собранные детерминированно на дату. payload —
+# JSON задачи без id/done (done и updated_at живут в колонках). Колонка
+# "user" в кавычках: в PostgreSQL это зарезервированное слово.
+_DAILY_PLAN_DDL = """
+CREATE TABLE IF NOT EXISTS {table}(
+    "user" TEXT NOT NULL,
+    date TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    payload TEXT,
+    done INTEGER DEFAULT 0,
+    updated_at BIGINT,
+    PRIMARY KEY("user", date, task_id)
+)
+"""
+
+# Дневной лог: минуты с трекера, счётчик задач и активность по партиям.
+# Одна строка на (игрок, дата); минуты/счётчики обновляются точечно.
+_DAILY_LOG_DDL = """
+CREATE TABLE IF NOT EXISTS {table}(
+    "user" TEXT NOT NULL,
+    date TEXT NOT NULL,
+    tasks_done INTEGER DEFAULT 0,
+    tasks_total INTEGER DEFAULT 0,
+    minutes INTEGER DEFAULT 0,
+    games_analyzed INTEGER DEFAULT 0,
+    analyses INTEGER DEFAULT 0,
+    updated_at BIGINT,
+    PRIMARY KEY("user", date)
+)
+"""
+
+# Снапшот рейтинга Lichess на дату (не чаще раза в день, см. api.track/ping).
+_RATING_SNAPSHOTS_DDL = """
+CREATE TABLE IF NOT EXISTS {table}(
+    "user" TEXT NOT NULL,
+    date TEXT NOT NULL,
+    rating INTEGER,
+    PRIMARY KEY("user", date)
+)
+"""
+
 _GAME_COLUMNS = (
     "id, player, rated, speed, created_at, status, winner, white, black, "
     "opening, eco, user_color, opponent, user_rating, user_rating_diff, "
@@ -227,6 +269,9 @@ _SCHEMA = f"""
 {_MIDDLEGAME_SESSIONS_DDL.format(table="middlegame_sessions")};
 {_MOVE_NOTES_DDL.format(table="move_notes")};
 {_THEORY_CACHE_DDL.format(table="theory_cache")};
+{_DAILY_PLAN_DDL.format(table="daily_plan")};
+{_DAILY_LOG_DDL.format(table="daily_log")};
+{_RATING_SNAPSHOTS_DDL.format(table="rating_snapshots")};
 CREATE TABLE IF NOT EXISTS sessions(
     token TEXT PRIMARY KEY,
     nick TEXT,
@@ -238,6 +283,8 @@ CREATE INDEX IF NOT EXISTS idx_task_explanations_player ON task_explanations(pla
 CREATE INDEX IF NOT EXISTS idx_opening_sessions_player ON opening_sessions(player, created_at);
 CREATE INDEX IF NOT EXISTS idx_middlegame_sessions_player ON middlegame_sessions(player, created_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_nick ON sessions(nick);
+CREATE INDEX IF NOT EXISTS idx_daily_log_date ON daily_log(date);
+CREATE INDEX IF NOT EXISTS idx_rating_snapshots_date ON rating_snapshots(date);
 """
 
 # Новые колонки users (миграция без потери данных — см. init_db).
@@ -314,6 +361,11 @@ def _uj(raw: str | None) -> Any:
     if not raw:
         return None
     return json.loads(raw)
+
+
+def _parse_iso_day(value: Any):
+    """Дата из ``YYYY-MM-DD`` (ValueError на мусор)."""
+    return datetime.strptime(str(value).strip(), "%Y-%m-%d").date()
 
 
 def _optional_int(value: Any) -> int | None:
@@ -1152,6 +1204,375 @@ class Database:
                 (key, value),
             )
 
+    # --- план дня и дневной лог ------------------------------------------
+
+    def get_daily_plan(self, user: str, date: str) -> list[dict[str, Any]]:
+        """Задачи дня, сохранённые для (игрок, дата), в порядке плана.
+
+        payload хранится без id/done; наружу отдаём полную задачу. Битый
+        JSON пропускается, чтобы одна плохая строка не роняла весь день.
+        """
+        key = (user or "").strip()
+        day = (date or "").strip()
+        if not key or not day:
+            return []
+        with self._connection() as conn:
+            rows = conn.execute(
+                'SELECT task_id, payload, done FROM daily_plan '
+                'WHERE "user" = ? AND date = ? ORDER BY updated_at ASC, task_id ASC',
+                (key, day),
+            ).fetchall()
+        tasks: list[tuple[int, str, dict[str, Any]]] = []
+        for row in rows:
+            try:
+                payload = _uj(row["payload"])
+            except (TypeError, ValueError):
+                payload = None
+            if not isinstance(payload, dict):
+                payload = {}
+            order = payload.pop("_order", None)
+            task = dict(payload)
+            task["id"] = str(row["task_id"])
+            task["done"] = bool(_optional_int(row["done"]) or 0)
+            task.setdefault("kind", "task")
+            task.setdefault("title", "")
+            task.setdefault("why", "")
+            task.setdefault("action", {})
+            try:
+                sort_key = int(order)
+            except (TypeError, ValueError):
+                sort_key = 10**6
+            tasks.append((sort_key, task["id"], task))
+        tasks.sort(key=lambda item: (item[0], item[1]))
+        return [task for _, _, task in tasks]
+
+    def save_daily_plan(
+        self, user: str, date: str, tasks: list[dict[str, Any]]
+    ) -> None:
+        """UPSERT задач дня; уже отмеченный ``done`` не сбрасывается.
+
+        Повторный вызов с тем же набором идемпотентен, а если план
+        пересобрали — обновляет тексты/параметры, сохраняя прогресс.
+        """
+        key = (user or "").strip()
+        day = (date or "").strip()
+        if not key or not day:
+            return
+        now = int(time.time())
+        with self._connection() as conn:
+            for index, task in enumerate(tasks):
+                if not isinstance(task, dict):
+                    continue
+                task_id = str(task.get("id") or "").strip()
+                if not task_id:
+                    continue
+                payload = {
+                    name: value
+                    for name, value in task.items()
+                    if name not in ("id", "done")
+                }
+                payload["_order"] = index
+                conn.execute(
+                    'INSERT INTO daily_plan("user", date, task_id, payload, done, updated_at) '
+                    "VALUES (?, ?, ?, ?, ?, ?) "
+                    'ON CONFLICT("user", date, task_id) DO UPDATE SET '
+                    "payload = excluded.payload, updated_at = excluded.updated_at",
+                    (
+                        key,
+                        day,
+                        task_id,
+                        _j(payload),
+                        1 if task.get("done") else 0,
+                        now,
+                    ),
+                )
+            self._sync_daily_totals(conn, key, day, now)
+
+    def toggle_daily_task(
+        self, user: str, date: str, task_id: str, done: bool
+    ) -> bool:
+        """Включает/выключает задачу дня; True — задача найдена."""
+        key = (user or "").strip()
+        day = (date or "").strip()
+        ident = (task_id or "").strip()
+        if not key or not day or not ident:
+            return False
+        now = int(time.time())
+        with self._connection() as conn:
+            cursor = conn.execute(
+                'UPDATE daily_plan SET done = ?, updated_at = ? '
+                'WHERE "user" = ? AND date = ? AND task_id = ?',
+                (1 if done else 0, now, key, day, ident),
+            )
+            if cursor.rowcount == 0:
+                return False
+            self._sync_daily_totals(conn, key, day, now)
+        return True
+
+    @staticmethod
+    def _sync_daily_totals(
+        conn: Any, user: str, date: str, now: int
+    ) -> None:
+        """Пересчитывает tasks_done/tasks_total в daily_log по daily_plan."""
+        row = conn.execute(
+            'SELECT COUNT(*) AS total, COALESCE(SUM(done), 0) AS done '
+            'FROM daily_plan WHERE "user" = ? AND date = ?',
+            (user, date),
+        ).fetchone()
+        total = int(row["total"] or 0) if row is not None else 0
+        done = int(row["done"] or 0) if row is not None else 0
+        conn.execute(
+            'INSERT INTO daily_log("user", date, tasks_done, tasks_total, '
+            "minutes, games_analyzed, analyses, updated_at) "
+            "VALUES (?, ?, ?, ?, 0, 0, 0, ?) "
+            'ON CONFLICT("user", date) DO UPDATE SET '
+            "tasks_done = excluded.tasks_done, "
+            "tasks_total = excluded.tasks_total, "
+            "updated_at = excluded.updated_at",
+            (user, date, done, total, now),
+        )
+
+    def get_daily_log(self, user: str, date: str) -> dict[str, Any] | None:
+        """Дневной лог по (игрок, дата) или None."""
+        key = (user or "").strip()
+        day = (date or "").strip()
+        if not key or not day:
+            return None
+        with self._connection() as conn:
+            row = conn.execute(
+                'SELECT date, tasks_done, tasks_total, minutes, games_analyzed, '
+                'analyses, updated_at FROM daily_log '
+                'WHERE "user" = ? AND date = ?',
+                (key, day),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "date": str(row["date"]),
+            "tasks_done": int(row["tasks_done"] or 0),
+            "tasks_total": int(row["tasks_total"] or 0),
+            "minutes": int(row["minutes"] or 0),
+            "games_analyzed": int(row["games_analyzed"] or 0),
+            "analyses": int(row["analyses"] or 0),
+            "updated_at": int(row["updated_at"] or 0),
+        }
+
+    def upsert_daily_log(
+        self,
+        user: str,
+        date: str,
+        *,
+        tasks_done: int | None = None,
+        tasks_total: int | None = None,
+        minutes: int | None = None,
+        games_analyzed: int | None = None,
+        analyses: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Сливает поля дневного лога: None-поля остаются как были.
+
+        ``minutes`` — уже целые минуты (трекер присылает секунды).
+        """
+        key = (user or "").strip()
+        day = (date or "").strip()
+        if not key or not day:
+            return None
+        current = self.get_daily_log(key, day) or {}
+        data = {
+            "tasks_done": int(current.get("tasks_done") or 0),
+            "tasks_total": int(current.get("tasks_total") or 0),
+            "minutes": int(current.get("minutes") or 0),
+            "games_analyzed": int(current.get("games_analyzed") or 0),
+            "analyses": int(current.get("analyses") or 0),
+        }
+        updates = {
+            "tasks_done": tasks_done,
+            "tasks_total": tasks_total,
+            "minutes": minutes,
+            "games_analyzed": games_analyzed,
+            "analyses": analyses,
+        }
+        for name, value in updates.items():
+            if value is not None:
+                data[name] = max(0, int(value))
+        now = int(time.time())
+        with self._connection() as conn:
+            conn.execute(
+                'INSERT INTO daily_log("user", date, tasks_done, tasks_total, '
+                "minutes, games_analyzed, analyses, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                'ON CONFLICT("user", date) DO UPDATE SET '
+                "tasks_done = excluded.tasks_done, "
+                "tasks_total = excluded.tasks_total, "
+                "minutes = excluded.minutes, "
+                "games_analyzed = excluded.games_analyzed, "
+                "analyses = excluded.analyses, "
+                "updated_at = excluded.updated_at",
+                (
+                    key,
+                    day,
+                    data["tasks_done"],
+                    data["tasks_total"],
+                    data["minutes"],
+                    data["games_analyzed"],
+                    data["analyses"],
+                    now,
+                ),
+            )
+        result = dict(data)
+        result["date"] = day
+        result["updated_at"] = now
+        return result
+
+    def list_daily_logs(
+        self, user: str, days: int = 30, end_day: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Плотная история за последние ``days`` дней (пустые дни — нули)."""
+        key = (user or "").strip()
+        if not key:
+            return []
+        count = min(3650, max(1, int(days)))
+        dates = timeutil.dates_back(count, end_day)
+        with self._connection() as conn:
+            rows = conn.execute(
+                'SELECT date, tasks_done, tasks_total, minutes, games_analyzed, '
+                'analyses, updated_at FROM daily_log '
+                'WHERE "user" = ? AND date >= ? AND date <= ?',
+                (key, dates[0], dates[-1]),
+            ).fetchall()
+        by_date = {
+            str(row["date"]): {
+                "date": str(row["date"]),
+                "tasks_done": int(row["tasks_done"] or 0),
+                "tasks_total": int(row["tasks_total"] or 0),
+                "minutes": int(row["minutes"] or 0),
+                "games_analyzed": int(row["games_analyzed"] or 0),
+                "analyses": int(row["analyses"] or 0),
+                "updated_at": int(row["updated_at"] or 0),
+            }
+            for row in rows
+        }
+        return [
+            by_date.get(
+                day,
+                {
+                    "date": day,
+                    "tasks_done": 0,
+                    "tasks_total": 0,
+                    "minutes": 0,
+                    "games_analyzed": 0,
+                    "analyses": 0,
+                    "updated_at": 0,
+                },
+            )
+            for day in dates
+        ]
+
+    def streak_days(self, user: str, end_day: str | None = None) -> int:
+        """Сколько дней подряд (заканчивая ``end_day``) есть активность.
+
+        Активность = ``tasks_done > 0`` или ``minutes > 0``. Если сегодня
+        ещё ничего не сделано, стрик равен 0 (не «вчерашний»), чтобы
+        интерфейс не показывал ложную серию.
+        """
+        key = (user or "").strip()
+        if not key:
+            return 0
+        try:
+            last = timeutil.now().date() if not end_day else _parse_iso_day(end_day)
+        except ValueError:
+            return 0
+        with self._connection() as conn:
+            rows = conn.execute(
+                'SELECT date FROM daily_log WHERE "user" = ? '
+                "AND (tasks_done > 0 OR minutes > 0) AND date <= ? "
+                "ORDER BY date DESC LIMIT 3660",
+                (key, last.isoformat()),
+            ).fetchall()
+        active = {str(row["date"]) for row in rows}
+        streak = 0
+        cursor = last
+        while cursor.isoformat() in active:
+            streak += 1
+            cursor = cursor - timedelta(days=1)
+        return streak
+
+    def daily_activity_counts(self, user: str, date: str) -> dict[str, int]:
+        """Партии за дату и анализы, сделанные в эту дату (по поясу APP_TZ)."""
+        key = (user or "").strip()
+        if not key:
+            return {"games_analyzed": 0, "analyses": 0}
+        try:
+            start_ms, end_ms = timeutil.day_bounds_ms(date)
+        except (TypeError, ValueError):
+            return {"games_analyzed": 0, "analyses": 0}
+        with self._connection() as conn:
+            games_row = conn.execute(
+                "SELECT COUNT(*) AS n FROM games "
+                "WHERE LOWER(player) = LOWER(?) AND created_at >= ? AND created_at < ?",
+                (key, start_ms, end_ms),
+            ).fetchone()
+            analyses_row = conn.execute(
+                "SELECT COUNT(*) AS n FROM analyses a "
+                "JOIN games g ON g.id = a.game_id "
+                "WHERE LOWER(g.player) = LOWER(?) "
+                "AND a.analyzed_at >= ? AND a.analyzed_at < ?",
+                (key, start_ms, end_ms),
+            ).fetchone()
+        return {
+            "games_analyzed": int(games_row["n"] or 0) if games_row else 0,
+            "analyses": int(analyses_row["n"] or 0) if analyses_row else 0,
+        }
+
+    # --- снапшоты рейтинга Lichess ---------------------------------------
+
+    def get_rating_snapshot(self, user: str, date: str) -> int | None:
+        """Рейтинг на дату или None (снапшота нет)."""
+        key = (user or "").strip()
+        day = (date or "").strip()
+        if not key or not day:
+            return None
+        with self._connection() as conn:
+            row = conn.execute(
+                'SELECT rating FROM rating_snapshots WHERE "user" = ? AND date = ?',
+                (key, day),
+            ).fetchone()
+        if row is None:
+            return None
+        return _optional_int(row["rating"])
+
+    def save_rating_snapshot(self, user: str, date: str, rating: int) -> None:
+        """UPSERT рейтинга на дату (повторный ping в тот же день — обновление)."""
+        key = (user or "").strip()
+        day = (date or "").strip()
+        if not key or not day:
+            return
+        with self._connection() as conn:
+            conn.execute(
+                'INSERT INTO rating_snapshots("user", date, rating) VALUES (?, ?, ?) '
+                'ON CONFLICT("user", date) DO UPDATE SET rating = excluded.rating',
+                (key, day, int(rating)),
+            )
+
+    def list_rating_snapshots(
+        self, user: str, days: int = 30, end_day: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Снапшоты рейтинга за окно (только существующие, по возрастанию)."""
+        key = (user or "").strip()
+        if not key:
+            return []
+        count = min(3650, max(1, int(days)))
+        dates = timeutil.dates_back(count, end_day)
+        with self._connection() as conn:
+            rows = conn.execute(
+                'SELECT date, rating FROM rating_snapshots '
+                'WHERE "user" = ? AND date >= ? AND date <= ? ORDER BY date ASC',
+                (key, dates[0], dates[-1]),
+            ).fetchall()
+        return [
+            {"date": str(row["date"]), "rating": _optional_int(row["rating"])}
+            for row in rows
+        ]
+
     # --- кеш теории дебютов ---------------------------------------------
 
     def get_theory_cache(
@@ -1532,3 +1953,25 @@ class Database:
 
     def __exit__(self, *exc) -> None:
         self.close()
+
+
+def is_admin(db: Database, nick: str | None) -> bool:
+    """Админ ли игрок: ``users.role == 'admin'`` или ник в ``ADMIN_NICKS``.
+
+    Env-список нужен демо-стенду: роль в БД можно не выставлять, достаточно
+    ``ADMIN_NICKS=nick1,nick2``. Сравнение ников регистронезависимое.
+    """
+    clean = (nick or "").strip()
+    if not clean:
+        return False
+    record = db.get_user_record(clean)
+    if record is not None:
+        role = str(record.get("role") or "").strip().lower()
+        if role == "admin":
+            return True
+    allowed = {
+        str(item).strip().lower()
+        for item in (getattr(settings, "admin_nicks", ()) or ())
+        if str(item).strip()
+    }
+    return clean.lower() in allowed
