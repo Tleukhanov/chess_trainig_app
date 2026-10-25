@@ -2515,7 +2515,7 @@ class FrontendTests(ApiTestBase):
         html = resp.text
         self.assertIn("app.js?v=", html)
         self.assertIn("style.css?v=", html)
-        self.assertIn("v0.7.0", html)
+        self.assertIn("v0.7.1", html)
 
     def test_api_version(self):
         self.assertEqual(self.app.version, "0.4.8")
@@ -3270,6 +3270,66 @@ class ChessUtilsApiTests(ApiTestBase):
             with self.subTest(path=path):
                 resp = self.client.post(path, json=payload)
                 self.assertEqual(resp.status_code, 400, resp.text)
+
+
+class GameImportApiTests(ApiTestBase):
+    """Импорт PGN: POST /api/games/import и появление партии в списке."""
+
+    PGN = """[Event "Import test"]
+[Site "https://lichess.org/imp12345"]
+[Date "2026.10.25"]
+[White "Importer"]
+[Black "Rival"]
+[Result "1-0"]
+[WhiteElo "2200"]
+[BlackElo "2100"]
+[ECO "C60"]
+[Opening "Ruy Lopez"]
+
+1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 1-0
+"""
+
+    def test_import_text_and_list(self) -> None:
+        self._register("importer")
+        resp = self.client.post("/api/games/import", data={"pgn": self.PGN})
+        self.assertEqual(resp.status_code, 200, resp.text)
+        payload = resp.json()
+        self.assertEqual(payload["imported"], 1)
+        self.assertEqual(payload["ids"], ["imp12345"])
+        games = self.client.get("/api/games").json()["games"]
+        self.assertEqual(len(games), 1)
+        self.assertEqual(games[0]["id"], "imp12345")
+        self.assertEqual(games[0]["opponent"], "Rival")
+        self.assertEqual(games[0]["user_color"], "white")
+        self.assertEqual(games[0]["result_for_user"], "win")
+        self.assertFalse(games[0]["analyzed"])
+
+    def test_import_forced_black(self) -> None:
+        self._register("importer")
+        resp = self.client.post(
+            "/api/games/import", data={"pgn": self.PGN, "user_color": "black"}
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        games = self.client.get("/api/games").json()["games"]
+        self.assertEqual(games[0]["user_color"], "black")
+        self.assertEqual(games[0]["opponent"], "Importer")
+        self.assertEqual(games[0]["result_for_user"], "loss")
+
+    def test_import_empty_and_garbage(self) -> None:
+        self._register("importer")
+        self.assertEqual(
+            self.client.post("/api/games/import", data={"pgn": ""}).status_code, 400
+        )
+        self.assertEqual(
+            self.client.post("/api/games/import", data={"pgn": "not a pgn"}).status_code,
+            400,
+        )
+
+    def test_import_requires_auth(self) -> None:
+        fresh = TestClient(self.app)
+        self.assertEqual(
+            fresh.post("/api/games/import", data={"pgn": self.PGN}).status_code, 404
+        )
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 // Chess Trainer Frontend — SPA на vanilla JS, потребляет /api/* эндпоинты.
 
-import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.7.0';
+import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.7.1';
 
 const state = {
   user: null,
@@ -1144,6 +1144,27 @@ async function viewGameList(app) {
   app.innerHTML = `
     <div class="card-header"><h1>Партии</h1><span class="badge badge-blue">${esc(state.user.nick)}</span></div>
     <div class="card">
+      <div class="card-header"><span class="card-title">Импорт PGN</span><span class="badge badge-neutral">1–20 партий</span></div>
+      <form id="pgn-import-form">
+        <div class="form-group">
+          <label for="pgn-text">PGN</label>
+          <textarea id="pgn-text" name="pgn" rows="7" placeholder="[Event ...]&#10;[White ...]&#10;1. e4 e5 2. Nf3 ..." style="min-height:140px;font-family:var(--font-mono,monospace);font-size:12px"></textarea>
+        </div>
+        <div class="form-row" style="align-items:flex-end">
+          <div class="form-group"><label for="pgn-file">Или файл .pgn</label><input type="file" id="pgn-file" accept=".pgn,text/plain"></div>
+          <div class="form-group"><label for="pgn-color">Твой цвет</label>
+            <select id="pgn-color"><option value="">определить по нику</option><option value="white">белые</option><option value="black">чёрные</option></select>
+          </div>
+          <div class="form-group" style="display:flex;align-items:center;gap:6px;min-height:38px">
+            <input type="checkbox" id="pgn-analyze"><label for="pgn-analyze" style="margin:0;white-space:nowrap">сразу проанализировать</label>
+          </div>
+          <button type="submit" class="btn btn-primary" style="height:38px">Импортировать</button>
+        </div>
+        <div id="pgn-import-status" class="alert alert-error" style="display:none;margin-top:8px"></div>
+        <p style="color:var(--c-text-muted);font-size:12px;margin:8px 0 0">Вставь одну или несколько партий. Если ника нет в заголовках — выбери свой цвет. Анализ сразу — для небольших импортов (до 3 партий).</p>
+      </form>
+    </div>
+    <div class="card">
       <div class="games-filter">
         <button class="btn btn-secondary ${state.gamesFilter === 'all' ? 'btn-active' : ''}" data-gfilter="all">Все</button>
         <button class="btn btn-secondary ${state.gamesFilter === 'analyzed' ? 'btn-active' : ''}" data-gfilter="analyzed">Только проанализированные</button>
@@ -1163,6 +1184,44 @@ async function viewGameList(app) {
       viewGames(app);
     });
   });
+  const importForm = document.getElementById('pgn-import-form');
+  if (importForm) {
+    importForm.addEventListener('submit', async e => {
+      e.preventDefault();
+      const btn = importForm.querySelector('button[type="submit"]');
+      const status = document.getElementById('pgn-import-status');
+      const text = document.getElementById('pgn-text').value.trim();
+      const fileInput = document.getElementById('pgn-file');
+      const file = fileInput && fileInput.files && fileInput.files[0];
+      if (!text && !file) {
+        if (status) { status.textContent = 'Вставь PGN или выбери файл'; status.style.display = 'block'; }
+        return;
+      }
+      const fd = new FormData();
+      if (file) fd.append('file', file);
+      else fd.append('pgn', text);
+      const color = document.getElementById('pgn-color').value;
+      if (color) fd.append('user_color', color);
+      if (document.getElementById('pgn-analyze').checked) fd.append('analyze', 'on');
+      btn.disabled = true;
+      btn.textContent = 'Импортирую…';
+      if (status) { status.style.display = 'none'; status.textContent = ''; }
+      try {
+        const res = await apiPost('/api/games/import', fd);
+        showToast(
+          'Импортировано: ' + res.imported + (res.analyzed ? ', проанализировано: ' + res.analyzed : ''),
+          'info',
+        );
+        viewGameList(app);
+      } catch (err) {
+        if (isSessionError(err)) { handleSessionExpired(); return; }
+        if (status) { status.textContent = err.message; status.style.display = 'block'; }
+        showToast(err.message, 'error');
+        btn.disabled = false;
+        btn.textContent = 'Импортировать';
+      }
+    });
+  }
   app.querySelectorAll('.analyze-game').forEach(btn => {
     btn.addEventListener('click', async e => {
       e.stopPropagation();

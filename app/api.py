@@ -25,7 +25,7 @@ import chess
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -74,6 +74,7 @@ from .comments import game_summary, move_comment
 from .paths import user_dir
 from .patterns import phase
 from .review_moves import badge_for, badge_label, detect_sacrifice
+from .pgn_import import MAX_PGN_BYTES, parse_pgn_games
 from .plan import build_plan
 from .progress import build_progress
 from .repertoire import Repertoire, opening_stats
@@ -3249,6 +3250,62 @@ def create_api(
             lambda db: _game_detail_payload(db, user["nick"], game_id),
             app.state.db_path,
         )
+
+    @app.post("/api/games/import")
+    async def api_games_import(
+        request: Request,
+        pgn: str = Form(""),
+        file: UploadFile | None = File(None),
+        user_color: str = Form(""),
+        analyze: str | None = Form(None),
+    ):
+        """Импорт одной или нескольких партий из PGN (текст или файл).
+
+        Цвет пользователя можно задать явно; иначе он определяется по нику
+        из заголовков White/Black. ``analyze=on`` сразу считает Stockfish
+        (depth 10) для импортированных партий.
+        """
+        user = _current_user(app.state.db_path, request)
+        if not user:
+            raise HTTPException(404, "No current user")
+        text = (pgn or "").strip()
+        if file is not None:
+            raw = await file.read()
+            if len(raw) > MAX_PGN_BYTES:
+                raise HTTPException(400, "PGN больше 2 МБ")
+            text = raw.decode("utf-8", errors="replace")
+        if not text:
+            raise HTTPException(400, "Пустой PGN")
+        if len(text.encode("utf-8", errors="replace")) > MAX_PGN_BYTES:
+            raise HTTPException(400, "PGN больше 2 МБ")
+        try:
+            games = parse_pgn_games(text, user["nick"], user_color=user_color or None)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        if not games:
+            raise HTTPException(400, "Не удалось разобрать PGN")
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            db.save_games(games, user["nick"])
+        analyzed = 0
+        if (analyze or "").strip().lower() in ("on", "1", "true", "yes"):
+            # Сразу анализируем только небольшие импорты: иначе это уже
+            # фоновая задача, а не быстрый ответ на форму.
+            for game in games[:3]:
+                try:
+                    with Engine(depth=10, multipv=1, time_ms=800) as engine:
+                        summary = engine.analyze_game(game).summary()
+                    with Database(app.state.db_path) as db:
+                        db.init_db()
+                        db.save_analysis(game.id, summary, depth=10)
+                    analyzed += 1
+                except Exception:  # noqa: BLE001 - импорт важнее анализа
+                    logger.warning("Импорт: не удалось проанализировать %s", game.id)
+        return {
+            "imported": len(games),
+            "analyzed": analyzed,
+            "ids": [game.id for game in games],
+        }
 
     @app.post("/api/games/{game_id}/analyze")
     def api_game_analyze(game_id: str, request: Request, refresh: bool = False):
