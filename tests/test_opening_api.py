@@ -335,9 +335,12 @@ class OpeningStartTests(OpeningApiTestBase):
             )
         state = self._start("white")
         self.assertEqual(state["my_elo"], 2100)
-        self.assertEqual(state["opp_elo"], 2200)
+        # Для 2000+ по умолчанию включается гибрид Maia+Stockfish (-1).
+        self.assertEqual(state["opp_elo"], -1)
         explicit = self._start("white", opp_elo=1800)
         self.assertEqual(explicit["opp_elo"], 1800)
+        hybrid = self._start("white", opp_elo=-1)
+        self.assertEqual(hybrid["opp_elo"], -1)
 
     def test_start_requires_auth(self):
         resp = self.client.post(
@@ -596,7 +599,9 @@ class OpeningAnalyzeTests(OpeningApiTestBase):
         self.assertEqual(report["recommendation"], "тренируй тактику")
         self.assertEqual(report["opponent"], "играл в заданном стиле")
         self.assertIsInstance(report["moments"], list)
-        self.assertTrue(report["moments"])
+        # FakeEngine ставит всем ходам "good", а отчёт больше не показывает
+        # хорошие ходы как «моменты» — остаётся пустой список.
+        self.assertEqual(report["moments"], [])
         self.assertEqual(report["engine"], "stockfish")
         self.assertTrue(report["opening"]["name"])
 
@@ -609,6 +614,183 @@ class OpeningAnalyzeTests(OpeningApiTestBase):
         state = self.client.get("/api/opening/s1").json()
         self.assertIsNotNone(state["report"])
         self.assertTrue(state["finished"])
+
+    def test_analyze_moments_are_real_errors_and_engine_backed(self):
+        """LLM-моменты фильтруются: только ошибки, san/better — из движка."""
+        self._register(self.client, "tester")
+        self._seed_session("s1", "tester", moves=_toggle_moves(40), status="done")
+
+        class ErrorEngine(FakeEngine):
+            def analyze_game(self, game: Game) -> _FakeGameAnalysis:
+                moves = [
+                    {
+                        "san": san,
+                        "classification": "mistake" if index == 0 else "good",
+                        "drop": 14.5 if index == 0 else 0.0,
+                        "win_before": 50.0,
+                        "win_after": 35.5 if index == 0 else 50.0,
+                        "best_move_san": "Nc6" if index == 0 else san,
+                    }
+                    for index, san in enumerate(game.moves)
+                ]
+                return _FakeGameAnalysis(
+                    {
+                        "moves": moves,
+                        "blunders": [],
+                        "mistakes": [],
+                        "inaccuracies": [],
+                        "avg_win_loss": 0.0,
+                        "accuracy": 90.0,
+                    }
+                )
+
+        llm = MagicMock()
+        llm.chat.return_value = json.dumps(
+            {
+                "summary": "ок",
+                "opening": "Дебют",
+                "moments": [
+                    {"ply": 1, "san": "e4", "kind": "good", "text": "нормально", "better": "d4"},
+                    {"ply": 3, "san": "Nf3", "kind": "good", "text": "тоже нормально", "better": "e4"},
+                ],
+                "opponent": "",
+                "recommendation": "",
+            },
+            ensure_ascii=False,
+        )
+        with patch("app.api.Engine", ErrorEngine), \
+                patch("app.api.LLMClient", return_value=llm), \
+                patch("app.api._unload_maia"):
+            job_id = self._analyze("s1")
+            job = self._wait_job(job_id)
+
+        self.assertEqual(job["status"], "done", job.get("error"))
+        moments = job["result"]["report"]["moments"]
+        self.assertEqual(len(moments), 1)
+        self.assertEqual(moments[0]["ply"], 1)
+        self.assertEqual(moments[0]["san"], _toggle_moves(40)[0])
+        self.assertEqual(moments[0]["better"], "Nc6")
+        self.assertEqual(moments[0]["classification"], "mistake")
+        self.assertEqual(moments[0]["drop"], 14.5)
+
+    def test_analyze_adds_missing_blunder_from_engine(self):
+        """Если LLM забыл зевок, он всё равно попадает в отчёт из движка."""
+        self._register(self.client, "tester")
+        self._seed_session("s1", "tester", moves=_toggle_moves(40), status="done")
+
+        class BlunderEngine(FakeEngine):
+            def analyze_game(self, game: Game) -> _FakeGameAnalysis:
+                moves = [
+                    {
+                        "san": san,
+                        "classification": (
+                            "mistake" if index == 0
+                            else "blunder" if index == 2
+                            else "good"
+                        ),
+                        "drop": 20.0 if index in (0, 2) else 0.0,
+                        "win_before": 50.0,
+                        "win_after": 30.0 if index in (0, 2) else 50.0,
+                        "best_move_san": "Nc6" if index == 0 else "d4" if index == 2 else san,
+                    }
+                    for index, san in enumerate(game.moves)
+                ]
+                return _FakeGameAnalysis(
+                    {
+                        "moves": moves,
+                        "blunders": [],
+                        "mistakes": [],
+                        "inaccuracies": [],
+                        "avg_win_loss": 0.0,
+                        "accuracy": 85.0,
+                    }
+                )
+
+        llm = MagicMock()
+        llm.chat.return_value = json.dumps(
+            {
+                "summary": "ок",
+                "opening": "Дебют",
+                "moments": [
+                    {"ply": 1, "san": "e4", "kind": "bad", "text": "зевок", "better": "Nc6"}
+                ],
+                "opponent": "",
+                "recommendation": "",
+            },
+            ensure_ascii=False,
+        )
+        with patch("app.api.Engine", BlunderEngine), \
+                patch("app.api.LLMClient", return_value=llm), \
+                patch("app.api._unload_maia"):
+            job_id = self._analyze("s1")
+            job = self._wait_job(job_id)
+
+        self.assertEqual(job["status"], "done", job.get("error"))
+        moments = job["result"]["report"]["moments"]
+        self.assertEqual([m["ply"] for m in moments], [1, 3])
+        self.assertEqual(moments[1]["classification"], "blunder")
+        self.assertEqual(moments[1]["better"], "d4")
+
+    def test_to_game_saves_and_analyzes(self):
+        self._register(self.client, "tester")
+        moves = ["e4", "e5", "Nf3", "Nc6"]
+        self._seed_session("s1", "tester", moves=moves, status="done")
+        with patch("app.api.Engine", FakeEngine):
+            resp = self.client.post("/api/opening/s1/to-game")
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json()["game_id"], "opening-s1")
+        with Database(self.db_path) as db:
+            db.init_db()
+            game = db.get_game("opening-s1", "tester")
+            self.assertIsNotNone(game)
+            self.assertEqual(game.moves, moves)
+            self.assertEqual(game.user_color, "white")
+            self.assertIsNotNone(db.get_analysis("opening-s1"))
+
+    def test_to_game_black_win_result(self):
+        self._register(self.client, "tester")
+        # Fool's mate: чёрные (игрок) ставят мат.
+        moves = ["f3", "e5", "g4", "Qh4#"]
+        self._seed_session("s1", "tester", moves=moves, status="done", color="black")
+        with patch("app.api.Engine", FakeEngine):
+            resp = self.client.post("/api/opening/s1/to-game")
+        self.assertEqual(resp.status_code, 200, resp.text)
+        with Database(self.db_path) as db:
+            db.init_db()
+            game = db.get_game("opening-s1", "tester")
+        self.assertEqual(game.user_color, "black")
+        self.assertEqual(game.result_for_user, "win")
+        pgn = self.client.get("/api/opening/s1/pgn")
+        self.assertIn('[White "Maia"]', pgn.text)
+        self.assertIn('[Black "tester"]', pgn.text)
+        self.assertIn('[Result "0-1"]', pgn.text)
+
+    def test_to_game_ownership_404_and_empty_400(self):
+        self._register(self.client, "tester")
+        self._seed_session("s1", "tester", moves=[], status="done")
+        self.assertEqual(self.client.post("/api/opening/s1/to-game").status_code, 400)
+
+        self._register(self.client2, "bob")
+        self._seed_session("s2", "tester", moves=["e4"], status="done")
+        self.assertEqual(self.client2.post("/api/opening/s2/to-game").status_code, 404)
+
+    def test_pgn_download(self):
+        self._register(self.client, "tester")
+        self._seed_session(
+            "s1", "tester", moves=["e4", "e5", "Nf3", "Nc6"], status="done"
+        )
+        resp = self.client.get("/api/opening/s1/pgn")
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertIn("attachment", resp.headers.get("content-disposition", ""))
+        self.assertIn('[White "tester"]', resp.text)
+        self.assertIn('[Black "Maia"]', resp.text)
+        self.assertIn("1. e4 e5 2. Nf3 Nc6", resp.text)
+
+    def test_pgn_ownership_404(self):
+        self._register(self.client, "tester")
+        self._seed_session("s1", "tester", moves=["e4"], status="done")
+        self._register(self.client2, "bob")
+        self.assertEqual(self.client2.get("/api/opening/s1/pgn").status_code, 404)
 
     def test_analyze_unload_before_engine(self):
         self._register(self.client, "tester")
@@ -876,12 +1058,14 @@ class OpeningStateTests(OpeningApiTestBase):
         self.assertEqual(resp.status_code, 200)
         data = resp.json()
         for key in (
-            "id", "status", "moves", "fen", "turn", "color", "style",
+            "id", "status", "moves", "fen", "fens", "turn", "color", "style",
             "my_elo", "opp_elo", "plies", "finished", "need_reply",
             "result", "report",
         ):
             self.assertIn(key, data)
         self.assertTrue(chess.Board(data["fen"]).is_valid())
+        self.assertEqual(data["fens"][0], chess.STARTING_FEN)
+        self.assertEqual(len(data["fens"]), len(data["moves"]) + 1)
 
     def test_get_missing_404(self):
         self._register(self.client, "tester")

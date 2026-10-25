@@ -887,6 +887,20 @@ def _opening_need_reply(game: OpeningGame) -> bool:
     return board.turn == opponent_color(game) and any(board.legal_moves)
 
 
+def _opening_move_fens(moves: list[str]) -> list[str]:
+    """FEN стартовой позиции и после каждого полухода (для навигации)."""
+    cursor = chess.Board()
+    fens = [cursor.fen()]
+    for san in moves:
+        try:
+            move = cursor.parse_san(san)
+        except ValueError:
+            break
+        cursor.push(move)
+        fens.append(cursor.fen())
+    return fens
+
+
 def _opening_state(
     session: dict[str, Any],
     *,
@@ -901,6 +915,7 @@ def _opening_state(
         "status": session.get("status"),
         "moves": list(game.moves),
         "fen": board.fen(),
+        "fens": _opening_move_fens(list(game.moves)),
         "turn": "white" if board.turn == chess.WHITE else "black",
         "color": game.color,
         "style": game.style,
@@ -933,7 +948,15 @@ def _opening_resolve_elos(
         rating = None
     base = rating or settings.maia_default_elo
     my_elo = body.my_elo if body.my_elo is not None else base
-    opp_elo = body.opp_elo if body.opp_elo is not None else base + 100
+    if body.opp_elo is not None:
+        opp_elo = body.opp_elo
+    elif int(my_elo) >= 2000:
+        # Maia не различает силу выше ~2000 Elo, поэтому для сильных игроков
+        # по умолчанию включаем гибрид Maia+Stockfish (sentinel -1), иначе
+        # соперник выглядит заметно слабее заявленного рейтинга.
+        opp_elo = -1
+    else:
+        opp_elo = base + 100
     return int(my_elo), int(opp_elo)
 
 
@@ -949,7 +972,7 @@ _OPENING_REPORT_SYSTEM = """Ты — шахматный тренер по деб
   "opponent": "как играл соперник в заданном стиле (1-2 предложения)",
   "recommendation": "что тренировать и по репертуару (1-2 предложения)"
 }
-В "moments" 2-4 хода: где ты сыграл хорошо, где мог сыграть лучше (и чем именно), где сыграл хуже. Только русский язык, без английского и без разбора по шагам."""
+В "moments" — ТОЛЬКО твои неточности, ошибки и зевки (classification inaccuracy/mistake/blunder), 1-4 штуки. НЕ включай хорошие и лучшие ходы. Поле "better" бери строго из фактов движка. В "text" — одно конкретное предложение: какой ресурс/угроза/план упущен, без повторения цифр. Если ошибок нет — "moments": []. Только русский язык, без английского и без разбора по шагам."""
 
 
 def _opening_fmt_win(value: Any) -> str:
@@ -989,7 +1012,8 @@ def _opening_analyze_messages(entry: dict[str, Any]) -> list[ChatMessage]:
         f"Дебют: {entry['opening_name'] or '—'} ({entry['eco'] or '—'}).",
         f"Ты играл за {entry['color_ru']}; соперник — человеко-подобный стиль "
         f"«{entry['style_label']}» ({entry['style_desc']}).",
-        f"Рейтинги: ты ~{entry['my_elo']}, соперник ~{entry['opp_elo']}. "
+        f"Рейтинги: ты ~{entry['my_elo']}, соперник "
+        f"{'Maia+ (гибрид, ~2200-2400)' if entry['opp_elo'] == -1 else '~' + str(entry['opp_elo'])}. "
         f"Сыграно полуходов: {entry['plies']}.",
         "Ходы дебюта: " + (" ".join(entry["moves"]) or "—"),
         "",
@@ -1016,33 +1040,85 @@ def _opening_analyze_messages(entry: dict[str, Any]) -> list[ChatMessage]:
 def _normalize_opening_moments(
     raw: Any, fallback_entries: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
-    """Нормализует моменты от LLM; без них — детерминированно из ошибок."""
+    """Оставляет только реальные ошибки игрока; «лучше» — строго из движка.
+
+    LLM любит добавлять «хорошие» ходы и придумывать альтернативы. Здесь мы
+    фильтруем моменты по классификации из анализа и подменяем san/better
+    фактами движка, чтобы в отчёте не было галлюцинаций.
+    """
+    errors = {
+        int(item["ply"]): item
+        for item in fallback_entries
+        if item.get("ply") is not None
+        and item.get("classification") in ("blunder", "mistake", "inaccuracy")
+    }
     moments: list[dict[str, Any]] = []
+    seen: set[int] = set()
     if isinstance(raw, list):
         for item in raw:
             if not isinstance(item, dict):
                 continue
+            try:
+                ply = int(item.get("ply"))
+            except (TypeError, ValueError):
+                continue
+            entry = errors.get(ply)
+            if entry is None or ply in seen:
+                continue
+            seen.add(ply)
             moments.append(
                 {
-                    "ply": item.get("ply"),
-                    "san": item.get("san"),
-                    "kind": item.get("kind"),
+                    "ply": ply,
+                    "san": entry.get("san"),
+                    "kind": "bad" if entry.get("classification") == "blunder" else "better",
                     "text": item.get("text"),
-                    "better": item.get("better"),
+                    "better": entry.get("best"),
+                    "classification": entry.get("classification"),
+                    "drop": entry.get("drop"),
                 }
             )
     if not moments:
-        for item in fallback_entries:
-            if item["classification"] in ("blunder", "mistake", "inaccuracy"):
-                moments.append(
-                    {
-                        "ply": item["ply"],
-                        "san": item["san"],
-                        "kind": "bad" if item["classification"] == "blunder" else "better",
-                        "text": None,
-                        "better": item["best"],
-                    }
-                )
+        for ply, entry in errors.items():
+            moments.append(
+                {
+                    "ply": ply,
+                    "san": entry.get("san"),
+                    "kind": "bad" if entry.get("classification") == "blunder" else "better",
+                    "text": None,
+                    "better": entry.get("best"),
+                    "classification": entry.get("classification"),
+                    "drop": entry.get("drop"),
+                }
+            )
+    # LLM может пропустить реальную ошибку (особенно зевок) — добираем
+    # оставшиеся ошибки из движка, чтобы отчёт не терял критичные ходы.
+    severity = {"blunder": 0, "mistake": 1, "inaccuracy": 2}
+    missing = [
+        (ply, entry)
+        for ply, entry in errors.items()
+        if ply not in seen
+    ]
+    missing.sort(
+        key=lambda item: (
+            severity.get(str(item[1].get("classification")), 9),
+            item[0],
+        )
+    )
+    for ply, entry in missing:
+        if len(moments) >= 4:
+            break
+        moments.append(
+            {
+                "ply": ply,
+                "san": entry.get("san"),
+                "kind": "bad" if entry.get("classification") == "blunder" else "better",
+                "text": None,
+                "better": entry.get("best"),
+                "classification": entry.get("classification"),
+                "drop": entry.get("drop"),
+            }
+        )
+    moments.sort(key=lambda item: item["ply"])
     return moments[:4]
 
 
@@ -4357,9 +4433,11 @@ def create_api(
         color = (body.color or "").strip()
         if color not in ("white", "black"):
             raise HTTPException(400, "Цвет: white или black")
-        for value in (body.opp_elo, body.my_elo):
-            if value is not None and value <= 0:
-                raise HTTPException(400, "Рейтинг: положительное число")
+        if body.my_elo is not None and body.my_elo <= 0:
+            raise HTTPException(400, "Рейтинг: положительное число")
+        # -1 — служебный sentinel гибрида Maia+Stockfish, не рейтинг.
+        if body.opp_elo is not None and body.opp_elo != -1 and body.opp_elo <= 0:
+            raise HTTPException(400, "Рейтинг: положительное число")
 
         nick = user["nick"]
         session_id = uuid.uuid4().hex
@@ -4512,6 +4590,107 @@ def create_api(
             daemon=True,
         ).start()
         return {"job_id": job.id, "status": "started"}
+
+    @app.post("/api/opening/{session_id}/to-game")
+    def api_opening_to_game(session_id: str, request: Request):
+        """Сохраняет тренировочную партию как обычную и сразу её анализирует."""
+        user = _current_user(app.state.db_path, request)
+        if not user:
+            raise HTTPException(404, "No current user")
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            session = _opening_owned(db, user["nick"], session_id)
+        if session is None:
+            raise HTTPException(404, "Сессия не найдена")
+        moves = list(session.get("moves") or [])
+        if not moves:
+            raise HTTPException(400, "В партии нет ходов")
+        user_color = session.get("color") or "white"
+        board = board_from_moves(moves)
+        result = board.result(claim_draw=False) if board.is_game_over(claim_draw=False) else "*"
+        if result == "1-0":
+            winner = "white"
+        elif result == "0-1":
+            winner = "black"
+        else:
+            winner = None
+        result_for_user = (
+            "win" if winner == user_color else "loss" if winner else "draw"
+        )
+        name, eco = classify_opening(moves)
+        game = Game(
+            id=f"opening-{session_id}",
+            moves=moves,
+            user_color=user_color,
+            opponent="Maia",
+            result_for_user=result_for_user,
+            status="normal",
+            opening=name,
+            eco=eco,
+            created_at=int(_now() * 1000),
+        )
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            db.save_games([game], user["nick"])
+        try:
+            with Engine(depth=10, multipv=1, time_ms=800) as engine:
+                summary = engine.analyze_game(game).summary()
+            with Database(app.state.db_path) as db:
+                db.init_db()
+                db.save_analysis(game.id, summary, depth=10)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(503, f"Не удалось проанализировать: {exc}") from exc
+        return {"game_id": game.id}
+
+    @app.get("/api/opening/{session_id}/pgn")
+    def api_opening_pgn(session_id: str, request: Request):
+        """PGN тренировочной партии для скачивания."""
+        user = _current_user(app.state.db_path, request)
+        if not user:
+            raise HTTPException(404, "No current user")
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            session = _opening_owned(db, user["nick"], session_id)
+        if session is None:
+            raise HTTPException(404, "Сессия не найдена")
+        moves = list(session.get("moves") or [])
+        color = session.get("color") or "white"
+        import chess.pgn as chess_pgn
+
+        board = board_from_moves(moves)
+        result = board.result(claim_draw=False) if board.is_game_over(claim_draw=False) else "*"
+        name, eco = classify_opening(moves)
+        pgn_game = chess_pgn.Game()
+        pgn_game.headers.update(
+            {
+                "Event": "Chess Trainer opening",
+                "Site": "chess-trainer",
+                "Date": time.strftime("%Y.%m.%d"),
+                "White": user["nick"] if color == "white" else "Maia",
+                "Black": "Maia" if color == "white" else user["nick"],
+                "Result": result,
+                "Opening": name or "",
+                "ECO": eco or "",
+            }
+        )
+        node = pgn_game
+        cursor = chess.Board()
+        for san in moves:
+            try:
+                move = cursor.parse_san(san)
+            except ValueError:
+                break
+            cursor.push(move)
+            node = node.add_main_variation(move)
+        return Response(
+            str(pgn_game),
+            media_type="application/x-chess-pgn; charset=utf-8",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="opening-{session_id[:8]}.pgn"'
+                )
+            },
+        )
 
     @app.get("/api/opening")
     def api_opening_list(request: Request, limit: int = 20):

@@ -1,6 +1,6 @@
 // Chess Trainer Frontend — SPA на vanilla JS, потребляет /api/* эндпоинты.
 
-import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.7.4';
+import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.7.8';
 
 const state = {
   user: null,
@@ -55,6 +55,10 @@ const state = {
   openingJobId: null,
   openingError: null,
   openingLastReply: null,
+  openingExplore: null,
+  openingExploreMoves: [],
+  openingExploreEval: null,
+  openingExploreLast: [],
   // Панель «Теория» в тренере дебютов: линия Lichess/ECO и идеи LLM.
   openingTheory: null,
   openingTheoryRequestFen: null,
@@ -159,11 +163,11 @@ function clearAllTimers() {
   });
 }
 
-function navigate(view) {
+function navigate(view, options = {}) {
   if (!views.includes(view)) view = 'dashboard';
   state.currentView = view;
   if (view === 'games') {
-    state.gameId = null;
+    state.gameId = options.gameId || null;
     state.gameData = null;
   }
   document.querySelectorAll('#nav a').forEach(a => {
@@ -3021,19 +3025,42 @@ function openingHighlight() {
   return [];
 }
 
-function openingMoveRowsHtml(moves) {
+function openingMomentBadges() {
+  const s = state.openingSession;
+  const moments = (s && s.report && Array.isArray(s.report.moments)) ? s.report.moments : [];
+  const badges = {};
+  moments.forEach(m => {
+    if (m && Number.isFinite(Number(m.ply))) badges[Number(m.ply) - 1] = m;
+  });
+  return badges;
+}
+
+function openingMoveRowsHtml(moves, options = {}) {
   if (!moves.length) return '<p style="color:var(--c-text-muted)">Ходов пока нет.</p>';
+  const interactive = !!options.interactive;
+  const badges = options.badges || {};
   const rows = {};
   moves.forEach((san, i) => {
     const num = Math.floor(i / 2) + 1;
     if (!rows[num]) rows[num] = { num, w: null, b: null };
     rows[num][i % 2 === 0 ? 'w' : 'b'] = san;
   });
+  const cell = (san, ply) => {
+    if (!san) return `<span class="move-cell" style="cursor:default"></span>`;
+    const info = badges[ply];
+    const cls = info
+      ? ` move-${info.classification || (info.kind === 'bad' ? 'blunder' : 'inaccuracy')}`
+      : '';
+    const title = info
+      ? `${info.classification === 'inaccuracy' ? 'неточность' : info.classification === 'mistake' ? 'ошибка' : 'зевок'}${info.drop ? `, потеря ${Number(info.drop).toFixed(1)}%` : ''}; лучший ход: ${info.better || '—'}`
+      : 'Разобрать позицию после этого хода';
+    return `<span class="move-cell${interactive ? ' move-cell-clickable' : ''}${cls}"${interactive ? ` data-opening-ply="${ply}" title="${esc(title)}"` : ` style="cursor:default" title="${esc(title)}"`}>${esc(san)}</span>`;
+  };
   return Object.values(rows).map(r => `
     <div class="move-row">
       <span class="move-num">${r.num}.</span>
-      <span class="move-cell" style="cursor:default">${esc(r.w || '')}</span>
-      <span class="move-cell" style="cursor:default">${esc(r.b || '')}</span>
+      ${cell(r.w, (r.num - 1) * 2)}
+      ${cell(r.b, (r.num - 1) * 2 + 1)}
     </div>`).join('');
 }
 
@@ -3422,8 +3449,12 @@ async function loadOpeningSession(app, id) {
   }
   state.openingSession = s;
   if (prevId !== s.id) {
-    state.openingFens = null;
+    state.openingFens = Array.isArray(s.fens) ? s.fens.slice() : null;
     resetOpeningTheory();
+    state.openingExplore = null;
+    state.openingExploreMoves = [];
+    state.openingExploreEval = null;
+    state.openingExploreLast = [];
   }
   drawOpening(app);
   if (state.openingAnalyzing && !state.timers.opening && state.openingJobId) {
@@ -3489,7 +3520,7 @@ async function drawOpeningSetup(app, errorMsg) {
               <button type="button" class="btn btn-secondary ${state.openingHuman ? 'btn-active' : ''}" data-speed="human">Как человек</button>
             </div>
           </div>
-          <div id="opening-strength-note" style="font-size:12px;color:var(--c-text-muted);margin-top:4px;display:none">Твой рейтинг ≥ 2000: Maia не различает силы выше 2000 Elo, доступен только равный уровень.</div>
+          <div id="opening-strength-note" style="font-size:12px;color:var(--c-text-muted);margin-top:4px;display:none">Твой рейтинг ≥ 2000: Maia не различает силы выше 2000 Elo. Если не выбрать соперника вручную, автоматически включится Maia+ (фильтр).</div>
         </div>
         <div class="form-group">
           <label>Твой цвет</label>
@@ -3544,14 +3575,21 @@ async function drawOpeningSetup(app, errorMsg) {
       const opp = document.getElementById('opening-opp-elo');
       const base = Number(my && my.value) || 1500;
       const mode = btn.dataset.opp;
+      if (opp) delete opp.dataset.hybrid;
       if (mode === 'equal') opp.value = my && my.value ? my.value : '';
       else if (mode === 'plus100') opp.value = String(base + 100);
       else if (mode === 'stronger') opp.value = String(base + 200);
-      else if (mode === 'hybrid') opp.value = '-1';
+      else if (mode === 'hybrid') {
+        // Sentinel -1 уходит в API, а не в числовое поле с min=100.
+        opp.value = '';
+        opp.dataset.hybrid = '1';
+      }
     });
   });
   const myEloInput = document.getElementById('opening-my-elo');
   if (myEloInput) myEloInput.addEventListener('input', updateOpeningStrengthAvailability);
+  const oppEloInput = document.getElementById('opening-opp-elo');
+  if (oppEloInput) oppEloInput.addEventListener('input', () => { delete oppEloInput.dataset.hybrid; });
   updateOpeningStrengthAvailability();
   app.querySelectorAll('#opening-form [data-speed]').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -3569,8 +3607,10 @@ async function drawOpeningSetup(app, errorMsg) {
     const body = { style: state.openingStyle, color: state.openingColor };
     const my = String(fd.get('my_elo') || '').trim();
     const opp = String(fd.get('opp_elo') || '').trim();
+    const oppInput = document.getElementById('opening-opp-elo');
     if (my) body.my_elo = Number(my);
-    if (opp) body.opp_elo = Number(opp);
+    if (oppInput && oppInput.dataset.hybrid === '1') body.opp_elo = -1;
+    else if (opp) body.opp_elo = Number(opp);
     body.human = !!state.openingHuman;
     const btn = form.querySelector('button[type="submit"]');
     if (btn) btn.disabled = true;
@@ -3620,7 +3660,7 @@ async function loadOpeningRecent(app) {
       <td>${esc(openingStyleLabel(s.style))}</td>
       <td class="center">${s.color === 'black' ? '♚' : '♔'}</td>
       <td class="num">${(s.moves || []).length} / ${s.plies}</td>
-      <td class="num">${s.my_elo != null ? s.my_elo : '—'} vs ${s.opp_elo != null ? s.opp_elo : '—'}</td>
+      <td class="num">${s.my_elo != null ? s.my_elo : '—'} vs ${s.opp_elo === -1 ? 'Maia+' : (s.opp_elo != null ? s.opp_elo : '—')}</td>
     </tr>`;
   }).join('');
   box.innerHTML = `
@@ -3647,9 +3687,13 @@ function drawOpening(app) {
   // Просмотр теории (шаг линии или расстановка) заменяет позицию на доске,
   // но не трогает саму партию: ходы и ответы Maia продолжают работать.
   const theoryPreview = openingTheoryPreview();
+  const explore = state.openingExplore;
+  const boardFen = explore ? explore.fen : (theoryPreview ? theoryPreview.fen : s.fen);
+  const boardLast = explore ? state.openingExploreLast : (theoryPreview ? theoryPreview.lastMove : openingHighlight());
+  const boardArrows = explore ? [] : (theoryPreview ? theoryPreview.arrows : []);
 
   const engineNote = s.engine
-    ? `<span class="badge badge-neutral" title="движок соперника">движок: ${s.engine === 'maia2' ? 'Maia-2' : 'MaiaLite'}</span>`
+    ? `<span class="badge badge-neutral" title="движок соперника">движок: ${s.engine === 'maia2' ? 'Maia-2' : s.engine === 'hybrid' ? 'Maia+' : 'MaiaLite'}</span>`
     : '';
 
   let replyHtml = '';
@@ -3691,11 +3735,11 @@ function drawOpening(app) {
     ${state.openingError ? `<div class="alert alert-error">${esc(state.openingError)}</div>` : ''}
     <div class="grid game-layout">
       <div class="card">
-        ${boardHtml(theoryPreview ? theoryPreview.fen : s.fen, {
-          lastMove: theoryPreview ? theoryPreview.lastMove : openingHighlight(),
+        ${boardHtml(boardFen, {
+          lastMove: boardLast,
           flip,
-          animate: theoryPreview ? true : (yourTurn && !state.openingThinking && moves.length > 0),
-          arrows: theoryPreview ? theoryPreview.arrows : [],
+          animate: explore ? false : (theoryPreview ? true : (yourTurn && !state.openingThinking && moves.length > 0)),
+          arrows: boardArrows,
         })}
         <div class="board-meta">
           <span class="badge badge-neutral">${esc(openingStyleLabel(s.style))}</span>
@@ -3706,25 +3750,37 @@ function drawOpening(app) {
           ${theoryPreview ? `<span class="badge badge-blue">${theoryPreview.label === 'setup' ? 'расстановка' : 'просмотр линии'}</span>` : ''}
         </div>
         ${replyHtml}
-        <div style="margin-top:12px"><button class="btn btn-secondary" id="opening-new">Новая партия</button></div>
+        ${state.openingExploreEval ? `<div class="opening-reply">Stockfish (depth ${esc(String(state.openingExploreEval.depth || 12))}): win белых ${Math.round(Number(state.openingExploreEval.win) || 0)}% · лучший ход <span class="drill-san">${esc(state.openingExploreEval.best_san || '—')}</span></div>` : ''}
+        <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn btn-secondary" id="opening-new">Новая партия</button>
+          ${finished ? `<button class="btn btn-primary" id="opening-to-game">Анализировать партию</button>` : ''}
+          ${moves.length ? `<a class="btn btn-secondary" href="/api/opening/${encodeURIComponent(s.id)}/pgn">Скачать PGN</a>` : ''}
+          <button class="btn btn-secondary" id="opening-explore">${explore ? 'Вернуться к партии' : 'Свободный разбор'}</button>
+        </div>
       </div>
       <div class="game-side">
         <div class="card">
           <div class="card-header"><span class="card-title">Ходы</span></div>
-          <div class="moves-list">${openingMoveRowsHtml(moves)}</div>
+          ${moves.length ? '<p style="color:var(--c-text-muted);font-size:12px;margin:0 0 6px">нажми на ход, чтобы открыть позицию и подвигать фигуры</p>' : ''}
+          <div class="moves-list">${openingMoveRowsHtml(moves, { interactive: true, badges: openingMomentBadges() })}</div>
         </div>
         ${openingTheoryCardHtml()}
         ${panel}
       </div>
     </div>`;
 
-  bindBoard(app.querySelector('.board'));
+  if (explore) bindOpeningExploreBoard(app);
+  else bindBoard(app.querySelector('.board'));
   bindOpeningTheory(app);
   const newBtn = document.getElementById('opening-new');
   if (newBtn) newBtn.addEventListener('click', () => {
     if (state.timers.opening) { clearInterval(state.timers.opening); state.timers.opening = null; }
     resetOpeningTheory();
     state.openingSession = null;
+    state.openingExplore = null;
+    state.openingExploreMoves = [];
+    state.openingExploreEval = null;
+    state.openingExploreLast = [];
     state.openingFens = null;
     state.openingLastReply = null;
     state.openingError = null;
@@ -3734,12 +3790,129 @@ function drawOpening(app) {
   });
   const analyzeBtn = document.getElementById('opening-analyze');
   if (analyzeBtn) analyzeBtn.addEventListener('click', () => openingAnalyze(app));
+  const toGame = document.getElementById('opening-to-game');
+  if (toGame) toGame.addEventListener('click', async () => {
+    const oldText = toGame.textContent;
+    toGame.disabled = true;
+    toGame.textContent = 'Анализирую…';
+    try {
+      const res = await api('/api/opening/' + encodeURIComponent(s.id) + '/to-game', { method: 'POST' });
+      state.gameReview = null;
+      state.gameExtras = null;
+      state.gameRepeats = null;
+      navigate('games', { gameId: res.game_id });
+    } catch (err) {
+      if (isSessionError(err)) { handleSessionExpired(); return; }
+      showToast(err.message, 'error');
+      toGame.disabled = false;
+      toGame.textContent = oldText;
+    }
+  });
+  const exploreBtn = document.getElementById('opening-explore');
+  if (exploreBtn) exploreBtn.addEventListener('click', () => startOpeningExplore(app));
+  const openExploreAtPly = ply => {
+    const fens = state.openingFens;
+    if (!fens || !fens[ply - 1] || !fens[ply]) return;
+    state.openingExplore = { fen: fens[ply] };
+    state.openingExploreLast = lastMoveSquares(fens[ply - 1], fens[ply]);
+    state.openingExploreMoves = [];
+    state.openingExploreEval = null;
+    drawOpening(app);
+    refreshOpeningExplore(app);
+  };
+  app.querySelectorAll('.move-cell[data-opening-ply]').forEach(cell => {
+    cell.addEventListener('click', () => openExploreAtPly(Number(cell.dataset.openingPly) + 1));
+  });
+  app.querySelectorAll('[data-opening-moment-ply]').forEach(card => {
+    card.addEventListener('click', () => openExploreAtPly(Number(card.dataset.openingMomentPly)));
+  });
   if (state.openingAnalyzing && !state.timers.opening && state.openingJobId) {
     openingPoll(app, state.openingJobId);
   }
-  if (!finished && yourTurn && !state.openingThinking && !theoryPreview) {
+  if (!explore && !finished && yourTurn && !state.openingThinking && !theoryPreview) {
     bindOpeningBoard(app, s.id);
   }
+}
+
+async function startOpeningExplore(app) {
+  if (state.openingExplore) {
+    state.openingExplore = null;
+    state.openingExploreMoves = [];
+    state.openingExploreEval = null;
+    state.openingExploreLast = [];
+    drawOpening(app);
+    return;
+  }
+  const s = state.openingSession;
+  const theory = openingTheoryPreview();
+  const fen = theory ? theory.fen : (s && s.fen);
+  if (!fen) return;
+  state.openingExplore = { fen };
+  state.openingExploreLast = theory ? theory.lastMove : [];
+  state.openingExploreMoves = [];
+  state.openingExploreEval = null;
+  drawOpening(app);
+  await refreshOpeningExplore(app);
+}
+
+async function refreshOpeningExplore(app) {
+  const explore = state.openingExplore;
+  if (!explore) return;
+  const fen = explore.fen;
+  try {
+    const [legal, ev] = await Promise.all([
+      api('/api/chess/legal', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fen }),
+      }),
+      api('/api/chess/eval', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fen, depth: 12 }),
+      }).catch(() => null),
+    ]);
+    if (!state.openingExplore || state.openingExplore.fen !== fen) return;
+    state.openingExploreMoves = (legal && legal.moves) || [];
+    state.openingExploreEval = ev || null;
+  } catch (err) {
+    if (isSessionError(err)) { handleSessionExpired(); return; }
+    showToast(err.message, 'error');
+  }
+  drawOpening(app);
+}
+
+async function exploreOpeningMove(app, move) {
+  const explore = state.openingExplore;
+  if (!explore) return;
+  try {
+    const res = await api('/api/chess/move', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fen: explore.fen,
+        from: move.from,
+        to: move.to,
+        promotion: move.promotion || null,
+      }),
+    });
+    state.openingExplore = { fen: res.fen };
+    state.openingExploreLast = [move.from, move.to];
+    state.openingExploreEval = null;
+    await refreshOpeningExplore(app);
+  } catch (err) {
+    if (isSessionError(err)) { handleSessionExpired(); return; }
+    showToast(err.message, 'error');
+  }
+}
+
+function bindOpeningExploreBoard(app) {
+  const board = app.querySelector('.board');
+  if (!board) return;
+  bindBoard(board, {
+    moves: state.openingExploreMoves || [],
+    onMove: move => exploreOpeningMove(app, move),
+  });
 }
 
 function bindOpeningBoard(app, sessionId) {
@@ -3749,7 +3922,7 @@ function bindOpeningBoard(app, sessionId) {
     // Доска могла перерисоваться, пока шёл запрос: берём актуальную ноду.
     const board = app.querySelector('.board');
     if (!board) return;
-    if (s.finished || s.turn !== s.color || state.openingThinking || openingTheoryPreview()) { bindBoard(board); return; }
+    if (state.openingExplore || s.finished || s.turn !== s.color || state.openingThinking || openingTheoryPreview()) { bindBoard(board); return; }
     const moves = ((legal && legal.moves) || []).filter(m => m && m.from && m.to && m.san);
     if (!moves.length) { bindBoard(board); return; }
     bindBoard(board, {
@@ -3899,18 +4072,22 @@ function openingReportHtml(report) {
   const name = opening.name || '—';
   const eco = opening.eco || '';
   const moments = report.moments || [];
+  const classRu = { inaccuracy: 'неточность', mistake: 'ошибка', blunder: 'зевок' };
   const kindBadge = k => k === 'good' ? 'badge-good' : k === 'bad' ? 'badge-bad' : 'badge-neutral';
   const kindLabel = k => OPENING_KIND_RU[k] || (k ? esc(k) : '—');
+  const momentLabel = m => classRu[m.classification] || kindLabel(m.kind);
+  const momentBadge = m => m.classification === 'inaccuracy' ? 'badge-neutral' : (m.classification ? 'badge-bad' : kindBadge(m.kind));
   const momentsHtml = moments.length ? moments.map(m => `
-    <div class="opening-report-moment">
+    <div class="opening-report-moment${m.ply ? ' opening-report-moment-clickable' : ''}"${m.ply ? ` data-opening-moment-ply="${esc(String(m.ply))}" title="Открыть позицию после этого хода"` : ''}>
       <div>
         <span class="drill-san">${esc(m.san || '—')}</span>
-        <span class="badge ${kindBadge(m.kind)}">${kindLabel(m.kind)}</span>
+        <span class="badge ${momentBadge(m)}">${esc(momentLabel(m))}</span>
         ${m.ply ? `<span style="color:var(--c-text-muted);font-size:12px">полуход ${esc(String(m.ply))}</span>` : ''}
+        ${m.drop ? `<span style="color:var(--c-text-muted);font-size:12px">потеря ${esc(String(m.drop.toFixed ? m.drop.toFixed(1) : m.drop))}%</span>` : ''}
       </div>
       ${m.text ? `<div style="margin-top:4px">${esc(m.text)}</div>` : ''}
-      ${m.better && m.better !== '—' ? `<div style="margin-top:2px;font-size:13px">лучше: <span class="drill-best">${esc(m.better)}</span></div>` : ''}
-    </div>`).join('') : '<p style="color:var(--c-text-muted)">Моментов нет.</p>';
+      ${m.better && m.better !== '—' ? `<div style="margin-top:2px;font-size:13px">${m.classification === 'inaccuracy' ? 'точнее' : 'лучше'}: <span class="drill-best">${esc(m.better)}</span></div>` : ''}
+    </div>`).join('') : '<p style="color:var(--c-text-muted)">Критических ошибок в дебюте нет.</p>';
   return `
     <div class="card">
       <div class="card-header"><span class="card-title">Отчёт тренера</span><span class="badge badge-good">Stockfish + LLM</span></div>
