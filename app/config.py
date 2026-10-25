@@ -139,6 +139,20 @@ class Settings:
     maia_default_elo: int = int(_cfg("MAIA_DEFAULT_ELO", "1500"))
     opening_plies: int = int(_cfg("OPENING_PLIES", "40"))
 
+    # --- теория дебютов (explorer/ECO) ---
+    # "lichess" | "eco" | "off": источник главной линии. Провайдер можно
+    # заменить, не трогая API (см. app.theory.TheoryProvider).
+    theory_provider: str = _cfg("THEORY_PROVIDER", "lichess")
+    theory_max_plies: int = int(_cfg("THEORY_MAX_PLIES", "12"))
+    theory_timeout: int = int(_cfg("THEORY_TIMEOUT", "8"))
+    theory_cache_hours: int = int(_cfg("THEORY_CACHE_HOURS", "168"))
+    theory_ideas_enabled: bool = _cfg("THEORY_IDEAS_ENABLED", "true").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
     # --- LLM (M1) ---
     llm_api_key: str = _cfg("LLM_API_KEY", "")
     llm_base_url: str = _cfg("LLM_BASE_URL", "https://openrouter.ai/api/v1")

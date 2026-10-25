@@ -154,6 +154,16 @@ CREATE TABLE IF NOT EXISTS {table}(
 )
 """
 
+# Кеш теории дебютов: главная линия Lichess Explorer и LLM-объяснения.
+# payload — JSON (список шагов линии или {"ideas": ...}), fetched_at — мс.
+_THEORY_CACHE_DDL = """
+CREATE TABLE IF NOT EXISTS {table}(
+    key TEXT PRIMARY KEY,
+    payload TEXT,
+    fetched_at BIGINT
+)
+"""
+
 _GAME_COLUMNS = (
     "id, player, rated, speed, created_at, status, winner, white, black, "
     "opening, eco, user_color, opponent, user_rating, user_rating_diff, "
@@ -188,6 +198,7 @@ _BIGINT_COLUMNS = (
     ("middlegame_sessions", "created_at"),
     ("middlegame_sessions", "updated_at"),
     ("move_notes", "updated_at"),
+    ("theory_cache", "fetched_at"),
 )
 
 
@@ -215,6 +226,7 @@ _SCHEMA = f"""
 {_OPENING_SESSIONS_DDL.format(table="opening_sessions")};
 {_MIDDLEGAME_SESSIONS_DDL.format(table="middlegame_sessions")};
 {_MOVE_NOTES_DDL.format(table="move_notes")};
+{_THEORY_CACHE_DDL.format(table="theory_cache")};
 CREATE TABLE IF NOT EXISTS sessions(
     token TEXT PRIMARY KEY,
     nick TEXT,
@@ -499,6 +511,7 @@ def _migrate_v3(path: Path | str) -> None:
         # приводить старую базу к актуальной схеме сама, не полагаясь на то,
         # что init_db потом выполнит весь _SCHEMA.
         conn.execute(_MOVE_NOTES_DDL.format(table="move_notes"))
+        conn.execute(_THEORY_CACHE_DDL.format(table="theory_cache"))
 
         # analyses раньше игр: пока в нём есть FK на games, пересборка games
         # оставила бы висячую ссылку.
@@ -653,6 +666,7 @@ class Database:
             conn.executescript(schema)
             _ensure_bigint(conn)
             conn.execute(_MOVE_NOTES_DDL.format(table="move_notes"))
+            conn.execute(_THEORY_CACHE_DDL.format(table="theory_cache"))
             existing = {
                 row["column_name"]
                 for row in conn.execute(
@@ -1136,6 +1150,53 @@ class Database:
                 "INSERT INTO meta(key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (key, value),
+            )
+
+    # --- кеш теории дебютов ---------------------------------------------
+
+    def get_theory_cache(
+        self, key: str, max_age_hours: float | None = None
+    ) -> Any | None:
+        """Значение из ``theory_cache`` или None (нет записи/просрочено).
+
+        ``max_age_hours=None`` — без проверки срока (кеш «навсегда»). Payload
+        хранится как JSON и возвращается раскодированным; если в базе лежит
+        не-JSON (старые/ручные записи), возвращаем строку как есть.
+        """
+        if not key:
+            return None
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT payload, fetched_at FROM theory_cache WHERE key = ?", (key,)
+            ).fetchone()
+        if row is None:
+            return None
+        if max_age_hours is not None:
+            try:
+                age_ms = int(time.time() * 1000) - int(row["fetched_at"])
+                if age_ms > float(max_age_hours) * 3_600_000:
+                    return None
+            except (TypeError, ValueError):
+                return None
+        raw = row["payload"]
+        if raw is None:
+            return None
+        try:
+            return json.loads(raw)
+        except (TypeError, ValueError):
+            return raw
+
+    def set_theory_cache(self, key: str, payload: Any) -> None:
+        """Сохраняет (UPSERT) значение в ``theory_cache`` с текущим временем."""
+        if not key:
+            return
+        with self._connection() as conn:
+            conn.execute(
+                "INSERT INTO theory_cache(key, payload, fetched_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET "
+                "payload = excluded.payload, "
+                "fetched_at = excluded.fetched_at",
+                (key, _j(payload), int(time.time() * 1000)),
             )
 
     # --- объяснения «Задачи дня» ---
