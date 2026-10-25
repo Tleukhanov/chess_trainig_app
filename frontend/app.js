@@ -1,6 +1,6 @@
 // Chess Trainer Frontend — SPA на vanilla JS, потребляет /api/* эндпоинты.
 
-import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.6.3';
+import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.6.4';
 
 const state = {
   user: null,
@@ -12,6 +12,8 @@ const state = {
   gamePly: 0,
   gameExtras: null,
   gameReview: null,
+  gameRepeats: null,
+  gameReviewRefresh: false,
   keyHandler: null,
   tool: 'repertoire',
   task: null,
@@ -1019,6 +1021,8 @@ async function viewGameDetail(app) {
   state.gamePly = 0;
   state.gameExtras = null;
   state.gameReview = null;
+  state.gameRepeats = null;
+  state.gameReviewRefresh = false;
   drawGameDetail(app);
   bindGameKeyboard();
 }
@@ -1156,9 +1160,8 @@ function drawGameDetail(app) {
   renderGameErrors(app);
   const repeatsBox = document.getElementById('game-repeats');
   if (repeatsBox && analysis) {
-    api('/api/games/' + encodeURIComponent(game.id) + '/repeats').then(data => {
-      const repeats = (data && data.repeats) || [];
-      if (!repeats.length) return;
+    const repeats = ensureGameRepeats(game.id).data;
+    if (repeats.length) {
       repeatsBox.innerHTML = `
         <div class="alert alert-error" style="margin-top:10px">
           <strong>Повтор ошибки:</strong> ${repeats.length} ход(ов) уже были в прошлых партиях.
@@ -1166,7 +1169,7 @@ function drawGameDetail(app) {
             ${repeats.map(r => `<li>${esc(r.san)} (полуход ${r.ply + 1}) — как в партии от ${new Date(r.created_at).toLocaleDateString('ru-RU')}${r.opening ? ' · ' + esc(r.opening) : ''}</li>`).join('')}
           </ul>
         </div>`;
-    }).catch(() => {});
+    }
   }
   const trainFromGame = document.getElementById('train-from-game');
   if (trainFromGame) {
@@ -1280,6 +1283,18 @@ function reviewLimit(value) {
   return Number.isFinite(num) ? Math.max(0, Math.min(100, num)) : null;
 }
 
+// Повторы ошибок грузим один раз на партию, а не на каждую перерисовку.
+function ensureGameRepeats(gameId) {
+  if (state.gameRepeats && state.gameRepeats.gameId === gameId) return state.gameRepeats;
+  const entry = { gameId, data: [] };
+  state.gameRepeats = entry;
+  api('/api/games/' + encodeURIComponent(gameId) + '/repeats').then(res => {
+    if (state.gameRepeats !== entry) return;
+    entry.data = (res && res.repeats) || [];
+  }).catch(() => {});
+  return entry;
+}
+
 // /review грузится один раз на партию; результат живёт в state.gameReview.
 function ensureGameReview(gameId) {
   if (state.gameReview && state.gameReview.gameId === gameId) return state.gameReview;
@@ -1302,8 +1317,14 @@ function ensureGameReview(gameId) {
 function refreshGameReviewView(gameId) {
   if (state.currentView !== 'games' || state.gameId !== gameId) return;
   if (!state.gameData || state.gameData.game.id !== gameId) return;
-  const app = document.getElementById('app');
-  if (app) drawGameDetail(app);
+  if (state.gameReviewRefresh) return;
+  state.gameReviewRefresh = true;
+  setTimeout(() => {
+    state.gameReviewRefresh = false;
+    if (state.currentView !== 'games' || state.gameId !== gameId) return;
+    const app = document.getElementById('app');
+    if (app) drawGameDetail(app);
+  }, 0);
 }
 
 function reviewGraphHtml(review, status, ply) {
