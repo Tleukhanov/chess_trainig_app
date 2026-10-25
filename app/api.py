@@ -28,7 +28,7 @@ from typing import Any
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from . import data as shared_data
 from . import middlegame as mg
@@ -710,6 +710,64 @@ class MoveNoteBody(BaseModel):
 
     ply: int
     intent: str = ""
+
+
+# --- Шахматные утилиты: свободный разбор позиции (stateless) -----------------
+
+
+class ChessPositionBody(BaseModel):
+    """Тело POST /api/chess/legal: произвольная позиция в FEN."""
+
+    fen: str
+
+
+class ChessMoveBody(BaseModel):
+    """Тело POST /api/chess/move.
+
+    ``from`` — ключевое слово Python, поэтому поле называется ``from_sq`` и
+    принимается из JSON по alias ``from`` (либо по имени благодаря
+    ``populate_by_name``).
+    """
+
+    model_config = {"populate_by_name": True}
+
+    fen: str
+    from_sq: str = Field(alias="from")
+    to: str
+    promotion: str | None = None
+
+
+class ChessEvalBody(BaseModel):
+    """Тело POST /api/chess/eval: FEN и желаемая глубина (6..14)."""
+
+    fen: str
+    depth: int = 10
+
+
+#: Границы глубины быстрой оценки позиции (экран разбора задачи дня).
+CHESS_EVAL_DEPTH_MIN = 6
+CHESS_EVAL_DEPTH_MAX = 14
+CHESS_EVAL_TIME_MS = 800
+
+
+def _fen_board(fen: str) -> chess.Board:
+    """Доска из FEN или HTTP 400 при невалидной строке/позиции."""
+    try:
+        return chess.Board(fen)
+    except ValueError as exc:
+        raise HTTPException(400, f"Невалидный FEN: {exc}") from exc
+
+
+def _chess_move_from_body(board: chess.Board, body: ChessMoveBody) -> chess.Move:
+    """UCI-ход из тела запроса; HTTP 400 если ход не легален в позиции."""
+    uci = f"{body.from_sq}{body.to}{body.promotion or ''}".lower()
+    try:
+        move = chess.Move.from_uci(uci)
+    except ValueError as exc:
+        raise HTTPException(400, f"Невалидный ход: {uci}") from exc
+    if move not in board.legal_moves:
+        raise HTTPException(400, f"Нелегальный ход: {uci}")
+    return move
 
 
 def _opening_policy(opp_elo: int, my_elo: int) -> tuple[Any, str]:
@@ -3048,6 +3106,79 @@ def create_api(
     def _notes_payload(db, user: str, game_id: str) -> dict[str, str]:
         """Заметки игрока к ходам: {"<ply>": intent}."""
         return {str(ply): text for ply, text in db.get_move_notes(game_id, user).items()}
+
+    # --- Шахматные утилиты: свободный разбор позиции (stateless) ------------
+
+    @app.post("/api/chess/legal")
+    def api_chess_legal(body: ChessPositionBody, request: Request):
+        """Легальные ходы позиции: UCI-координаты + SAN (для доски разбора)."""
+        user = _current_user(app.state.db_path, request)
+        if not user:
+            raise HTTPException(404, "No current user")
+        board = _fen_board(body.fen)
+        return {
+            "moves": [
+                {
+                    "from": chess.square_name(move.from_square),
+                    "to": chess.square_name(move.to_square),
+                    "promotion": (
+                        chess.piece_symbol(move.promotion) if move.promotion else None
+                    ),
+                    "san": board.san(move),
+                }
+                for move in board.legal_moves
+            ]
+        }
+
+    @app.post("/api/chess/move")
+    def api_chess_move(body: ChessMoveBody, request: Request):
+        """Применяет ход к FEN и возвращает новую позицию без сохранения."""
+        user = _current_user(app.state.db_path, request)
+        if not user:
+            raise HTTPException(404, "No current user")
+        board = _fen_board(body.fen)
+        move = _chess_move_from_body(board, body)
+        san = board.san(move)
+        board.push(move)
+        return {
+            "fen": board.fen(),
+            "san": san,
+            "check": board.is_check(),
+            "game_over": board.is_game_over(),
+        }
+
+    @app.post("/api/chess/eval")
+    def api_chess_eval(body: ChessEvalBody, request: Request):
+        """Быстрая оценка позиции Stockfish (win% — для белых)."""
+        user = _current_user(app.state.db_path, request)
+        if not user:
+            raise HTTPException(404, "No current user")
+        board = _fen_board(body.fen)
+        depth = max(CHESS_EVAL_DEPTH_MIN, min(CHESS_EVAL_DEPTH_MAX, body.depth))
+        try:
+            with Engine(depth=depth, multipv=1, time_ms=CHESS_EVAL_TIME_MS) as engine:
+                lines = engine.analyze_position(board)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(503, "Stockfish недоступен") from exc
+        if not lines:
+            raise HTTPException(503, "Stockfish не вернул оценку")
+        top = lines[0]
+        eval_white = top.get("eval") or {}
+        best_line = [str(move) for move in (top.get("pv") or [])]
+        try:
+            win_value = float(top["win"]) if top.get("win") is not None else None
+        except (TypeError, ValueError):
+            win_value = None
+        if win_value is None:
+            win_value = win_percent(eval_white.get("cp"), eval_white.get("mate"))
+        return {
+            "depth": depth,
+            "cp": eval_white.get("cp"),
+            "mate": eval_white.get("mate"),
+            "win": win_value,
+            "best_san": best_line[0] if best_line else None,
+            "best_line": best_line,
+        }
 
     @app.get("/api/games")
     def api_games(request: Request, limit: int = 100):

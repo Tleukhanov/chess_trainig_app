@@ -1,6 +1,6 @@
 // Chess Trainer Frontend — SPA на vanilla JS, потребляет /api/* эндпоинты.
 
-import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.6.7';
+import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.6.8';
 
 const state = {
   user: null,
@@ -23,6 +23,16 @@ const state = {
   taskRevealed: false,
   taskLine: null,
   taskPlayTimer: null,
+  // Свободный разбор решения: своя позиция, ходы и оценка Stockfish.
+  taskExplore: false,
+  taskExploreFen: null,
+  taskExploreMoves: [],
+  taskExploreEval: null,
+  taskExploreResult: null,
+  taskExploreLast: [],
+  taskExploreBusy: false,
+  taskExploreError: null,
+  taskExploreToken: 0,
   taskExplanation: null,
   taskExplaining: false,
   taskJobId: null,
@@ -123,6 +133,7 @@ function setupTheme() {
 const views = ['dashboard', 'overview', 'plan', 'progress', 'games', 'drills', 'task', 'opening', 'middlegame', 'coach', 'tools', 'users'];
 
 function clearAllTimers() {
+  if (state.taskPlayTimer) { clearInterval(state.taskPlayTimer); state.taskPlayTimer = null; }
   Object.keys(state.timers).forEach(key => {
     if (state.timers[key]) {
       clearInterval(state.timers[key]);
@@ -2006,6 +2017,8 @@ async function viewTask(app) {
     state.taskJobId = null;
     state.taskRevealed = !!task.done;
     state.taskLine = null;
+    if (state.taskPlayTimer) { clearInterval(state.taskPlayTimer); state.taskPlayTimer = null; }
+    resetTaskExplore();
   } else if (!state.taskExplanation && task.explanation) {
     state.taskExplanation = task.explanation;
   }
@@ -2055,6 +2068,7 @@ function taskLineControlsHtml(lineFens, lineIdx) {
       <button type="button" class="btn btn-secondary" id="task-line-played" ${atStart ? 'disabled' : ''} title="Показать сыгранный ход (красный крестик)">Твой ход</button>
       <button type="button" class="btn btn-secondary" id="task-line-best" ${total < 1 ? 'disabled' : ''} title="Показать лучший ход (зелёная галочка)">Лучший ход</button>
       <button type="button" class="btn btn-secondary" id="task-line-play" ${total < 1 ? 'disabled' : ''}>▶ Показать линию</button>
+      <button type="button" class="btn btn-secondary" id="task-line-explore" title="Ходить любыми фигурами и смотреть оценку Stockfish">Свободный разбор</button>
       <span class="task-line-pos">${atStart ? 'до хода' : `${Math.min(value, total)} / ${total}`}</span>
       <div class="task-line-nav">
         <button type="button" class="btn btn-secondary" id="task-line-prev" ${atStart || value <= 0 ? 'disabled' : ''}>◀</button>
@@ -2087,7 +2101,6 @@ function taskEvalBarsHtml(task) {
 }
 
 function drawTask(app) {
-  if (state.taskPlayTimer) { clearInterval(state.taskPlayTimer); state.taskPlayTimer = null; }
   const task = state.task;
   if (!task) {
     app.innerHTML = '<div class="card"><p>Загрузка...</p></div>';
@@ -2098,24 +2111,32 @@ function drawTask(app) {
   const lineFens = [task.fen, ...(Array.isArray(task.best_line_fens) ? task.best_line_fens : [])];
   const lineIdx = typeof state.taskLine === 'number' ? state.taskLine : null;
   const inLine = lineIdx != null && lineIdx >= 0 && lineIdx < lineFens.length;
+  const explore = !!state.taskExplore && answered;
   const bestMove = uciToFromTo(task.best_uci);
   const playedMove = uciToFromTo(task.played_uci);
-  const currentFen = inLine ? lineFens[lineIdx] : task.fen;
-  const lineLast = inLine && lineIdx > 0 ? lastMoveSquares(lineFens[lineIdx - 1], lineFens[lineIdx]) : [];
+  const currentFen = explore && state.taskExploreFen
+    ? state.taskExploreFen
+    : (inLine ? lineFens[lineIdx] : task.fen);
+  const exploreLast = explore && Array.isArray(state.taskExploreLast) ? state.taskExploreLast : [];
+  const lineLast = explore
+    ? exploreLast
+    : (inLine && lineIdx > 0 ? lastMoveSquares(lineFens[lineIdx - 1], lineFens[lineIdx]) : []);
   const arrows = [];
   const marks = [];
-  if (answered && !inLine) {
-    if (bestMove) {
-      arrows.push({ from: bestMove[0], to: bestMove[1], color: 'good' });
-      marks.push({ square: bestMove[1], kind: 'good' });
+  if (!explore) {
+    if (answered && !inLine) {
+      if (bestMove) {
+        arrows.push({ from: bestMove[0], to: bestMove[1], color: 'good' });
+        marks.push({ square: bestMove[1], kind: 'good' });
+      }
+      if (playedMove && !(bestMove && playedMove[0] === bestMove[0] && playedMove[1] === bestMove[1])) {
+        arrows.push({ from: playedMove[0], to: playedMove[1], color: 'bad' });
+        marks.push({ square: playedMove[1], kind: 'bad' });
+      }
+    } else if (inLine && lineLast.length >= 2) {
+      arrows.push({ from: lineLast[0], to: lineLast[1], color: 'good' });
+      marks.push({ square: lineLast[1], kind: 'good' });
     }
-    if (playedMove && !(bestMove && playedMove[0] === bestMove[0] && playedMove[1] === bestMove[1])) {
-      arrows.push({ from: playedMove[0], to: playedMove[1], color: 'bad' });
-      marks.push({ square: playedMove[1], kind: 'bad' });
-    }
-  } else if (inLine && lineLast.length >= 2) {
-    arrows.push({ from: lineLast[0], to: lineLast[1], color: 'good' });
-    marks.push({ square: lineLast[1], kind: 'good' });
   }
   const colorLabel = task.user_color === 'white' ? 'белые' : 'чёрные';
   const clsBadge = answered && task.classification
@@ -2179,11 +2200,13 @@ function drawTask(app) {
           <span class="badge badge-blue">${esc(task.date)}</span>
           <span class="badge badge-neutral">${esc(task.opening || '—')}${task.eco ? ` ${esc(task.eco)}` : ''}</span>
           <span class="badge badge-neutral">ты: ${colorLabel}</span>
+          ${explore ? '<span class="badge badge-blue">свободный разбор</span>' : ''}
           ${clsBadge}
         </div>
         ${answered ? '' : '<div id="task-board-hint" style="color:var(--c-text-muted);font-size:13px;margin-top:8px">кликни фигуру, затем клетку — или введи ход текстом</div>'}
-        ${answered ? taskLineControlsHtml(lineFens, lineIdx) : ''}
-        ${answered ? taskEvalBarsHtml(task) : ''}
+        ${explore ? '<div class="task-explore-hint">Ходи любой фигурой — оценка Stockfish обновится после хода.</div>' : ''}
+        ${answered ? (explore ? taskExplorePanelHtml() : taskLineControlsHtml(lineFens, lineIdx)) : ''}
+        ${answered && !explore ? taskEvalBarsHtml(task) : ''}
       </div>
       <div class="game-side">
         ${state.taskError ? `<div class="alert alert-error">${esc(state.taskError)}</div>` : ''}
@@ -2214,9 +2237,30 @@ function drawTask(app) {
   if (explainBtn) explainBtn.addEventListener('click', () => taskExplain(app));
   bindBoard(app.querySelector('.board'));
 
+  // Свободный разбор: вход, выход и доска с любыми легальными ходами.
+  const exploreBtn = document.getElementById('task-line-explore');
+  if (exploreBtn) exploreBtn.addEventListener('click', () => startTaskExplore(app));
+  const exploreBack = document.getElementById('task-explore-back');
+  if (exploreBack) {
+    exploreBack.addEventListener('click', () => {
+      resetTaskExplore();
+      drawTask(app);
+    });
+  }
+  if (explore) {
+    const exploreBoard = app.querySelector('.board');
+    if (exploreBoard) {
+      bindBoard(exploreBoard, {
+        moves: Array.isArray(state.taskExploreMoves) ? state.taskExploreMoves : [],
+        onMove: move => playTaskExploreMove(app, move),
+      });
+    }
+  }
+
   // Просмотр решения: позиция до хода, лучший ход, вся линия, шаги.
   const totalLine = Math.max(0, lineFens.length - 1);
   const setLine = value => {
+    if (state.taskPlayTimer) { clearInterval(state.taskPlayTimer); state.taskPlayTimer = null; }
     state.taskLine = value == null ? null : Math.max(0, Math.min(totalLine, value));
     drawTask(app);
   };
@@ -2234,6 +2278,7 @@ function drawTask(app) {
   if (linePlay) {
     linePlay.addEventListener('click', () => {
       if (totalLine < 1) return;
+      if (state.taskPlayTimer) { clearInterval(state.taskPlayTimer); state.taskPlayTimer = null; }
       state.taskLine = 0;
       drawTask(app);
       state.taskPlayTimer = setInterval(() => {
@@ -2271,6 +2316,167 @@ function drawTask(app) {
   }
 }
 
+// --- Свободный разбор задачи ---
+
+const TASK_EXPLORE_DEPTH = 12;
+
+function resetTaskExplore() {
+  state.taskExploreToken = (state.taskExploreToken || 0) + 1;
+  state.taskExplore = false;
+  state.taskExploreFen = null;
+  state.taskExploreMoves = [];
+  state.taskExploreEval = null;
+  state.taskExploreResult = null;
+  state.taskExploreLast = [];
+  state.taskExploreBusy = false;
+  state.taskExploreError = null;
+}
+
+// Позиция, которую сейчас показывает просмотр линии (до хода или шаг линии).
+function taskExploreSourceFen() {
+  const task = state.task;
+  if (!task) return null;
+  const lineFens = [task.fen, ...(Array.isArray(task.best_line_fens) ? task.best_line_fens : [])];
+  const lineIdx = typeof state.taskLine === 'number' ? state.taskLine : null;
+  if (lineIdx != null && lineIdx >= 0 && lineFens[lineIdx]) return lineFens[lineIdx];
+  return task.fen || null;
+}
+
+function chessPost(path, payload) {
+  return api(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+}
+
+function taskExplorePanelHtml() {
+  const ev = state.taskExploreEval;
+  const result = state.taskExploreResult;
+  let evalText;
+  if (state.taskExploreBusy) {
+    evalText = 'Stockfish думает…';
+  } else if (result && result.game_over) {
+    evalText = 'Позиция завершена (мат или пат)';
+  } else if (ev) {
+    const win = ev.win == null ? NaN : Number(ev.win);
+    const winTxt = Number.isFinite(win) ? Math.round(Math.max(0, Math.min(100, win))) + '%' : '—';
+    const depth = ev.depth != null ? ev.depth : TASK_EXPLORE_DEPTH;
+    const best = ev.best_san ? String(ev.best_san) : '—';
+    evalText = `Stockfish (depth ${depth}): win белых ${winTxt} · лучший ход ${best}`;
+  } else {
+    evalText = 'Stockfish: оценка недоступна';
+  }
+  const status = result && !result.game_over && result.check
+    ? '<span class="badge badge-bad">шах</span>'
+    : '';
+  return `
+    <div class="task-explore-panel" aria-live="polite">
+      <div class="task-explore-eval">${esc(evalText)}${status ? ' ' + status : ''}</div>
+      ${state.taskExploreError ? `<div class="task-explore-error">${esc(state.taskExploreError)}</div>` : ''}
+      <button type="button" class="btn btn-secondary" id="task-explore-back">Вернуться к решению</button>
+    </div>`;
+}
+
+function startTaskExplore(app) {
+  const fen = taskExploreSourceFen();
+  if (!fen) return;
+  if (state.taskPlayTimer) { clearInterval(state.taskPlayTimer); state.taskPlayTimer = null; }
+  resetTaskExplore();
+  state.taskExplore = true;
+  state.taskExploreFen = fen;
+  // Сохраняем подсветку последнего хода линии, если разбор начат с шага линии.
+  const task = state.task;
+  if (task && typeof state.taskLine === 'number' && state.taskLine > 0) {
+    const lineFens = [task.fen, ...(Array.isArray(task.best_line_fens) ? task.best_line_fens : [])];
+    if (lineFens[state.taskLine - 1] && lineFens[state.taskLine]) {
+      state.taskExploreLast = lastMoveSquares(lineFens[state.taskLine - 1], lineFens[state.taskLine]);
+    }
+  }
+  drawTask(app);
+  taskExploreRefresh(app);
+}
+
+// Догружает легальные ходы и оценку для текущей позиции разбора.
+async function taskExploreRefresh(app) {
+  if (!state.taskExplore || !state.taskExploreFen) return;
+  const token = state.taskExploreToken;
+  const fen = state.taskExploreFen;
+  state.taskExploreBusy = true;
+  state.taskExploreError = null;
+  if (state.currentView === 'task') drawTask(app);
+  const [legalRes, evalRes] = await Promise.allSettled([
+    chessPost('/api/chess/legal', { fen }),
+    chessPost('/api/chess/eval', { fen, depth: TASK_EXPLORE_DEPTH }),
+  ]);
+  if (token !== state.taskExploreToken || !state.taskExplore) return;
+  const errors = [];
+  if (legalRes.status === 'fulfilled') {
+    const moves = (legalRes.value && legalRes.value.moves) || [];
+    state.taskExploreMoves = moves.filter(m => m && m.from && m.to);
+  } else {
+    state.taskExploreMoves = [];
+    errors.push('ходы: ' + ((legalRes.reason && legalRes.reason.message) || 'недоступны'));
+  }
+  if (evalRes.status === 'fulfilled') {
+    state.taskExploreEval = evalRes.value || null;
+  } else {
+    state.taskExploreEval = null;
+    errors.push('оценка: ' + ((evalRes.reason && evalRes.reason.message) || 'недоступна'));
+  }
+  state.taskExploreBusy = false;
+  state.taskExploreError = errors.length ? errors.join(' · ') : null;
+  if (errors.length) showToast(errors[0], 'error');
+  if (state.currentView === 'task') drawTask(app);
+}
+
+async function playTaskExploreMove(app, move) {
+  if (!state.taskExplore || state.taskExploreBusy) return;
+  const fen = state.taskExploreFen;
+  const from = move && move.from;
+  const to = move && move.to;
+  if (!fen || !from || !to) return;
+  const token = state.taskExploreToken;
+  state.taskExploreBusy = true;
+  state.taskExploreError = null;
+  let res;
+  try {
+    res = await chessPost('/api/chess/move', {
+      fen, from, to, promotion: move.promotion || undefined,
+    });
+  } catch (err) {
+    if (token !== state.taskExploreToken || !state.taskExplore) return;
+    state.taskExploreBusy = false;
+    state.taskExploreError = err.message;
+    if (state.currentView !== 'task') return;
+    showToast(err.message, 'error');
+    drawTask(app);
+    return;
+  }
+  if (token !== state.taskExploreToken || !state.taskExplore) return;
+  if (!res || !res.fen) {
+    state.taskExploreBusy = false;
+    state.taskExploreError = 'Сервер не вернул позицию';
+    if (state.currentView !== 'task') return;
+    showToast('Сервер не вернул позицию', 'error');
+    drawTask(app);
+    return;
+  }
+  state.taskExploreFen = res.fen;
+  state.taskExploreResult = res;
+  state.taskExploreLast = [from, to];
+  state.taskExploreMoves = [];
+  state.taskExploreEval = null;
+  if (res.game_over) {
+    // Терминальная позиция: ходов и оценки нет, доска остаётся как есть.
+    state.taskExploreBusy = false;
+    if (state.currentView === 'task') drawTask(app);
+    return;
+  }
+  if (state.currentView === 'task') drawTask(app);
+  await taskExploreRefresh(app);
+}
+
 async function submitTaskAnswer(app, san) {
   const answer = String(san == null ? '' : san).trim();
   if (!answer) return;
@@ -2283,6 +2489,8 @@ async function submitTaskAnswer(app, san) {
     state.taskResult = res;
     state.taskRevealed = true;
     state.taskLine = null;
+    if (state.taskPlayTimer) { clearInterval(state.taskPlayTimer); state.taskPlayTimer = null; }
+    resetTaskExplore();
     state.task.done = !!res.correct;
   } catch (err) {
     state.taskError = err.message;

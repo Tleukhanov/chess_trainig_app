@@ -759,6 +759,20 @@ td.center { text-align: center; }
 .task-line-nav { display: flex; align-items: center; gap: 6px; width: 100%; }
 .task-line-nav input[type="range"] { flex: 1; accent-color: var(--c-btn-primary); min-width: 60px; }
 
+/* Свободный разбор задачи: панель с оценкой Stockfish и возвратом к решению */
+.task-explore-hint { color: var(--c-text-muted); font-size: 13px; margin-top: 8px; }
+.task-explore-panel {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  font-size: 12px;
+}
+.task-explore-eval { flex: 1 1 100%; color: var(--c-text-muted); }
+.task-explore-panel .btn { font-size: 12px; padding: 4px 10px; }
+.task-explore-error { flex: 1 1 100%; color: var(--c-err-blunder); }
+
 /* Шкала оценки Stockfish (win% белых) после решения */
 .eval-bars { display: flex; gap: 18px; margin-top: 12px; }
 .eval-bar-item { display: flex; flex-direction: column; align-items: center; gap: 4px; font-size: 11px; color: var(--c-text-muted); }

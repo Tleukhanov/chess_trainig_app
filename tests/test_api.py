@@ -2515,7 +2515,7 @@ class FrontendTests(ApiTestBase):
         html = resp.text
         self.assertIn("app.js?v=", html)
         self.assertIn("style.css?v=", html)
-        self.assertIn("v0.6.7", html)
+        self.assertIn("v0.6.8", html)
 
     def test_api_version(self):
         self.assertEqual(self.app.version, "0.4.8")
@@ -3163,6 +3163,113 @@ class GameCausesNotesApiTests(ApiTestBase):
         self.assertEqual(
             self.client.get("/api/games/cn1/notes").json()["notes"].keys(), {"0"}
         )
+
+
+class ChessUtilsApiTests(ApiTestBase):
+    """POST /api/chess/{legal,move,eval}: stateless-разбор позиции.
+
+    Stockfish не поднимается: для eval подменяем ``app.api.Engine`` фейком.
+    """
+
+    class FakePositionEngine:
+        """Фейк Engine: запоминает параметры и отдаёт одну линию."""
+
+        calls: list[dict] = []
+
+        def __init__(self, depth=14, multipv=3, time_ms=None, **kwargs):
+            type(self).calls.append(
+                {"depth": depth, "multipv": multipv, "time_ms": time_ms}
+            )
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def analyze_position(self, board):
+            return [
+                {
+                    "pv": ["Nf3", "Nc6", "Bb5"],
+                    "eval": {"cp": 31, "mate": None},
+                    "win": 54.5,
+                    "multipv": 1,
+                }
+            ]
+
+    def setUp(self) -> None:
+        super().setUp()
+        type(self).FakePositionEngine.calls = []
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.set_current_user("tester")
+
+    def test_legal_starting_position_has_20_moves(self):
+        resp = self.client.post(
+            "/api/chess/legal", json={"fen": chess.STARTING_FEN}
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        moves = resp.json()["moves"]
+        self.assertEqual(len(moves), 20)
+        e2e4 = next(m for m in moves if m["from"] == "e2" and m["to"] == "e4")
+        self.assertEqual(e2e4["san"], "e4")
+        self.assertIsNone(e2e4["promotion"])
+
+    def test_move_applies_e2e4(self):
+        resp = self.client.post(
+            "/api/chess/move",
+            json={"fen": chess.STARTING_FEN, "from": "e2", "to": "e4", "promotion": None},
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["san"], "e4")
+        expected = chess.Board()
+        expected.push_san("e4")
+        self.assertEqual(data["fen"], expected.fen())
+        self.assertFalse(data["check"])
+        self.assertFalse(data["game_over"])
+
+    def test_illegal_move_400(self):
+        resp = self.client.post(
+            "/api/chess/move",
+            json={"fen": chess.STARTING_FEN, "from": "e2", "to": "e5"},
+        )
+        self.assertEqual(resp.status_code, 400)
+        # Невалидный UCI (нет такой клетки) — тоже 400, а не 500.
+        resp = self.client.post(
+            "/api/chess/move",
+            json={"fen": chess.STARTING_FEN, "from": "zz", "to": "e4"},
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_eval_returns_white_win_and_best_line(self):
+        fake = type(self).FakePositionEngine
+        with patch("app.api.Engine", fake):
+            resp = self.client.post(
+                "/api/chess/eval",
+                json={"fen": chess.STARTING_FEN, "depth": 10},
+            )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["depth"], 10)
+        self.assertGreaterEqual(data["win"], 0.0)
+        self.assertLessEqual(data["win"], 100.0)
+        self.assertTrue(data["best_san"])
+        self.assertEqual(data["best_san"], "Nf3")
+        self.assertEqual(data["best_line"][0], "Nf3")
+        self.assertEqual(
+            fake.calls, [{"depth": 10, "multipv": 1, "time_ms": 800}]
+        )
+
+    def test_invalid_fen_400(self):
+        for path, payload in (
+            ("/api/chess/legal", {"fen": "not a fen"}),
+            ("/api/chess/move", {"fen": "not a fen", "from": "e2", "to": "e4"}),
+            ("/api/chess/eval", {"fen": "not a fen", "depth": 10}),
+        ):
+            with self.subTest(path=path):
+                resp = self.client.post(path, json=payload)
+                self.assertEqual(resp.status_code, 400, resp.text)
 
 
 if __name__ == "__main__":
