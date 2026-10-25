@@ -1,6 +1,6 @@
 // Chess Trainer Frontend — SPA на vanilla JS, потребляет /api/* эндпоинты.
 
-import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.6.4';
+import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.6.5';
 
 const state = {
   user: null,
@@ -1071,13 +1071,21 @@ function drawGameDetail(app) {
     return '';
   };
 
+  const moveClassForBadge = badge => {
+    if (badge === 'blunder') return ' move-blunder';
+    if (badge === 'mistake') return ' move-mistake';
+    if (badge === 'inaccuracy') return ' move-inaccuracy';
+    return '';
+  };
   const moveCellHtml = m => {
     if (!m) return '';
     const entry = reviewMoves[m.ply];
     const badge = entry ? reviewBadge(entry.badge) : '';
     const isCurrent = ply === m.ply + 1;
     const badgeHtml = badge ? reviewBadgeIcon(badge, isCurrent ? 'pop' : '') : '';
-    return `<button class="move-cell${clsForPly(m.ply)}${isCurrent ? ' active' : ''}" data-ply="${m.ply}">${esc(m.san)}${badgeHtml}</button>`;
+    // Цвет клетки — по бейджу из разбора (единый источник правды), иначе по анализу.
+    const cellCls = badge ? moveClassForBadge(badge) : clsForPly(m.ply);
+    return `<button class="move-cell${cellCls}${isCurrent ? ' active' : ''}" data-ply="${m.ply}">${esc(m.san)}${badgeHtml}</button>`;
   };
 
   const moveRowsHtml = moves.length
