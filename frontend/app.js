@@ -1,6 +1,6 @@
 // Chess Trainer Frontend — SPA на vanilla JS, потребляет /api/* эндпоинты.
 
-import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.7.3';
+import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.7.4';
 
 const state = {
   user: null,
@@ -2171,7 +2171,7 @@ function gameErrorsInnerHtml(analysis, game, extras) {
     ? `<p style="color:var(--c-text-muted);font-size:12px">Показаны первые ${shown.length} из ${errors.length}.</p>`
     : '';
   const intentHtml = extras && extras.intentReview
-    ? `<div class="card" style="margin-top:10px"><div class="card-header"><span class="card-title">Разбор идей</span></div><div style="font-size:13px;line-height:1.5">${esc(extras.intentReview)}</div></div>`
+    ? `<div class="card" style="margin-top:10px"><div class="card-header"><span class="card-title">Разбор идей</span></div><div style="font-size:13px;line-height:1.5;white-space:pre-wrap">${esc(extras.intentReview)}</div></div>`
     : '';
   return `<div class="card-header" style="margin-top:12px"><span class="card-title">Ошибки: причина и твоя идея</span>
       <button type="button" class="btn btn-secondary" id="intent-review-btn" style="font-size:12px;padding:4px 10px">Разобрать мои идеи</button>
