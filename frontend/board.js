@@ -95,6 +95,8 @@ export function boardHtml(fen, opts = {}) {
   const lastMove = Array.isArray(opts.lastMove) ? opts.lastMove : [];
   const flip = !!opts.flip;
 
+  const staticArrows = Array.isArray(opts.arrows) ? opts.arrows : [];
+  const marks = Array.isArray(opts.marks) ? opts.marks : [];
   const animFrom = opts.animFrom || (lastMove.length === 2 ? lastMove[0] : '');
   const animTo = opts.animTo || (lastMove.length === 2 ? lastMove[1] : '');
   const animate = opts.animate !== false && animFrom && animTo && animFrom !== animTo;
@@ -126,14 +128,18 @@ export function boardHtml(fen, opts = {}) {
       const pieceHtml = piece
         ? `<span class="piece ${piece === piece.toUpperCase() ? 'pw' : 'pb'}" aria-label="${pieceColor} ${pieceName}"><img src="${PIECE_DIR}/${PIECE_IMAGES[piece]}.svg" alt="${pieceColor} ${pieceName}" draggable="false" decoding="async"></span>`
         : '';
-      html += `<div class="${cls.join(' ')}" data-square="${square}" role="gridcell" aria-label="${square}" tabindex="-1">${coord}${pieceHtml}</div>`;
+      const mark = marks.find(m => m && m.square === square);
+      const markHtml = mark
+        ? `<span class="sq-mark sq-mark-${mark.kind === 'bad' ? 'bad' : 'good'}" aria-hidden="true">${mark.kind === 'bad' ? '✗' : '✓'}</span>`
+        : '';
+      html += `<div class="${cls.join(' ')}" data-square="${square}" role="gridcell" aria-label="${square}" tabindex="-1">${coord}${pieceHtml}${markHtml}</div>`;
     }
   }
 
   return `<div class="board${flip ? ' flipped' : ''}" role="application" aria-label="Chess board" tabindex="0" data-flip="${flip ? '1' : '0'}"
     data-anim-from="${animate ? animFrom : ''}" data-anim-to="${animate ? animTo : ''}">
     <div class="board-grid" role="grid" aria-label="Chess board grid">${html}</div>
-    <svg class="board-arrows" viewBox="0 0 8 8" preserveAspectRatio="none" aria-hidden="true"></svg>
+    <svg class="board-arrows" viewBox="0 0 8 8" preserveAspectRatio="none" aria-hidden="true">${staticArrows.map(a => arrowMarkup(a.from, a.to, a.color === 'bad' || a.color === 'red' ? ARROW_COLORS.red : ARROW_COLORS.green, flip)).join('')}</svg>
     <div class="board-drag-layer"></div>
   </div>`;
 }
@@ -182,6 +188,28 @@ function drawArrow(svg, from, to, color, flip) {
   group.appendChild(line);
   group.appendChild(polygon);
   svg.appendChild(group);
+}
+
+// Статическая стрелка для server-rendered доски (boardHtml): та же геометрия,
+// что и у интерактивной drawArrow, но строкой, без DOM.
+function arrowMarkup(from, to, color, flip) {
+  const p1 = squarePoint(from, flip);
+  const p2 = squarePoint(to, flip);
+  if (!p1 || !p2) return '';
+  const dx = p2.x - p1.x;
+  const dy = p2.y - p1.y;
+  const len = Math.hypot(dx, dy);
+  if (len < 0.2) return '';
+  const ux = dx / len;
+  const uy = dy / len;
+  const head = Math.min(0.42, len * 0.5);
+  const half = 0.25;
+  const tip = p2;
+  const baseX = tip.x - ux * head;
+  const baseY = tip.y - uy * head;
+  const line = `<line x1="${p1.x.toFixed(3)}" y1="${p1.y.toFixed(3)}" x2="${(baseX + ux * 0.1).toFixed(3)}" y2="${(baseY + uy * 0.1).toFixed(3)}" stroke="${color}" stroke-width="0.17" stroke-linecap="round"></line>`;
+  const polygon = `<polygon points="${tip.x.toFixed(3)},${tip.y.toFixed(3)} ${(baseX - uy * half).toFixed(3)},${(baseY + ux * half).toFixed(3)} ${(baseX + uy * half).toFixed(3)},${(baseY - ux * half).toFixed(3)}" fill="${color}"></polygon>`;
+  return `<g opacity="0.8">${line}${polygon}</g>`;
 }
 
 function squareFromPoint(x, y, root) {

@@ -730,3 +730,37 @@ td.center { text-align: center; }
   .move-badge { width: 16px; height: 16px; border-radius: 4px; }
   .move-badge img { width: 14px; height: 14px; }
 }
+
+/* Статичные метки ходов (✓/✗) на доске после разбора */
+.sq-mark {
+  position: absolute;
+  right: 2px;
+  top: 1px;
+  z-index: 4;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1;
+  pointer-events: none;
+}
+.sq-mark-good { color: #2e9e4a; }
+.sq-mark-bad { color: #c5221f; }
+
+/* Просмотр решения задачи: шаги по лучшей линии */
+.task-line-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  font-size: 12px;
+}
+.task-line-controls .btn { font-size: 12px; padding: 4px 10px; }
+.task-line-pos { color: var(--c-text-muted); margin-left: auto; white-space: nowrap; }
+.task-line-nav { display: flex; align-items: center; gap: 6px; width: 100%; }
+.task-line-nav input[type="range"] { flex: 1; accent-color: var(--c-btn-primary); min-width: 60px; }
+
+/* Шкала оценки Stockfish (win% белых) после решения */
+.eval-bars { display: flex; gap: 18px; margin-top: 12px; }
+.eval-bar-item { display: flex; flex-direction: column; align-items: center; gap: 4px; font-size: 11px; color: var(--c-text-muted); }
+.eval-bar { width: 20px; height: 92px; border-radius: 4px; background: #2f2f2f; display: flex; align-items: flex-end; overflow: hidden; border: 1px solid var(--c-border); }
+.eval-bar-white { width: 100%; background: #f2f2f2; }

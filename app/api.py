@@ -1570,6 +1570,30 @@ def _task_payload(db: Database, user: str, date: str | None = None) -> dict[str,
     move = item["move"]
     ply = item["ply"]
     best = str(move.get("best_move_san"))
+    # Конкретная линия для просмотра: UCI первого хода, сыгранный ход и FEN
+    # после каждого полухода лучшей линии (фронтенд листает их без шахматной
+    # библиотеки на клиенте).
+    task_board = chess.Board(item["fen"])
+    best_uci = ""
+    played_uci = ""
+    try:
+        best_uci = task_board.parse_san(best).uci()
+    except ValueError:
+        pass
+    played_san = str(move.get("san") or game.moves[ply])
+    try:
+        played_uci = task_board.parse_san(played_san).uci()
+    except ValueError:
+        pass
+    best_line_fens: list[str] = []
+    cursor = task_board.copy()
+    for line_san in [best, *[str(s) for s in (move.get("best_line") or [])]]:
+        try:
+            line_move = cursor.parse_san(line_san)
+        except ValueError:
+            break
+        cursor.push(line_move)
+        best_line_fens.append(cursor.fen())
     explanation = db.get_task_explanation(item["task_key"])
     if explanation is not None and _is_bad_explanation(explanation):
         # Отравленный кэш (reasoning-разбор/safety-заглушка/огрызок вместо ответа):
@@ -1586,6 +1610,9 @@ def _task_payload(db: Database, user: str, date: str | None = None) -> dict[str,
         "san_played": str(move.get("san") or game.moves[ply]),
         "best_san": best,
         "best_line": [str(s) for s in (move.get("best_line") or [])],
+        "best_uci": best_uci,
+        "played_uci": played_uci,
+        "best_line_fens": best_line_fens,
         "classification": move.get("classification"),
         "drop": move.get("drop"),
         "win_before": move.get("win_before"),

@@ -1,6 +1,6 @@
 // Chess Trainer Frontend — SPA на vanilla JS, потребляет /api/* эндпоинты.
 
-import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.6.6';
+import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.6.7';
 
 const state = {
   user: null,
@@ -21,6 +21,8 @@ const state = {
   taskResult: null,
   taskAnswerText: '',
   taskRevealed: false,
+  taskLine: null,
+  taskPlayTimer: null,
   taskExplanation: null,
   taskExplaining: false,
   taskJobId: null,
@@ -2003,6 +2005,7 @@ async function viewTask(app) {
     state.taskExplaining = false;
     state.taskJobId = null;
     state.taskRevealed = !!task.done;
+    state.taskLine = null;
   } else if (!state.taskExplanation && task.explanation) {
     state.taskExplanation = task.explanation;
   }
@@ -2038,7 +2041,53 @@ function taskSolutionHtml(task) {
     </div>`;
 }
 
+function uciToFromTo(uci) {
+  const s = String(uci || '');
+  return /^[a-h][1-8][a-h][1-8]/.test(s) ? [s.slice(0, 2), s.slice(2, 4)] : null;
+}
+
+function taskLineControlsHtml(lineFens, lineIdx) {
+  const total = Math.max(0, lineFens.length - 1);
+  const atStart = lineIdx == null;
+  const value = atStart ? 0 : lineIdx;
+  return `
+    <div class="task-line-controls">
+      <button type="button" class="btn btn-secondary" id="task-line-played" ${atStart ? 'disabled' : ''} title="Показать сыгранный ход (красный крестик)">Твой ход</button>
+      <button type="button" class="btn btn-secondary" id="task-line-best" ${total < 1 ? 'disabled' : ''} title="Показать лучший ход (зелёная галочка)">Лучший ход</button>
+      <button type="button" class="btn btn-secondary" id="task-line-play" ${total < 1 ? 'disabled' : ''}>▶ Показать линию</button>
+      <span class="task-line-pos">${atStart ? 'до хода' : `${Math.min(value, total)} / ${total}`}</span>
+      <div class="task-line-nav">
+        <button type="button" class="btn btn-secondary" id="task-line-prev" ${atStart || value <= 0 ? 'disabled' : ''}>◀</button>
+        <input type="range" id="task-line-range" min="0" max="${Math.max(0, total)}" value="${Math.min(value, total)}" ${total < 1 ? 'disabled' : ''}>
+        <button type="button" class="btn btn-secondary" id="task-line-next" ${atStart || value >= total ? 'disabled' : ''}>▶</button>
+      </div>
+    </div>`;
+}
+
+function taskEvalBarsHtml(task) {
+  const before = Number(task.win_before);
+  const after = Number(task.win_after);
+  if (!Number.isFinite(before) || !Number.isFinite(after)) return '';
+  const white = v => (task.user_color === 'white' ? v : 100 - v);
+  const items = [
+    ['до', white(before)],
+    ['после твоего хода', white(after)],
+  ];
+  return `<div class="eval-bars" aria-label="Оценка Stockfish до и после хода">
+    ${items.map(([label, v]) => {
+      const pct = Math.max(0, Math.min(100, v));
+      return `<div class="eval-bar-item">
+        <div class="eval-bar" title="${esc(label)}: win белых ${Math.round(pct)}%">
+          <div class="eval-bar-white" style="height:${pct.toFixed(1)}%"></div>
+        </div>
+        <span>${esc(label)}</span>
+      </div>`;
+    }).join('')}
+  </div>`;
+}
+
 function drawTask(app) {
+  if (state.taskPlayTimer) { clearInterval(state.taskPlayTimer); state.taskPlayTimer = null; }
   const task = state.task;
   if (!task) {
     app.innerHTML = '<div class="card"><p>Загрузка...</p></div>';
@@ -2046,6 +2095,28 @@ function drawTask(app) {
   }
 
   const answered = !!state.taskResult || !!task.done;
+  const lineFens = [task.fen, ...(Array.isArray(task.best_line_fens) ? task.best_line_fens : [])];
+  const lineIdx = typeof state.taskLine === 'number' ? state.taskLine : null;
+  const inLine = lineIdx != null && lineIdx >= 0 && lineIdx < lineFens.length;
+  const bestMove = uciToFromTo(task.best_uci);
+  const playedMove = uciToFromTo(task.played_uci);
+  const currentFen = inLine ? lineFens[lineIdx] : task.fen;
+  const lineLast = inLine && lineIdx > 0 ? lastMoveSquares(lineFens[lineIdx - 1], lineFens[lineIdx]) : [];
+  const arrows = [];
+  const marks = [];
+  if (answered && !inLine) {
+    if (bestMove) {
+      arrows.push({ from: bestMove[0], to: bestMove[1], color: 'good' });
+      marks.push({ square: bestMove[1], kind: 'good' });
+    }
+    if (playedMove && !(bestMove && playedMove[0] === bestMove[0] && playedMove[1] === bestMove[1])) {
+      arrows.push({ from: playedMove[0], to: playedMove[1], color: 'bad' });
+      marks.push({ square: playedMove[1], kind: 'bad' });
+    }
+  } else if (inLine && lineLast.length >= 2) {
+    arrows.push({ from: lineLast[0], to: lineLast[1], color: 'good' });
+    marks.push({ square: lineLast[1], kind: 'good' });
+  }
   const colorLabel = task.user_color === 'white' ? 'белые' : 'чёрные';
   const clsBadge = answered && task.classification
     ? `<span class="badge ${task.classification === 'blunder' ? 'badge-bad' : 'badge-neutral'}">${esc(task.classification)}</span>`
@@ -2096,7 +2167,14 @@ function drawTask(app) {
     <div class="card-header"><h1>Задача дня</h1><span class="badge badge-blue">${esc(state.user.nick)}</span></div>
     <div class="grid game-layout">
       <div class="card">
-        ${boardHtml(task.fen, { flip: task.user_color === 'black' })}
+        ${boardHtml(currentFen, {
+          flip: task.user_color === 'black',
+          lastMove: lineLast,
+          animFrom: lineLast[0],
+          animTo: lineLast[1],
+          arrows,
+          marks,
+        })}
         <div class="board-meta">
           <span class="badge badge-blue">${esc(task.date)}</span>
           <span class="badge badge-neutral">${esc(task.opening || '—')}${task.eco ? ` ${esc(task.eco)}` : ''}</span>
@@ -2104,6 +2182,8 @@ function drawTask(app) {
           ${clsBadge}
         </div>
         ${answered ? '' : '<div id="task-board-hint" style="color:var(--c-text-muted);font-size:13px;margin-top:8px">кликни фигуру, затем клетку — или введи ход текстом</div>'}
+        ${answered ? taskLineControlsHtml(lineFens, lineIdx) : ''}
+        ${answered ? taskEvalBarsHtml(task) : ''}
       </div>
       <div class="game-side">
         ${state.taskError ? `<div class="alert alert-error">${esc(state.taskError)}</div>` : ''}
@@ -2133,6 +2213,41 @@ function drawTask(app) {
   const explainBtn = document.getElementById('task-explain');
   if (explainBtn) explainBtn.addEventListener('click', () => taskExplain(app));
   bindBoard(app.querySelector('.board'));
+
+  // Просмотр решения: позиция до хода, лучший ход, вся линия, шаги.
+  const totalLine = Math.max(0, lineFens.length - 1);
+  const setLine = value => {
+    state.taskLine = value == null ? null : Math.max(0, Math.min(totalLine, value));
+    drawTask(app);
+  };
+  const linePlayed = document.getElementById('task-line-played');
+  if (linePlayed) linePlayed.addEventListener('click', () => setLine(null));
+  const lineBest = document.getElementById('task-line-best');
+  if (lineBest) lineBest.addEventListener('click', () => setLine(0));
+  const linePrev = document.getElementById('task-line-prev');
+  if (linePrev) linePrev.addEventListener('click', () => setLine((lineIdx == null ? 0 : lineIdx) - 1));
+  const lineNext = document.getElementById('task-line-next');
+  if (lineNext) lineNext.addEventListener('click', () => setLine((lineIdx == null ? -1 : lineIdx) + 1));
+  const lineRange = document.getElementById('task-line-range');
+  if (lineRange) lineRange.addEventListener('input', e => setLine(Number(e.target.value)));
+  const linePlay = document.getElementById('task-line-play');
+  if (linePlay) {
+    linePlay.addEventListener('click', () => {
+      if (totalLine < 1) return;
+      state.taskLine = 0;
+      drawTask(app);
+      state.taskPlayTimer = setInterval(() => {
+        const current = typeof state.taskLine === 'number' ? state.taskLine : 0;
+        if (current >= totalLine) {
+          clearInterval(state.taskPlayTimer);
+          state.taskPlayTimer = null;
+          return;
+        }
+        state.taskLine = current + 1;
+        drawTask(app);
+      }, 700);
+    });
+  }
   if (!state.taskResult && !task.done) {
     api('/api/task/legal').then(legal => {
       if (!legal || !state.task || legal.task_key !== state.task.task_key) return;
@@ -2167,6 +2282,7 @@ async function submitTaskAnswer(app, san) {
     const res = await apiPost('/api/task/answer', fd);
     state.taskResult = res;
     state.taskRevealed = true;
+    state.taskLine = null;
     state.task.done = !!res.correct;
   } catch (err) {
     state.taskError = err.message;

@@ -1368,6 +1368,12 @@ class TaskApiTests(ApiTestBase):
         self.assertIsInstance(data["san_played"], str)
         self.assertTrue(data["san_played"])
         self.assertTrue(data["best_san"])
+        # Конкретная линия для просмотра: UCI ходов и FEN после каждого полухода.
+        self.assertRegex(data["best_uci"], r"^[a-h][1-8][a-h][1-8]$")
+        self.assertRegex(data["played_uci"], r"^[a-h][1-8][a-h][1-8]$")
+        self.assertIsInstance(data["best_line_fens"], list)
+        for fen in data["best_line_fens"]:
+            self.assertTrue(chess.Board(fen).is_valid())
         self.assertIn(data["classification"], ("blunder", "mistake"))
         self.assertIsInstance(data["drop"], (int, float))
         self.assertIsInstance(data["moves_before"], list)
@@ -2509,7 +2515,7 @@ class FrontendTests(ApiTestBase):
         html = resp.text
         self.assertIn("app.js?v=", html)
         self.assertIn("style.css?v=", html)
-        self.assertIn("v0.6.6", html)
+        self.assertIn("v0.6.7", html)
 
     def test_api_version(self):
         self.assertEqual(self.app.version, "0.4.8")
