@@ -1,6 +1,6 @@
 // Chess Trainer Frontend — SPA на vanilla JS, потребляет /api/* эндпоинты.
 
-import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.7.8';
+import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.8.1';
 
 const state = {
   user: null,
@@ -181,15 +181,36 @@ function navigate(view, options = {}) {
 }
 
 function setupNav() {
+  const topbar = document.querySelector('.topbar');
+  const toggle = document.getElementById('nav-toggle');
+  const closeNav = () => {
+    if (topbar) topbar.classList.remove('nav-open');
+    if (toggle) toggle.setAttribute('aria-expanded', 'false');
+  };
+  if (toggle) {
+    toggle.addEventListener('click', () => {
+      const open = topbar && !topbar.classList.contains('nav-open');
+      if (topbar) topbar.classList.toggle('nav-open', open);
+      toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    });
+  }
   document.querySelectorAll('#nav a').forEach(a => {
     a.addEventListener('click', e => {
       e.preventDefault();
+      closeNav();
       navigate(a.dataset.view);
     });
   });
   document.querySelector('.brand').addEventListener('click', e => {
     e.preventDefault();
+    closeNav();
     navigate('dashboard');
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') closeNav();
+  });
+  document.addEventListener('click', e => {
+    if (topbar && topbar.classList.contains('nav-open') && !topbar.contains(e.target)) closeNav();
   });
 }
 
@@ -206,11 +227,17 @@ async function authStatus() {
 function hideNav() {
   const nav = document.getElementById('nav');
   if (nav) nav.style.display = 'none';
+  const toggle = document.getElementById('nav-toggle');
+  if (toggle) toggle.hidden = true;
+  const topbar = document.querySelector('.topbar');
+  if (topbar) topbar.classList.remove('nav-open');
 }
 
 function showNav() {
   const nav = document.getElementById('nav');
   if (nav) nav.style.display = '';
+  const toggle = document.getElementById('nav-toggle');
+  if (toggle) toggle.hidden = false;
 }
 
 // Пункт «Админ» показываем только администратору (is_admin из /api/user/current).
