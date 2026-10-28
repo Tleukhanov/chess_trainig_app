@@ -55,7 +55,7 @@ CAUSES: tuple[str, ...] = (
 
 CAUSE_LABELS: dict[str, str] = {
     CAUSE_TIME_PRESSURE: "цейтнот",
-    CAUSE_TACTICAL_OVERSIGHT: "тактический зевок",
+    CAUSE_TACTICAL_OVERSIGHT: "резкая потеря",
     CAUSE_STRATEGIC: "стратегическая ошибка",
     CAUSE_RANDOM: "случайная",
 }
@@ -230,9 +230,10 @@ def explain_cause(
         return "ход на последних секундах — скорее цейтнот"
 
     if cause == CAUSE_TACTICAL_OVERSIGHT:
+        # Это порог по win%, а не доказанная тактика: не выдумываем мотив.
         if drop > 0.0:
-            return f"потеря {_fmt(drop)} win% за один ход — пропущена тактика"
-        return "резкая потеря за один ход — пропущена тактика"
+            return f"резкая потеря {_fmt(drop)} win% за один ход — причина не установлена"
+        return "резкая потеря за один ход — причина не установлена"
 
     if cause == CAUSE_STRATEGIC:
         opening = phase_hint == PHASE_OPENING

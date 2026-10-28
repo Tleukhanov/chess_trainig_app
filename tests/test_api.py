@@ -1446,13 +1446,13 @@ class TaskApiTests(ApiTestBase):
         self.assertEqual(data["win_before"], payload["win_before"])
         self.assertEqual(data["win_after"], payload["win_after"])
         self.assertEqual(data["san_played"], payload["san_played"])
-        # решение записано: повторный запрос + ключ в meta
+        # неверный ответ не закрывает задачу: можно попробовать ещё раз
         again = self.client.get("/api/task/today").json()
-        self.assertTrue(again["done"])
+        self.assertFalse(again["done"])
         with Database(self.db_path) as db:
             db.init_db()
-            self.assertEqual(
-                db.get_meta(_task_done_key(payload["date"], "tester")), "1"
+            self.assertIsNone(
+                db.get_meta(_task_done_key(payload["date"], "tester"))
             )
 
     def test_answer_correct_move(self):
@@ -2534,12 +2534,12 @@ class FrontendTests(ApiTestBase):
         html = resp.text
         self.assertIn("app.js?v=", html)
         self.assertIn("style.css?v=", html)
-        self.assertIn("v0.9.1", html)
+        self.assertIn("v0.9.7", html)
         self.assertIn('id="nav-toggle"', html)
         self.assertIn('aria-controls="nav"', html)
 
     def test_api_version(self):
-        self.assertEqual(self.app.version, "0.4.8")
+        self.assertEqual(self.app.version, "0.9.7")
 
 
 class AuthApiTests(ApiTestBase):
@@ -3075,8 +3075,8 @@ class GameCausesNotesApiTests(ApiTestBase):
         # Дебютная потеря >= 20 win.% не становится «тактикой».
         self.assertEqual(causes["4"]["cause"], "strategic")
         self.assertEqual(causes["12"]["cause"], "tactical_oversight")
-        self.assertEqual(causes["12"]["label"], "тактический зевок")
-        self.assertIn("тактика", causes["12"]["explanation"])
+        self.assertEqual(causes["12"]["label"], "резкая потеря")
+        self.assertIn("причина не установлена", causes["12"]["explanation"])
 
         # Без анализа — пустой словарь, а не 500.
         self._seed_game("cn_plain", analysis=False)

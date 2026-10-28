@@ -116,6 +116,8 @@ _MISSED_WIN_BEFORE = 95.0
 _MISSED_WIN_AFTER = 90.0
 _BRILLIANT_WIN_CAP = 95.0
 _GREAT_WIN_CAP = 50.0
+_GREAT_WIN_FLOOR = 10.0
+_BRILLIANT_WIN_FLOOR = 10.0
 
 # Похоже на жертву: потеря не меньше двух единиц материала (слон/конь).
 _SACRIFICE_MATERIAL = 2
@@ -256,10 +258,19 @@ def badge_for(
     ):
         return BADGE_MISSED_WIN
 
-    if best and sacrifice and win_before is not None and win_before < _BRILLIANT_WIN_CAP:
+    if (
+        best
+        and sacrifice
+        and win_before is not None
+        and _BRILLIANT_WIN_FLOOR <= win_before < _BRILLIANT_WIN_CAP
+    ):
         return BADGE_BRILLIANT
 
-    if best and win_before is not None and win_before < _GREAT_WIN_CAP:
+    if (
+        best
+        and win_before is not None
+        and _GREAT_WIN_FLOOR <= win_before < _GREAT_WIN_CAP
+    ):
         return BADGE_GREAT
 
     if best:

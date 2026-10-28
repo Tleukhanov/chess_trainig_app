@@ -28,6 +28,8 @@ __all__ = [
 #: Бейджи ходов, для которых есть готовая формулировка.
 BADGES: tuple[str, ...] = (
     "book",
+    "brilliant",
+    "great",
     "best",
     "excellent",
     "good",
@@ -40,7 +42,7 @@ BADGES: tuple[str, ...] = (
 #: Названия причин ошибки (совпадают с ``app.mistakes.CAUSE_LABELS``).
 CAUSE_LABELS: dict[str, str] = {
     "time_pressure": "цейтнот",
-    "tactical_oversight": "тактический зевок",
+    "tactical_oversight": "резкая потеря",
     "strategic": "стратегическая ошибка",
     "random": "случайная",
 }
@@ -55,8 +57,10 @@ PHASE_LABELS: dict[str, str] = {
 
 _BADGE_LABELS: dict[str, str] = {
     "book": "теоретический ход",
+    "brilliant": "блестящий ход",
+    "great": "отличный ход",
     "best": "лучший ход",
-    "excellent": "отличный ход",
+    "excellent": "очень хороший ход",
     "good": "хороший ход",
     "inaccuracy": "неточность",
     "mistake": "ошибка",
@@ -210,7 +214,7 @@ def _cause_note(cause: str | None, phase: str | None) -> str | None:
     if key == "time_pressure":
         return "Скорее всего, сказался цейтнот."
     if key == "tactical_oversight":
-        return "Пропущена тактика."
+        return "Резкая потеря за один ход."
     if key == "strategic":
         if _phase_key(phase) == "opening":
             return "Ошибка в дебюте — вопрос к плану, а не к одному ходу."
@@ -256,7 +260,7 @@ def move_comment(
             return f"{san} — теоретический ход."
         return "Теоретический ход."
 
-    if key in ("best", "excellent", "good"):
+    if key in ("best", "excellent", "good", "great", "brilliant"):
         label = _BADGE_LABELS[key]
         if san is not None:
             return f"{san} — {label}."
@@ -353,6 +357,8 @@ def game_summary(
     *,
     user_color: str,
     result: str | None = None,
+    errors: int = 0,
+    worst: dict | None = None,
 ) -> str:
     """Итог партии: 2-4 предложения по фазам, точности и результату.
 
@@ -400,6 +406,9 @@ def game_summary(
                     f"Сильная сторона — {PHASE_LABELS[best_key].lower()}, "
                     f"слабая — {PHASE_LABELS[worst_key].lower()}."
                 )
+            elif worst:
+                # При реальной ошибке не пишем «всё ровно» — ниже будет худший ход.
+                pass
             elif worst_value < 70.0:
                 sentences.append(f"Слабое место — {PHASE_LABELS[worst_key].lower()}.")
             elif best_value >= 80.0:
@@ -414,6 +423,18 @@ def game_summary(
         sentences.append(f"Средняя потеря по фазам: {parts}.")
         worst_key, _, _ = max(with_drop, key=lambda row: row[2])
         sentences.append(f"Больше всего потерь — {PHASE_LABELS[worst_key].lower()}.")
+
+    if worst and errors > 0:
+        san = worst.get("san") or "—"
+        label = _BADGE_LABELS.get(str(worst.get("badge") or ""), "ошибка")
+        drop = _number(worst.get("drop"))
+        best = worst.get("best_move_san")
+        detail = f"Худший момент — {san}, {label}"
+        if drop is not None:
+            detail += f" (−{_fmt(drop)} win%)"
+        if isinstance(best, str) and best.strip():
+            detail += f", лучше {best.strip()}"
+        sentences.append(detail + ".")
 
     if accuracy is not None:
         sentences.append(f"Итоговая точность — {_fmt(accuracy)}%.")

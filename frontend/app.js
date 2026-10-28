@@ -1,6 +1,6 @@
 // Chess Trainer Frontend — SPA на vanilla JS, потребляет /api/* эндпоинты.
 
-import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.9.1';
+import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.9.7';
 
 const state = {
   user: null,
@@ -246,7 +246,8 @@ function syncAdminNav() {
   if (admin) admin.hidden = !state.isAdmin;
   // «Инструменты» — внутренний LLM-полигон, не пользовательская фича.
   const tools = document.getElementById('nav-tools');
-  if (tools) tools.hidden = !state.isAdmin;
+  // Внутренние LLM-инструменты не показываем в пользовательском демо.
+  if (tools) tools.hidden = true;
 }
 
 function viewAuth(app) {
@@ -638,6 +639,22 @@ async function toggleDayPlanTask(app, taskId, done) {
   repaintDayPlan(app);
 }
 
+async function openingStartMovesFor(name) {
+  const opening = String(name || '').trim();
+  if (!opening) return [];
+  try {
+    const list = await api('/api/games?limit=100');
+    const game = (list.games || []).find(
+      g => String(g.opening || '').toLowerCase().startsWith(opening.toLowerCase())
+    );
+    if (!game) return [];
+    const detail = await api('/api/games/' + encodeURIComponent(game.id));
+    return ((detail.game && detail.game.moves) || []).slice(0, 8);
+  } catch {
+    return [];
+  }
+}
+
 async function startDayPlanTask(btn, task) {
   const action = (task && task.action) || {};
   const target = String(action.view || '');
@@ -647,10 +664,13 @@ async function startDayPlanTask(btn, task) {
     btn.disabled = true;
     btn.textContent = '…';
     try {
+      const startMoves = await openingStartMovesFor(action.opening);
+      const body = { style: 'universal', color, human: true };
+      if (startMoves.length) body.start_moves = startMoves;
       const res = await api('/api/opening/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ style: 'universal', color, human: true }),
+        body: JSON.stringify(body),
       });
       startOpeningSession(res);
       navigate('opening');
@@ -662,10 +682,10 @@ async function startDayPlanTask(btn, task) {
     }
     return;
   }
-  // action.view = review — это не отдельный экран, а вкладка «Разбор» в Инструментах.
+  // «Разбор» ведёт в обычный список партий, а не во внутренние Инструменты.
   if (target === 'review') {
-    state.tool = 'review';
-    navigate('tools');
+    state.gamesFilter = 'analyzed';
+    navigate('games');
     return;
   }
   if (views.includes(target)) {
@@ -720,6 +740,15 @@ function onboardingStepsHtml(plan, dayplan) {
     </div>`;
 }
 
+function isWeakOpening(o) {
+  const games = Number(o && o.games) || 0;
+  const points = Number(o && o.points_pct);
+  const errors = Number(o && o.errors_per_game) || 0;
+  if (games >= 2) return true;
+  if (Number.isFinite(points) && points < 70) return true;
+  return errors >= 1.5;
+}
+
 async function viewDashboard(app) {
   if (!state.user) {
     app.innerHTML = `
@@ -769,16 +798,17 @@ async function viewDashboard(app) {
         <div class="stat"><div class="stat-value">${fmt(h.unnatural_share_pct)}%</div><div class="stat-label">Доля неестественных</div></div>
       </div>`;
   } else {
-    humanityHtml = '<p style="color:var(--c-text-muted)">Нет данных humanize.</p>';
+    humanityHtml = '<p style="color:var(--c-text-muted)">Нет данных: запусти оценку ошибок.</p>';
   }
 
+  const weakRows = (plan.repertoire.weak_openings || []).filter(isWeakOpening);
   let weakOpeningsHtml = '';
-  if (plan.repertoire.weak_openings.length > 0) {
+  if (weakRows.length > 0) {
     weakOpeningsHtml = `
       <div class="table-wrap"><table>
         <thead><tr><th>Дебют</th><th>ECO</th><th>Партий</th><th>Очков %</th><th>Ошибок/партию</th><th>Ср. потеря</th><th></th></tr></thead>
         <tbody>
-          ${plan.repertoire.weak_openings.slice(0, 6).map(o => `
+          ${weakRows.slice(0, 6).map(o => `
             <tr>
               <td>${esc(o.opening)}</td><td>${esc(o.eco)}</td>
               <td class="num">${o.games}</td>
@@ -794,7 +824,7 @@ async function viewDashboard(app) {
   }
 
   let trendHtml = '';
-  if (progress && progress.trend) {
+  if (progress && progress.trend && Number(progress.games) >= 6) {
     const t = progress.trend;
     const badgeClass = t.overall === 'improving' ? 'badge-good' : t.overall === 'worsening' ? 'badge-bad' : 'badge-neutral';
     let rows = '';
@@ -802,19 +832,21 @@ async function viewDashboard(app) {
       if (['improving', 'worsening', 'overall'].includes(m)) continue;
       const deltaClass = v.delta > 0 ? 'badge-bad' : 'badge-good';
       rows += `<tr>
-        <td>${esc(m)}</td>
+        <td>${esc(TREND_LABELS[m] || m)}</td>
         <td class="num">${fmt(v.from, 2)}</td>
         <td class="num">${fmt(v.to, 2)}</td>
         <td class="num ${deltaClass}">${v.delta >= 0 ? '+' : ''}${fmt(v.delta, 2)}</td>
-        <td>${esc(v.verdict)}</td>
+        <td>${esc(TREND_VERDICT_RU[v.verdict] || v.verdict)}</td>
       </tr>`;
     }
     trendHtml = `
-      <div style="margin-bottom:8px"><span class="badge ${badgeClass}">${t.overall.toUpperCase()}</span></div>
+      <div style="margin-bottom:8px"><span class="badge ${badgeClass}">${esc(TREND_OVERALL_RU[t.overall] || t.overall)}</span></div>
       <div class="table-wrap"><table style="font-size:12px">
         <thead><tr><th>Метрика</th><th>Было</th><th>Стало</th><th>Δ</th><th>Вердикт</th></tr></thead>
         <tbody>${rows}</tbody>
       </table></div>`;
+  } else if (progress && progress.trend) {
+    trendHtml = '<p style="color:var(--c-text-muted)">Мало данных для тренда: нужно хотя бы 6 партий.</p>';
   } else {
     trendHtml = '<p style="color:var(--c-text-muted)">Нет данных для тренда.</p>';
   }
@@ -901,14 +933,17 @@ async function viewDashboard(app) {
     btn.addEventListener('click', async () => {
       btn.disabled = true;
       try {
+        const startMoves = await openingStartMovesFor(btn.dataset.trainName || btn.dataset.trainOpening || '');
+        const body = {
+          style: 'universal',
+          color: btn.dataset.trainColor || 'white',
+          human: true,
+        };
+        if (startMoves.length) body.start_moves = startMoves;
         const res = await api('/api/opening/start', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            style: 'universal',
-            color: btn.dataset.trainColor || 'white',
-            human: true,
-          }),
+          body: JSON.stringify(body),
         });
         startOpeningSession(res);
         navigate('opening');
@@ -966,7 +1001,7 @@ async function viewOverview(app) {
     </div>
     <div class="card">
       <div class="card-header"><span class="card-title">Человечность ошибок</span></div>
-      ${ov.humanity ? `<div class="grid grid-4"><div class="stat"><div class="stat-value">${ov.humanity.total}</div><div class="stat-label">Всего плохих</div></div><div class="stat"><div class="stat-value">${ov.humanity.natural}</div><div class="stat-label">Естественные</div></div><div class="stat"><div class="stat-value">${ov.humanity.borderline}</div><div class="stat-label">Пограничные</div></div><div class="stat"><div class="stat-value">${ov.humanity.unnatural}</div><div class="stat-label">Неестественные</div></div></div>` : '<p style="color:var(--c-text-muted)">Нет файла humanity.json.</p>'}
+      ${ov.humanity ? `<div class="grid grid-4"><div class="stat"><div class="stat-value">${ov.humanity.total}</div><div class="stat-label">Всего плохих</div></div><div class="stat"><div class="stat-value">${ov.humanity.natural}</div><div class="stat-label">Естественные</div></div><div class="stat"><div class="stat-value">${ov.humanity.borderline}</div><div class="stat-label">Пограничные</div></div><div class="stat"><div class="stat-value">${ov.humanity.unnatural}</div><div class="stat-label">Неестественные</div></div></div>` : '<p style="color:var(--c-text-muted)">Нет данных: запусти оценку ошибок.</p>'}
     </div>`;
 }
 
@@ -1127,7 +1162,7 @@ async function viewPlan(app) {
       <div class="card stat"><div class="stat-value">${plan.games}</div><div class="stat-label">Партий</div></div>
       <div class="card stat"><div class="stat-value">${scorePct}</div><div class="stat-label">Счёт</div></div>
       <div class="card stat"><div class="stat-value">${avgWinLoss}</div><div class="stat-label" title="Средняя потеря win% (процентов) на ход игрока (метрика avg_win_loss из анализа)">Ср. потеря win%</div></div>
-      <div class="card stat"><div class="stat-value">${plan.drills.total}/${plan.drills.unnatural}</div><div class="stat-label">Ошибки всего/неест.</div></div>
+      <div class="card stat"><div class="stat-value">${(plan.drills.total || plan.drills.unnatural) ? `${plan.drills.total}/${plan.drills.unnatural}` : '—'}</div><div class="stat-label">Дрели в кеше: всего/неест.</div></div>
     </div>
     <div class="card">
       <div class="card-header"><span class="card-title">Репертуар — частые ветви</span></div>
@@ -1138,7 +1173,7 @@ async function viewPlan(app) {
     </div>
     <div class="card">
       <div class="card-header"><span class="card-title">Слабые дебюты</span></div>
-      ${plan.repertoire.weak_openings.length ? `<div class="table-wrap"><table><thead><tr><th>Дебют</th><th>ECO</th><th>Партий</th><th>Очков %</th><th>Ошибок/партию</th><th>Ср. потеря</th></tr></thead><tbody>${plan.repertoire.weak_openings.slice(0, 6).map(o => `<tr><td>${esc(o.opening)}</td><td>${esc(o.eco)}</td><td class="num">${o.games}</td><td class="num">${fmt(o.points_pct)}%</td><td class="num">${fmt(o.errors_per_game, 2)}</td><td class="num">${fmt(o.avg_drop)}%</td></tr>`).join('')}</tbody></table></div>` : '<p style="color:var(--c-text-muted)">Нет слабых дебютов.</p>'}
+      ${(() => { const rows = (plan.repertoire.weak_openings || []).filter(isWeakOpening); return rows.length ? `<div class="table-wrap"><table><thead><tr><th>Дебют</th><th>ECO</th><th>Партий</th><th>Очков %</th><th>Ошибок/партию</th><th>Ср. потеря</th></tr></thead><tbody>${rows.slice(0, 6).map(o => `<tr><td>${esc(o.opening)}</td><td>${esc(o.eco)}</td><td class="num">${o.games}</td><td class="num">${fmt(o.points_pct)}%</td><td class="num">${fmt(o.errors_per_game, 2)}</td><td class="num">${fmt(o.avg_drop)}%</td></tr>`).join('')}</tbody></table></div>` : '<p style="color:var(--c-text-muted)">Мало данных: нет дебюта с достаточной выборкой или плохими очками.</p>'; })()}
     </div>
     <div class="grid grid-2">
       <div class="card">
@@ -1152,7 +1187,7 @@ async function viewPlan(app) {
     </div>
     <div class="card">
       <div class="card-header"><span class="card-title">Человечность ошибок</span></div>
-      ${plan.humanity ? `<div class="grid grid-4"><div class="stat"><div class="stat-value">${plan.humanity.total}</div><div class="stat-label">Всего</div></div><div class="stat"><div class="stat-value">${plan.humanity.natural}</div><div class="stat-label">Естественные</div></div><div class="stat"><div class="stat-value">${plan.humanity.borderline}</div><div class="stat-label">Пограничные</div></div><div class="stat"><div class="stat-value">${plan.humanity.unnatural}</div><div class="stat-label">Неестественные</div></div></div><div style="margin-top:8px"><strong>Доля неестественных: </strong>${fmt(plan.humanity.unnatural_share_pct)}%</div>` : '<p style="color:var(--c-text-muted)">Нет данных humanize.</p>'}
+      ${plan.humanity ? `<div class="grid grid-4"><div class="stat"><div class="stat-value">${plan.humanity.total}</div><div class="stat-label">Всего</div></div><div class="stat"><div class="stat-value">${plan.humanity.natural}</div><div class="stat-label">Естественные</div></div><div class="stat"><div class="stat-value">${plan.humanity.borderline}</div><div class="stat-label">Пограничные</div></div><div class="stat"><div class="stat-value">${plan.humanity.unnatural}</div><div class="stat-label">Неестественные</div></div></div><div style="margin-top:8px"><strong>Доля неестественных: </strong>${fmt(plan.humanity.unnatural_share_pct)}%</div>` : '<p style="color:var(--c-text-muted)">Нет данных: запусти оценку ошибок.</p>'}
     </div>`;
 
   app.querySelectorAll('[data-plan-act]').forEach(btn => {
@@ -1349,15 +1384,17 @@ async function viewProgress(app) {
   }
 
   let trendRows = '';
-  if (pr.trend) {
+  if (pr.trend && Number(pr.games) >= 6) {
     for (const [m, v] of Object.entries(pr.trend)) {
       if (['improving', 'worsening', 'overall'].includes(m)) continue;
       const deltaClass = v.delta > 0 ? 'badge-bad' : 'badge-good';
-      trendRows += `<tr><td>${esc(m)}</td><td class="num">${fmt(v.from, 2)}</td><td class="num">${fmt(v.to, 2)}</td><td class="num ${deltaClass}">${v.delta >= 0 ? '+' : ''}${fmt(v.delta, 2)}</td><td>${esc(v.direction)}</td><td><span class="badge ${v.verdict === 'better' ? 'badge-good' : v.verdict === 'worse' ? 'badge-bad' : 'badge-neutral'}">${esc(v.verdict)}</span></td></tr>`;
+      trendRows += `<tr><td>${esc(TREND_LABELS[m] || m)}</td><td class="num">${fmt(v.from, 2)}</td><td class="num">${fmt(v.to, 2)}</td><td class="num ${deltaClass}">${v.delta >= 0 ? '+' : ''}${fmt(v.delta, 2)}</td><td><span class="badge ${v.verdict === 'better' ? 'badge-good' : v.verdict === 'worse' ? 'badge-bad' : 'badge-neutral'}">${esc(TREND_VERDICT_RU[v.verdict] || v.verdict)}</span></td></tr>`;
     }
+  } else if (pr.trend) {
+    trendRows = '<tr><td colspan="5" style="color:var(--c-text-muted)">Мало данных: нужно хотя бы 6 партий.</td></tr>';
   }
 
-  const overall = pr.trend ? pr.trend.overall : '—';
+  const overall = pr.trend && Number(pr.games) >= 6 ? pr.trend.overall : '—';
   const badgeClass = overall === 'improving' ? 'badge-good' : overall === 'worsening' ? 'badge-bad' : 'badge-neutral';
 
   app.innerHTML = `
@@ -1382,7 +1419,7 @@ async function viewProgress(app) {
     </div>
     <div class="card">
       <div class="card-header"><span class="card-title">Тренд метрик</span></div>
-      ${pr.trend ? `<div style="margin-bottom:8px"><span class="badge ${badgeClass}">${overall.toUpperCase()}</span></div>
+      ${pr.trend ? `<div style="margin-bottom:8px"><span class="badge ${badgeClass}">${esc(TREND_OVERALL_RU[overall] || overall)}</span></div>
       <div class="table-wrap"><table><thead><tr><th>Метрика</th><th>Было</th><th>Стало</th><th>Δ</th><th>Направление</th><th>Вердикт</th></tr></thead><tbody>${trendRows}</tbody></table></div>
       <div style="margin-top:12px;font-size:13px"><strong>Улучшается: </strong>${pr.trend.improving.length ? pr.trend.improving.join(', ') : '—'}<br><strong>Ухудшается: </strong>${pr.trend.worsening.length ? pr.trend.worsening.join(', ') : '—'}</div>` : '<p style="color:var(--c-text-muted)">Недостаточно данных для тренда.</p>'}
     </div>`;
@@ -1806,6 +1843,23 @@ const REVIEW_BADGE_SHORT = {
   missed_win: 'Упущ. выигрыши',
   book: 'Теория',
 };
+const REVIEW_BADGE_SINGULAR = {
+  brilliant: 'блестящий',
+  great: 'отличный',
+  best: 'лучший',
+  excellent: 'оч. хороший',
+  good: 'хороший',
+  inaccuracy: 'неточность',
+  mistake: 'ошибка',
+  blunder: 'зевок',
+  missed_win: 'упущ. выигрыш',
+  book: 'теория',
+};
+function reviewBadgeShort(badge, count) {
+  return count === 1
+    ? (REVIEW_BADGE_SINGULAR[badge] || REVIEW_BADGE_SHORT[badge] || badge)
+    : (REVIEW_BADGE_SHORT[badge] || badge);
+}
 
 // Цвета маркеров графика согласованы с .mb-* из style.css.
 const REVIEW_BADGE_COLORS = {
@@ -1825,9 +1879,6 @@ const REVIEW_CATEGORIES = [
   ['opening', 'Дебют'],
   ['middlegame', 'Миттельшпиль'],
   ['endgame', 'Эндшпиль'],
-  ['tactics', 'Тактика'],
-  ['strategy', 'Стратегия'],
-  ['positional', 'Позиционка'],
 ];
 
 const REVIEW_BADGE_SET = new Set(REVIEW_BADGES);
@@ -1924,8 +1975,9 @@ function reviewGraphHtml(review, status, ply) {
   // win_before может отсутствовать — ведём линию от предыдущего значения.
   let prev = 50;
   const points = moves.map((m, i) => {
-    const raw = reviewLimit(m && m.win_before);
-    // win_before в анализе — для стороны, чей ход; график — от белых.
+    // Точка соответствует позиции ПОСЛЕ хода, поэтому берём win_after.
+    const raw = reviewLimit(m && (m.win_after != null ? m.win_after : m.win_before));
+    // win_after в анализе — для стороны, чей ход; график — от белых.
     const value = raw == null ? null : (m && m.color === 'w' ? raw : 100 - raw);
     const v = value != null ? value : prev;
     prev = v;
@@ -1994,7 +2046,7 @@ function reviewCoachHtml(review, ply) {
     badge = reviewBadge(entry.badge);
     label = entry.label || REVIEW_BADGE_LABELS[badge] || 'Ход';
     comment = entry.comment || '';
-    const win = reviewLimit(entry.win_before);
+    const win = reviewLimit(entry.win_after != null ? entry.win_after : entry.win_before);
     const whiteWin = win == null ? null : (entry.color === 'w' ? win : 100 - win);
     score = whiteWin != null ? `win белых ${Math.round(whiteWin)}%` : '';
   }
@@ -2021,8 +2073,9 @@ function reviewReportCardHtml(review, status) {
   const accuracy = review.accuracy || {};
   const moves = Array.isArray(review.moves) ? review.moves : [];
   const counts = {};
-  moves.forEach(m => {
-    const b = reviewBadge(m && m.badge);
+  // В отчёте игрока — только его ходы, иначе ошибки соперника выглядят как его.
+  moves.filter(m => m && m.is_user).forEach(m => {
+    const b = reviewBadge(m.badge);
     if (b) counts[b] = (counts[b] || 0) + 1;
   });
 
@@ -2030,7 +2083,7 @@ function reviewReportCardHtml(review, status) {
     const count = counts[b] || 0;
     const title = REVIEW_BADGE_LABELS[b] + ': ' + count;
     return `<div class="review-badge-stat${count ? '' : ' is-empty'}" title="${esc(title)}" style="display:flex;align-items:center;gap:4px;font-size:12px;${count ? '' : 'opacity:.55'}">
-      ${reviewBadgeIcon(b)}<span>${count}</span><span style="color:var(--c-text-muted)">${esc(REVIEW_BADGE_SHORT[b])}</span>
+      ${reviewBadgeIcon(b)}<span>${count}</span><span style="color:var(--c-text-muted)">${esc(reviewBadgeShort(b, count))}</span>
     </div>`;
   }).join('');
 
@@ -2041,7 +2094,7 @@ function reviewReportCardHtml(review, status) {
     const value = has ? Math.max(0, Math.min(100, raw)) : 0;
     return `<div class="review-cat" style="margin-top:8px">
       <div style="display:flex;justify-content:space-between;gap:8px;font-size:12px"><span>${label}</span><span>${has ? Math.round(value) : '—'}</span></div>
-      <div class="review-cat-bar" style="height:6px;margin-top:3px;border-radius:3px;overflow:hidden;background:var(--c-border)" title="${has ? '' : 'нет ходов в этой фазе'}">
+      <div class="review-cat-bar" style="height:6px;margin-top:3px;border-radius:3px;overflow:hidden;background:var(--c-border)" title="${has ? '' : 'нет данных'}">
         <div style="width:${has ? value.toFixed(1) : 0}%;height:100%;border-radius:3px;background:var(--c-btn-primary)"></div>
       </div>
     </div>`;
@@ -2062,7 +2115,7 @@ function reviewReportCardHtml(review, status) {
     </div>
     <div style="display:flex;align-items:baseline;gap:8px;margin-top:8px">
       <span style="font-size:24px;font-weight:700;line-height:1.1">${esc(rating)}</span>
-      <span style="font-size:12px;color:var(--c-text-muted)">оценка по точности</span>
+      <span style="font-size:12px;color:var(--c-text-muted)">оценка по точности · не рейтинг</span>
     </div>
     <div class="review-badge-grid" style="display:flex;flex-wrap:wrap;gap:6px 12px;margin-top:10px">${badgeCells}</div>
     <div class="review-categories" style="margin-top:12px">${catRows}</div>
@@ -2470,10 +2523,13 @@ async function viewTask(app) {
     state.taskResult = null;
     state.taskAnswerText = '';
     state.taskError = null;
-    state.taskExplanation = task.explanation_facts || task.explanation || null;
     state.taskExplaining = false;
     state.taskJobId = null;
     state.taskRevealed = !!task.done;
+    // Не показываем решение и линию до ответа/«Показать решение».
+    state.taskExplanation = task.done
+      ? (task.explanation_facts || task.explanation || null)
+      : null;
     state.taskLine = null;
     if (state.taskPlayTimer) { clearInterval(state.taskPlayTimer); state.taskPlayTimer = null; }
     resetTaskExplore();
@@ -2506,9 +2562,9 @@ function taskSolutionHtml(task) {
   return `
     <div class="card">
       <div class="card-header"><span class="card-title">Решение</span>${dropBadge}</div>
-      <div>Твой ход: <span class="drill-san" style="color:var(--c-err-blunder)">${esc(task.san_played)}</span></div>
+      <div>Ход в партии: <span class="drill-san" style="color:var(--c-err-blunder)">${esc(task.san_played)}</span></div>
       <div>Лучший: <span class="drill-best">${esc(task.best_san)}</span></div>
-      <div style="color:var(--c-text-muted);font-size:13px;margin-top:6px">Win%: ${before} → ${after}</div>
+      <div style="color:var(--c-text-muted);font-size:13px;margin-top:6px">Твой win%: ${before} → ${after}</div>
     </div>`;
 }
 
@@ -2523,7 +2579,7 @@ function taskLineControlsHtml(lineFens, lineIdx) {
   const value = atStart ? 0 : lineIdx;
   return `
     <div class="task-line-controls">
-      <button type="button" class="btn btn-secondary" id="task-line-played" ${atStart ? 'disabled' : ''} title="Показать сыгранный ход (красный крестик)">Твой ход</button>
+      <button type="button" class="btn btn-secondary" id="task-line-played" ${atStart ? 'disabled' : ''} title="Показать сыгранный ход (красный крестик)">Ход в партии</button>
       <button type="button" class="btn btn-secondary" id="task-line-best" ${total < 1 ? 'disabled' : ''} title="Показать лучший ход (зелёная галочка)">Лучший ход</button>
       <button type="button" class="btn btn-secondary" id="task-line-play" ${total < 1 ? 'disabled' : ''}>▶ Показать линию</button>
       <button type="button" class="btn btn-secondary" id="task-line-explore" title="Ходить любыми фигурами и смотреть оценку Stockfish">Свободный разбор</button>
@@ -2540,16 +2596,15 @@ function taskEvalBarsHtml(task) {
   const before = Number(task.win_before);
   const after = Number(task.win_after);
   if (!Number.isFinite(before) || !Number.isFinite(after)) return '';
-  const white = v => (task.user_color === 'white' ? v : 100 - v);
   const items = [
-    ['до', white(before)],
-    ['после твоего хода', white(after)],
+    ['твой win% до', before],
+    ['твой win% после', after],
   ];
   return `<div class="eval-bars" aria-label="Оценка Stockfish до и после хода">
     ${items.map(([label, v]) => {
       const pct = Math.max(0, Math.min(100, v));
       return `<div class="eval-bar-item">
-        <div class="eval-bar" title="${esc(label)}: win белых ${Math.round(pct)}%">
+        <div class="eval-bar" title="${esc(label)}: ${Math.round(pct)}%">
           <div class="eval-bar-white" style="height:${pct.toFixed(1)}%"></div>
         </div>
         <span>${esc(label)}</span>
@@ -2610,7 +2665,7 @@ function drawTask(app) {
   }
   const colorLabel = task.user_color === 'white' ? 'белые' : 'чёрные';
   const clsBadge = answered && task.classification
-    ? `<span class="badge ${task.classification === 'blunder' ? 'badge-bad' : 'badge-neutral'}">${esc(task.classification)}</span>`
+    ? `<span class="badge ${task.classification === 'blunder' ? 'badge-bad' : 'badge-neutral'}">${esc(TASK_CLASS_RU[task.classification] || task.classification)}</span>`
     : '';
 
   let panel = '';
@@ -2701,6 +2756,7 @@ function drawTask(app) {
     showSolution.addEventListener('click', e => {
       e.preventDefault();
       state.taskRevealed = true;
+      state.taskExplanation = (state.task && state.task.explanation_facts) || state.taskExplanation;
       drawTask(app);
     });
   }
@@ -2959,6 +3015,7 @@ async function submitTaskAnswer(app, san) {
     const res = await apiPost('/api/task/answer', fd);
     state.taskResult = res;
     state.taskRevealed = true;
+    state.taskExplanation = (state.task && state.task.explanation_facts) || state.taskExplanation;
     state.taskLine = null;
     if (state.taskPlayTimer) { clearInterval(state.taskPlayTimer); state.taskPlayTimer = null; }
     resetTaskExplore();
@@ -3043,6 +3100,17 @@ function taskPollExplanation(app, jobId) {
 
 const OPENING_START_FEN = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
 const OPENING_KIND_RU = { good: 'хорошо', better: 'можно лучше', bad: 'плохо' };
+const TASK_CLASS_RU = { inaccuracy: 'неточность', mistake: 'ошибка', blunder: 'зевок' };
+const TREND_LABELS = {
+  avg_win_loss: 'Ср. потеря win%',
+  avg_win_before: 'Win% до хода',
+  blunders_per_game: 'Зевки/партию',
+  errors_per_game: 'Ошибки/партию',
+  avg_drop: 'Ср. потеря',
+  score_pct: 'Счёт',
+};
+const TREND_VERDICT_RU = { better: 'лучше', worse: 'хуже', same: 'без изменений', stable: 'без изменений' };
+const TREND_OVERALL_RU = { improving: 'УЛУЧШЕНИЕ', worsening: 'УХУДШЕНИЕ', stable: 'БЕЗ ИЗМЕНЕНИЙ' };
 
 function openingStyleLabel(key) {
   const s = (state.openingStyles || []).find(x => x.key === key);
@@ -3844,9 +3912,9 @@ function drawOpening(app) {
   if (exploreBtn) exploreBtn.addEventListener('click', () => startOpeningExplore(app));
   const openExploreAtPly = ply => {
     const fens = state.openingFens;
-    if (!fens || !fens[ply - 1] || !fens[ply]) return;
+    if (!fens || !fens[ply]) return;
     state.openingExplore = { fen: fens[ply] };
-    state.openingExploreLast = lastMoveSquares(fens[ply - 1], fens[ply]);
+    state.openingExploreLast = ply > 0 ? lastMoveSquares(fens[ply - 1], fens[ply]) : [];
     state.openingExploreMoves = [];
     state.openingExploreEval = null;
     drawOpening(app);
@@ -3856,7 +3924,11 @@ function drawOpening(app) {
     cell.addEventListener('click', () => openExploreAtPly(Number(cell.dataset.openingPly) + 1));
   });
   app.querySelectorAll('[data-opening-moment-ply]').forEach(card => {
-    card.addEventListener('click', () => openExploreAtPly(Number(card.dataset.openingMomentPly)));
+    // Совет «вместо хода» относится к позиции ПЕРЕД сыгранным ходом.
+    card.addEventListener('click', () => {
+      const ply = Number(card.dataset.openingMomentPly);
+      openExploreAtPly(Math.max(0, ply - 1));
+    });
   });
   if (state.openingAnalyzing && !state.timers.opening && state.openingJobId) {
     openingPoll(app, state.openingJobId);
@@ -4110,7 +4182,7 @@ function openingReportHtml(report) {
   const momentLabel = m => classRu[m.classification] || kindLabel(m.kind);
   const momentBadge = m => m.classification === 'inaccuracy' ? 'badge-neutral' : (m.classification ? 'badge-bad' : kindBadge(m.kind));
   const momentsHtml = moments.length ? moments.map(m => `
-    <div class="opening-report-moment${m.ply ? ' opening-report-moment-clickable' : ''}"${m.ply ? ` data-opening-moment-ply="${esc(String(m.ply))}" title="Открыть позицию после этого хода"` : ''}>
+    <div class="opening-report-moment${m.ply ? ' opening-report-moment-clickable' : ''}"${m.ply ? ` data-opening-moment-ply="${esc(String(m.ply))}" title="Открыть позицию перед этим ходом"` : ''}>
       <div>
         <span class="drill-san">${esc(m.san || '—')}</span>
         <span class="badge ${momentBadge(m)}">${esc(momentLabel(m))}</span>
@@ -4122,7 +4194,7 @@ function openingReportHtml(report) {
     </div>`).join('') : '<p style="color:var(--c-text-muted)">Критических ошибок в дебюте нет.</p>';
   return `
     <div class="card">
-      <div class="card-header"><span class="card-title">Отчёт тренера</span><span class="badge badge-good">Stockfish${report.depth ? ` ${esc(String(report.depth))}` : ''} · факты</span></div>
+      <div class="card-header"><span class="card-title">Отчёт тренера</span><span class="badge badge-good">Stockfish${report.depth ? ` · глубина ${esc(String(report.depth))}` : ''} · факты</span></div>
       <div style="font-size:15px;font-weight:600;margin-bottom:6px">${esc(name)}${eco ? ` <span class="badge badge-neutral">${esc(eco)}</span>` : ''}</div>
       ${report.summary ? `<div class="mentor-reply">${esc(report.summary)}</div>` : ''}
       <h3 style="font-size:14px;margin:12px 0 8px">Ключевые моменты</h3>
@@ -5079,10 +5151,10 @@ function middlegameReportHtml(report, source, plan) {
     <div class="card">
       <div class="card-header"><span class="card-title">Отчёт тренера</span><span class="badge ${verdict.badge}">${esc(verdict.label)}</span></div>
       ${report.summary ? `<div class="mentor-reply">${esc(report.summary)}</div>` : ''}
-      ${report.plan_comment ? `<h3 style="font-size:14px;margin:12px 0 6px">Разбор плана</h3><div class="mentor-reply">${esc(report.plan_comment)}</div>` : ''}
+      ${report.plan_comment ? `<h3 style="font-size:14px;margin:12px 0 6px">Ошибки по движку</h3><div class="mentor-reply">${esc(report.plan_comment)}</div>` : ''}
       <h3 style="font-size:14px;margin:12px 0 8px">Ключевые моменты</h3>
       ${momentsHtml}
-      ${report.lesson ? `<h3 style="font-size:14px;margin:12px 0 6px">Урок</h3><div class="mentor-reply">${esc(report.lesson)}</div>` : ''}
+      ${report.lesson ? `<h3 style="font-size:14px;margin:12px 0 6px">Главный ресурс</h3><div class="mentor-reply">${esc(report.lesson)}</div>` : ''}
       <div class="middlegame-report-source">${esc(sourceLine)}${source.chapter_url ? ` · <a href="${esc(safeHttp(source.chapter_url))}" target="_blank" rel="noopener">открыть главу источника</a>` : ''}</div>
       ${middlegamePlanHtml(plan)}
     </div>`;
@@ -6079,22 +6151,7 @@ async function viewUsers(app) {
         <div class="alert alert-success" id="pw-ok" style="display:none;margin-top:8px">Пароль сменён</div>
         <div style="margin-top:8px"><button class="btn btn-secondary" id="logout-btn">Выйти</button></div>
       </div>
-    </div>
-    <div class="card">
-      <div class="card-header"><span class="card-title">Все пользователи (${list.length})</span></div>
-      ${list.length ? `<div class="table-wrap"><table><thead><tr><th>Ник</th><th>Lichess</th><th>FIDE</th><th>Партий</th><th>Анализов</th><th>Последний вход</th></tr></thead><tbody>${list.map(u => {
-        const isCurrent = String(u.nick || '').toLowerCase() === want;
-        return `<tr>
-          <td${isCurrent ? ' style="font-weight:600"' : ''}>${esc(u.nick)}${isCurrent ? ' <span class="badge badge-blue">это ты</span>' : ''}</td>
-          <td>${esc(u.lichess || '—')}</td>
-          <td>${esc(u.fide_id || '—')}</td>
-          <td class="num">${u.games}</td>
-          <td class="num">${u.analyses}</td>
-          <td>${u.last_seen_at ? new Date(u.last_seen_at * 1000).toLocaleDateString('ru-RU') : '—'}</td>
-        </tr>`;
-      }).join('')}</tbody></table></div>` : '<p style="color:var(--c-text-muted);padding:16px">Пользователей нет.</p>'}
     </div>`;
-
   const rerender = async () => {
     await loadUser();
     navigate('users');

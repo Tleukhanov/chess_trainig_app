@@ -69,7 +69,7 @@ class FactTextTests(unittest.TestCase):
                 "drop": 6.0,
             }
         )
-        self.assertIn("Ты сыграл Nh3", text)
+        self.assertIn("В партии ты сыграл Nh3", text)
         self.assertIn("Движок считал лучшим Nf3", text)
         self.assertIn("Линия движка: Nf3 d5 d4", text)
         self.assertNotIn("активизировать", text.lower())

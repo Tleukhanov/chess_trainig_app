@@ -68,7 +68,7 @@ class MoveCommentTests(unittest.TestCase):
         )
         self.assertEqual(
             text,
-            "Qh5 — зевок (−25 win%): лучше было Qxe5+. Пропущена тактика.",
+            "Qh5 — зевок (−25 win%): лучше было Qxe5+. Резкая потеря за один ход.",
         )
         self.assertEqual(text.count("."), 2)
 

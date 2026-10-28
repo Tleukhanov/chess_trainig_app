@@ -1304,6 +1304,8 @@ def _build_opening_report(
     user_entries: list[dict[str, Any]],
     opening: tuple[str | None, str | None],
     analysis: dict[str, Any],
+    *,
+    depth: int | None = None,
 ) -> dict[str, Any]:
     """Stockfish-отчёт в одном JSON: только проверяемые факты.
 
@@ -1352,7 +1354,7 @@ def _build_opening_report(
         "my_elo": session.get("my_elo"),
         "opp_elo": session.get("opp_elo"),
         "engine": "stockfish",
-        "depth": max(int(settings.stockfish_depth) + 4, 18),
+        "depth": int(depth) if depth is not None else int(settings.stockfish_depth),
     }
 
 
@@ -1386,16 +1388,17 @@ def _run_opening_analyze_job(
             result_for_user="draw",
             status="normal",
         )
+        # Один проход на заявленной глубине: best move, линия, win% и
+        # классификация должны быть из одного поиска. Threads=1 — чтобы
+        # 2600-игрок мог воспроизвести те же ходы и числа.
+        opening_depth = max(int(settings.stockfish_depth), 18)
         with Engine(
-            depth=settings.stockfish_depth, multipv=settings.stockfish_multipv
+            depth=opening_depth,
+            multipv=3,
+            threads=1,
+            time_ms=0,
         ) as engine:
             analysis = engine.analyze_game(game).summary()
-            analysis = _deepen_opening_errors(
-                analysis,
-                moves,
-                session.get("color") or "white",
-                engine=engine,
-            )
 
         user_entries = _opening_user_entries(
             analysis,
@@ -1408,7 +1411,7 @@ def _run_opening_analyze_job(
         job.phase = "Отчёт тренера"
         _persist_job(app.state.db_path, job, session_id=session_id)
         report = _build_opening_report(
-            session, moves, user_entries, opening, analysis
+            session, moves, user_entries, opening, analysis, depth=opening_depth
         )
 
         with Database(app.state.db_path) as db:
@@ -2631,17 +2634,20 @@ def _build_human_summary(
     if isinstance(humanity, dict):
         total = int(humanity.get("total") or 0)
         unnatural = int(humanity.get("unnatural") or 0)
-    share = round(unnatural / total * 100, 1) if total else 0.0
-    if share >= 40.0:
-        parts.append(
-            f"Много случайных ходов — {share}% неестественных из {total}: "
-            "играй медленнее, считай до конца."
-        )
+    if total <= 0:
+        parts.append("Нет данных о человечности ошибок — запусти оценку ошибок, чтобы делать вывод.")
     else:
-        parts.append(
-            f"Ошибки в основном естественные ({share}% неестественных из {total}) — "
-            "работаем над счётом."
-        )
+        share = round(unnatural / total * 100, 1)
+        if share >= 40.0:
+            parts.append(
+                f"Много случайных ходов — {share}% неестественных из {total}: "
+                "играй медленнее, считай до конца."
+            )
+        else:
+            parts.append(
+                f"Ошибки в основном естественные ({share}% неестественных из {total}) — "
+                "работаем над счётом."
+            )
     parts.append(
         f"Вывод на неделю: качаем {phase_ru} — {drills_today} дрелей в день "
         "плюс разбор партий из списка выше."
@@ -2812,16 +2818,19 @@ def _plan_player_level(db: Database, nick: str) -> dict[str, Any]:
         return {"rating": None, "speed": None}
     if not games:
         return {"rating": None, "speed": None}
-    last = max(games, key=lambda g: (g.created_at, g.id))
-    rating = last.user_rating
-    if isinstance(rating, bool) or not isinstance(rating, int) or rating <= 0:
-        rating = None
-    speed = last.speed
-    if not isinstance(speed, str) or not speed.strip():
-        speed = None
-    else:
-        speed = speed.strip()
-    return {"rating": rating, "speed": speed}
+    # Последняя партия может быть без рейтинга (PGN/тренировка) — ищем
+    # ближайшую назад партию с валидным рейтингом, иначе остаёмся без него.
+    for game in sorted(games, key=lambda g: (g.created_at, g.id), reverse=True):
+        rating = game.user_rating
+        if isinstance(rating, bool) or not isinstance(rating, int) or rating <= 0:
+            continue
+        speed = game.speed
+        if not isinstance(speed, str) or not speed.strip():
+            speed = None
+        else:
+            speed = speed.strip()
+        return {"rating": rating, "speed": speed}
+    return {"rating": None, "speed": None}
 
 
 def _plan_llm_input(db: Database, nick: str, data_dir: Any) -> dict[str, Any]:
@@ -2847,18 +2856,28 @@ def _plan_llm_input(db: Database, nick: str, data_dir: Any) -> dict[str, Any]:
     avg_win_loss = None
     if plan is not None:
         raw_weak = (plan.get("repertoire") or {}).get("weak_openings") or []
-        for item in raw_weak[:3]:
+        for item in raw_weak[:6]:
             if not isinstance(item, dict):
                 continue
-            epg = item.get("errors_per_game")
+            games = item.get("games")
+            points = item.get("points_pct")
+            errors = item.get("errors_per_game")
+            try:
+                games_n = int(games) if games is not None else 0
+                points_n = float(points) if points is not None else 0.0
+                errors_n = float(errors) if errors is not None else 0.0
+            except (TypeError, ValueError):
+                games_n, points_n, errors_n = 0, 0.0, 0.0
+            if games_n < 2 and points_n >= 70 and errors_n < 1.5:
+                continue
             weak_openings.append(
                 {
                     "opening": str(item.get("opening") or "—"),
-                    "errors_per_game": round(float(epg), 2)
-                    if isinstance(epg, (int, float))
-                    else None,
+                    "errors_per_game": round(errors_n, 2),
                 }
             )
+            if len(weak_openings) >= 3:
+                break
         drills = plan.get("drills") or {}
         try:
             drills_total = int(drills.get("total") or 0)
@@ -3149,7 +3168,7 @@ def create_api(
     db_path: Path | None = None,
     data_dir: Path | None = None,
 ) -> FastAPI:
-    app = FastAPI(title="Chess Trainer API", version="0.4.8", docs_url="/api/docs", redoc_url=None)
+    app = FastAPI(title="Chess Trainer API", version="0.9.7", docs_url="/api/docs", redoc_url=None)
     app.state.db_path = Path(db_path) if db_path else settings.db_path
     app.state.data_dir = Path(data_dir) if data_dir else settings.data_dir
 
@@ -4116,6 +4135,17 @@ def create_api(
         phases = phase_stats(moves_san, analysis, game.user_color)
         user_acc = acc_accuracy(_avg_drop(for_user=True))
         opponent_acc = acc_accuracy(_avg_drop(for_user=False))
+        user_errors = [
+            item
+            for item in items
+            if item.get("is_user")
+            and item.get("badge") in ("blunder", "mistake", "inaccuracy", "missed_win")
+        ]
+        worst_error = (
+            max(user_errors, key=lambda item: float(item.get("drop") or 0))
+            if user_errors
+            else None
+        )
         return {
             "accuracy": {"user": user_acc, "opponent": opponent_acc},
             "rating_estimate": estimate_rating(user_acc, game.user_rating),
@@ -4126,6 +4156,8 @@ def create_api(
                 user_acc,
                 user_color=game.user_color,
                 result=game.result_for_user,
+                errors=len(user_errors),
+                worst=worst_error,
             ),
             "moves": items,
         }
@@ -4490,7 +4522,10 @@ def create_api(
             except ValueError:
                 best = None
             correct = best is not None and given == best
-            db.set_meta(_task_done_key(payload["date"], user["nick"]), "1")
+            # Задача считается решённой только при верном ответе; иначе
+            # пользователь может попробовать ещё раз.
+            if correct:
+                db.set_meta(_task_done_key(payload["date"], user["nick"]), "1")
             return {
                 "correct": correct,
                 "expected": payload["best_san"],

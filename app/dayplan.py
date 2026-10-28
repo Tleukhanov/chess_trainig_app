@@ -213,11 +213,17 @@ def build_tasks(
 
     repertoire = safe_plan.get("repertoire")
     repertoire = repertoire if isinstance(repertoire, dict) else {}
-    openings = [
-        row
-        for row in (repertoire.get("weak_openings") or [])
-        if isinstance(row, dict)
-    ]
+    openings = []
+    for row in (repertoire.get("weak_openings") or []):
+        if not isinstance(row, dict):
+            continue
+        games = int(_num(row.get("games")))
+        points = _num(row.get("points_pct"))
+        errors = _num(row.get("errors_per_game"))
+        # Одна победа в одном дебюте — не повод называть его слабым.
+        if games < 2 and points >= 70 and errors < 1.5:
+            continue
+        openings.append(row)
     patterns = safe_plan.get("patterns")
     patterns = patterns if isinstance(patterns, dict) else {}
     motifs = _pairs(patterns.get("motifs"))

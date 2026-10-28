@@ -139,7 +139,7 @@ class ClassifyCauseTests(unittest.TestCase):
 
     def test_labels_and_explanations(self) -> None:
         self.assertEqual(CAUSE_LABELS[CAUSE_TIME_PRESSURE], "цейтнот")
-        self.assertEqual(CAUSE_LABELS[CAUSE_TACTICAL_OVERSIGHT], "тактический зевок")
+        self.assertEqual(CAUSE_LABELS[CAUSE_TACTICAL_OVERSIGHT], "резкая потеря")
         self.assertEqual(CAUSE_LABELS[CAUSE_STRATEGIC], "стратегическая ошибка")
         self.assertEqual(CAUSE_LABELS[CAUSE_RANDOM], "случайная")
         self.assertEqual(cause_label(CAUSE_RANDOM), "случайная")
@@ -154,7 +154,7 @@ class ClassifyCauseTests(unittest.TestCase):
 
         tactical = explain_cause(CAUSE_TACTICAL_OVERSIGHT, _entry(drop=25.0))
         self.assertIn("25 win%", tactical)
-        self.assertIn("тактика", tactical)
+        self.assertIn("причина не установлена", tactical)
 
         opening = _entry(drop=25.0)
         self.assertEqual(

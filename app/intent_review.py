@@ -147,8 +147,11 @@ def review_intents(
         if len(idea) > 180:
             idea = idea[:177].rsplit(" ", 1)[0].rstrip(" ,.;:") + "…"
 
+        ply = int(item["ply"])
+        move_no = (ply + 1) // 2
+        move_prefix = f"{move_no}. " if ply % 2 == 1 else f"{move_no}... "
         lines.append(
-            f"Ход {item['ply']} — {item['san']} ({label}"
+            f"{move_prefix}{item['san']} ({label}"
             + (f", потеря {drop}% win" if drop else "")
             + ")."
         )
@@ -159,5 +162,6 @@ def review_intents(
         if line_text:
             engine_line += f"; линия: {line_text}"
         lines.append(engine_line + ".")
+        lines.append("Твой ход — вне этой линии движка.")
         lines.append("")
     return "\n".join(lines).strip()

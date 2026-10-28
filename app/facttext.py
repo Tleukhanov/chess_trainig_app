@@ -222,9 +222,9 @@ def opening_recommendation(entries: list[dict[str, Any]]) -> str:
     best = str(worst.get("best") or worst.get("best_move_san") or "").strip()
     line = full_line(best, worst.get("best_line") or worst.get("pv"))
     if line:
-        return f"Повтори линию после {worst.get('san')}: {line}."
+        return f"Вместо {worst.get('san')}: {line}."
     if best:
-        return f"Повтори линию после {worst.get('san')}: {best}."
+        return f"Вместо {worst.get('san')}: {best}."
     return "Повтори позиции, где движок видел лучший ход."
 
 
@@ -241,7 +241,7 @@ def task_text(payload: dict[str, Any]) -> str:
     played_fact = move_fact(fen, played)
     best_fact = move_fact(fen, best) if best else None
 
-    first = f"Ты сыграл {played}"
+    first = f"В партии ты сыграл {played}"
     if played_fact and ("взятие" in played_fact or "шах" in played_fact or "рокировка" in played_fact):
         first += f" ({played_fact})"
     first += "."
