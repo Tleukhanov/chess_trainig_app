@@ -2534,7 +2534,7 @@ class FrontendTests(ApiTestBase):
         html = resp.text
         self.assertIn("app.js?v=", html)
         self.assertIn("style.css?v=", html)
-        self.assertIn("v0.8.1", html)
+        self.assertIn("v0.9.1", html)
         self.assertIn('id="nav-toggle"', html)
         self.assertIn('aria-controls="nav"', html)
 

@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import random
 import uuid
@@ -23,6 +24,8 @@ from pathlib import Path
 from typing import Any
 
 import chess
+
+from . import facttext
 
 MIDDLEGAME_DIR = Path(__file__).resolve().parent.parent / "assets" / "middlegame"
 
@@ -902,6 +905,86 @@ def _clean_ply(value: Any) -> int:
         return 0
 
 
+def _plan_comment_text(value: Any) -> str:
+    """plan_comment из LLM: строка, список или словарь — в читаемый текст."""
+    if isinstance(value, dict):
+        parts = []
+        for item in value.values():
+            text = str(item).strip()
+            if text:
+                parts.append(f"— {text}")
+        return "\n".join(parts) if parts else "Комментарий к плану не сформирован."
+    if isinstance(value, list):
+        parts = [f"— {str(item).strip()}" for item in value if str(item).strip()]
+        return "\n".join(parts) if parts else "Комментарий к плану не сформирован."
+    text = _clean_text(value, "Комментарий к плану не сформирован.")
+    if text.startswith("{") and "':" in text:
+        try:
+            parsed = ast.literal_eval(text)
+        except (SyntaxError, ValueError):
+            parsed = None
+        if isinstance(parsed, (dict, list)):
+            return _plan_comment_text(parsed)
+    return text
+
+
+def _drop_class(delta: float | None) -> str:
+    """Класс хода по потере win% для детерминированного текста."""
+    value = float(delta or 0.0)
+    if value >= 20:
+        return "blunder"
+    if value >= 10:
+        return "mistake"
+    if value >= 5:
+        return "inaccuracy"
+    return "good"
+
+
+def _fen_before(fen: str | None, moves: list[str] | None, ply: int) -> str | None:
+    """FEN перед полуходом ``ply`` (1-based) или None при битой истории."""
+    if not fen or not moves:
+        return None
+    board = chess.Board(fen)
+    for uci in moves[: max(0, ply - 1)]:
+        try:
+            board.push_uci(str(uci))
+        except ValueError:
+            return None
+    return board.fen()
+
+
+def _fact_moment(fact: dict[str, Any], fen_before: str | None) -> dict[str, Any]:
+    """Момент только из фактов: SAN, потеря, лучший ход и линия движка."""
+    delta = fact.get("drop", fact.get("delta"))
+    try:
+        delta_value = float(delta) if delta is not None else 0.0
+    except (TypeError, ValueError):
+        delta_value = 0.0
+    classification = _drop_class(delta_value)
+    best = fact.get("best_move_san") or fact.get("best_san")
+    entry = {
+        "san": fact.get("san"),
+        "classification": classification,
+        "drop": delta_value,
+        "best_move_san": best,
+        "best_line": fact.get("pv") or [],
+    }
+    comment = facttext.error_text(entry, fen_before)
+    if classification == "good":
+        title = "ход по плану"
+    else:
+        title = facttext.CLASS_RU.get(classification, "ошибка")
+    return {
+        "ply": fact.get("ply"),
+        "move_san": fact.get("san"),
+        "title": title,
+        "comment": comment,
+        "alt_san": best,
+        "eval_before": _format_eval(fact.get("eval_before", fact.get("before"))),
+        "eval_after": _format_eval(fact.get("eval_after", fact.get("after"))),
+    }
+
+
 def normalize_report(raw: dict[str, Any]) -> dict[str, Any]:
     """Приводит ответ LLM к схеме отчёта, подставляя безопасные значения.
 
@@ -935,9 +1018,7 @@ def normalize_report(raw: dict[str, Any]) -> dict[str, Any]:
     return {
         "verdict": verdict,
         "summary": _clean_text(data.get("summary"), "Итог не сформирован."),
-        "plan_comment": _clean_text(
-            data.get("plan_comment"), "Комментарий к плану не сформирован."
-        ),
+        "plan_comment": _plan_comment_text(data.get("plan_comment")),
         "moments": moments,
         "lesson": _clean_text(
             data.get("lesson"), "Практический вывод не сформирован."
@@ -999,17 +1080,20 @@ def ground_report(
             continue
         before = fact.get("eval_before", fact.get("before"))
         after = fact.get("eval_after", fact.get("after"))
-        moments.append(
-            {
-                "ply": ply,
-                "move_san": _clean_text(fact.get("san")),
-                "title": _clean_text(item.get("title")),
-                "comment": _clean_text(item.get("comment")),
-                "alt_san": _legal_alt_san(fen, moves, ply, item.get("alt_san")),
-                "eval_before": _format_eval(before) if before is not None else None,
-                "eval_after": _format_eval(after) if after is not None else None,
-            }
-        )
+        # SAN, «лучше» и линия — только из движка. Текст LLM не используем:
+        # в моментах он чаще всего и придумывает поля и варианты.
+        grounded_fact = dict(fact)
+        grounded_fact["ply"] = ply
+        moment = _fact_moment(grounded_fact, _fen_before(fen, moves, ply))
+        moment["eval_before"] = _format_eval(before) if before is not None else None
+        moment["eval_after"] = _format_eval(after) if after is not None else None
+        # alt_san оставляем только если это реально лучший ход движка.
+        best = fact.get("best_move_san") or fact.get("best_san")
+        alt = _legal_alt_san(fen, moves, ply, best) if best else None
+        if alt and str(alt).rstrip("+#") == str(fact.get("san") or "").rstrip("+#"):
+            alt = None
+        moment["alt_san"] = alt
+        moments.append(moment)
     grounded = dict(data)
     grounded["moments"] = moments
     return grounded

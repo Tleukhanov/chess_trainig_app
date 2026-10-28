@@ -324,7 +324,7 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(moment["move_san"], "Qxc2")
         self.assertEqual(moment["eval_before"], "-1.07")
         self.assertEqual(moment["eval_after"], "-1.29")
-        self.assertEqual(moment["alt_san"], "Ba3")
+        self.assertIsNone(moment["alt_san"])  # лучший ход = сыгранный
         self.assertEqual(grounded["lesson"], "вывод")
         self.assertEqual(report["moments"][1]["title"], "Несыгранный ход")
 
@@ -446,7 +446,8 @@ class ReportTests(unittest.TestCase):
         )
         self.assertEqual(len(grounded["moments"]), 2)
         self.assertIsNone(grounded["moments"][0]["alt_san"])
-        self.assertEqual(grounded["moments"][1]["alt_san"], "c5")
+        # Без лучшего хода движка альтернативу не выдумываем.
+        self.assertIsNone(grounded["moments"][1]["alt_san"])
 
 
 class MiddlegameDbTests(unittest.TestCase):

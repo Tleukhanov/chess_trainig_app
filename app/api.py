@@ -50,6 +50,7 @@ from .fide import (
     fetch_fide_ratings,
 )
 from .games import Game, fetch_lichess_rating, fetch_user_games
+from . import facttext
 from .humanize import humanize_report
 from .intent_review import intent_cache_key, review_intents
 from .review import repeated_mistakes
@@ -983,27 +984,127 @@ def _opening_fmt_win(value: Any) -> str:
 
 
 def _opening_user_entries(
-    analysis: dict[str, Any], user_color: str, plies: int
+    analysis: dict[str, Any],
+    user_color: str,
+    plies: int,
+    *,
+    moves: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Ходы пользователя из анализа движка (в пределах дебюта ``plies``)."""
+    """Ходы пользователя из анализа движка (в пределах дебюта ``plies``).
+
+    Дополнительно сохраняет FEN перед ходом и линию движка: это нужно для
+    детерминированного текста без выдуманных полей и фигур.
+    """
     entries = (analysis.get("moves") or [])[:plies]
     user_is_white = user_color == "white"
     out: list[dict[str, Any]] = []
+    board = chess.Board()
     for ply, entry in enumerate(entries):
-        if (ply % 2 == 0) != user_is_white or not isinstance(entry, dict):
-            continue
-        out.append(
-            {
-                "ply": ply + 1,
-                "san": entry.get("san"),
-                "classification": entry.get("classification"),
-                "drop": entry.get("drop"),
-                "win_before": entry.get("win_before"),
-                "win_after": entry.get("win_after"),
-                "best": entry.get("best_move_san"),
-            }
-        )
+        fen_before = board.fen()
+        if (ply % 2 == 0) == user_is_white and isinstance(entry, dict):
+            out.append(
+                {
+                    "ply": ply + 1,
+                    "san": entry.get("san"),
+                    "classification": entry.get("classification"),
+                    "drop": entry.get("drop"),
+                    "win_before": entry.get("win_before"),
+                    "win_after": entry.get("win_after"),
+                    "best": entry.get("best_move_san"),
+                    "best_line": entry.get("best_line") or [],
+                    "alternatives": entry.get("alternatives") or [],
+                    "fen": fen_before,
+                }
+            )
+        if moves and ply < len(moves):
+            try:
+                board.push_san(str(moves[ply]))
+            except ValueError:
+                break
     return out
+
+
+def _deepen_opening_errors(
+    analysis: dict[str, Any],
+    moves: list[str],
+    user_color: str,
+    *,
+    engine: Any | None = None,
+) -> dict[str, Any]:
+    """Перепроверяет лучший ход в позициях ошибок на большей глубине.
+
+    Основной проход быстрый (глубина 14, multipv 3). Для 2600-игрока best move
+    в неточности должен быть устойчивым, поэтому ошибочные позиции считаем
+    ещё раз depth+4 и сохраняем 1-2 близкие альтернативы.
+    """
+    entries = analysis.get("moves") or []
+    if not isinstance(entries, list):
+        return analysis
+    user_is_white = user_color == "white"
+    board = chess.Board()
+    deep_depth = max(int(settings.stockfish_depth) + 4, 18)
+    owned = engine is None
+    if owned:
+        engine = Engine(depth=deep_depth, multipv=3)
+        engine.__enter__()
+    old_depth = getattr(engine, "depth", None)
+    old_multipv = getattr(engine, "multipv", None)
+    try:
+        if hasattr(engine, "depth"):
+            engine.depth = deep_depth
+        if hasattr(engine, "multipv"):
+            engine.multipv = 3
+        for ply, raw_san in enumerate(moves):
+            entry = entries[ply] if ply < len(entries) else None
+            is_user = (ply % 2 == 0) == user_is_white
+            if (
+                is_user
+                and isinstance(entry, dict)
+                and entry.get("classification") in ("inaccuracy", "mistake", "blunder")
+            ):
+                try:
+                    lines = engine.analyze_position(board)
+                except AttributeError:
+                    # Тестовый/упрощённый движок может не уметь deep-pass.
+                    return analysis
+                if lines:
+                    top = lines[0]
+                    pv = [str(move) for move in (top.get("pv") or [])]
+                    if pv:
+                        entry["best_move_san"] = pv[0]
+                        entry["best_line"] = pv[1:7]
+                        entry["best_eval"] = dict(top.get("eval") or {})
+                        if top.get("win") is not None:
+                            entry["best_win"] = top["win"]
+                        top_win = top.get("win")
+                        alternatives: list[str] = []
+                        for alt_line in lines[1:3]:
+                            alt_pv = [str(move) for move in (alt_line.get("pv") or [])]
+                            if not alt_pv or alt_pv[0] == pv[0]:
+                                continue
+                            if str(alt_pv[0]).rstrip("+#") == str(entry.get("san") or "").rstrip("+#"):
+                                continue
+                            alt_win = alt_line.get("win")
+                            if (
+                                isinstance(top_win, (int, float))
+                                and isinstance(alt_win, (int, float))
+                                and abs(float(top_win) - float(alt_win)) > 3.0
+                            ):
+                                continue
+                            alternatives.append(alt_pv[0])
+                        entry["alternatives"] = alternatives
+            try:
+                board.push_san(str(raw_san))
+            except ValueError:
+                break
+        return analysis
+    finally:
+        if old_depth is not None and hasattr(engine, "depth"):
+            engine.depth = old_depth
+        if old_multipv is not None and hasattr(engine, "multipv"):
+            engine.multipv = old_multipv
+        if owned:
+            engine.__exit__(None, None, None)
 
 
 def _opening_analyze_messages(entry: dict[str, Any]) -> list[ChatMessage]:
@@ -1077,8 +1178,23 @@ def _normalize_opening_moments(
                     "drop": entry.get("drop"),
                 }
             )
+    # LLM может пропустить реальную ошибку (особенно зевок) — добираем
+    # оставшиеся ошибки из движка, чтобы отчёт не терял критичные ходы.
+    severity = {"blunder": 0, "mistake": 1, "inaccuracy": 2}
+
+    def _rank(item: tuple[int, dict[str, Any]]) -> tuple[int, float, int]:
+        ply, entry = item
+        drop = entry.get("drop")
+        loss = float(drop) if isinstance(drop, (int, float)) and not isinstance(drop, bool) else 0.0
+        return (
+            severity.get(str(entry.get("classification")), 9),
+            -loss,
+            ply,
+        )
+
     if not moments:
-        for ply, entry in errors.items():
+        # Показываем в первую очередь худшие ошибки, а не первые по ходу.
+        for ply, entry in sorted(sorted(errors.items(), key=_rank)[:4], key=lambda item: item[0]):
             moments.append(
                 {
                     "ply": ply,
@@ -1090,20 +1206,13 @@ def _normalize_opening_moments(
                     "drop": entry.get("drop"),
                 }
             )
-    # LLM может пропустить реальную ошибку (особенно зевок) — добираем
-    # оставшиеся ошибки из движка, чтобы отчёт не терял критичные ходы.
-    severity = {"blunder": 0, "mistake": 1, "inaccuracy": 2}
+            seen.add(ply)
     missing = [
         (ply, entry)
         for ply, entry in errors.items()
         if ply not in seen
     ]
-    missing.sort(
-        key=lambda item: (
-            severity.get(str(item[1].get("classification")), 9),
-            item[0],
-        )
-    )
+    missing.sort(key=_rank)
     for ply, entry in missing:
         if len(moments) >= 4:
             break
@@ -1196,10 +1305,11 @@ def _build_opening_report(
     opening: tuple[str | None, str | None],
     analysis: dict[str, Any],
 ) -> dict[str, Any]:
-    """Stockfish-анализ + LLM-отчёт в одном JSON (русский, как coach.py).
+    """Stockfish-отчёт в одном JSON: только проверяемые факты.
 
-    Бросает ``RuntimeError`` при сбое LLM — job уходит в error, сессия не
-    меняется (report в БД не пишется).
+    LLM здесь не используется: у 2600-игрока выдуманное «лучше e5» вызывает
+    больше вопросов, чем приносит пользы. Моменты, итог и рекомендация
+    собираются из ходов, оценок и линий Stockfish.
     """
     name, eco = opening
     color = session.get("color") or "white"
@@ -1216,18 +1326,33 @@ def _build_opening_report(
         "moves": moves,
         "user_entries": user_entries,
     }
-    _ensure_llm_key()
-    data = _opening_report_llm(entry)
+    # Моменты собираем детерминированно из фактов движка: никаких
+    # придуманных «лучше e5» для хорошего хода или полей, которых нет в FEN.
+    moments = _normalize_opening_moments([], user_entries)
+    by_ply = {item["ply"]: item for item in user_entries}
+    for moment in moments:
+        source = by_ply.get(moment["ply"])
+        if source is not None:
+            moment["text"] = facttext.error_text(source, source.get("fen"))
+
+    # Итог и рекомендацию не отдаём LLM: только проверяемые факты.
+    summary = facttext.opening_summary(user_entries, name)
+    recommendation = facttext.opening_recommendation(user_entries)
+    # Секцию «как играл соперник» убрали: это стиль из анкеты, а не факт
+    # партии. Для сильного игрока она была водой.
+    opponent = None
+
     return {
-        "opening": {"name": name or data.get("opening"), "eco": eco},
-        "summary": data.get("summary"),
-        "moments": _normalize_opening_moments(data.get("moments"), user_entries),
-        "opponent": data.get("opponent"),
-        "recommendation": data.get("recommendation"),
+        "opening": {"name": name, "eco": eco},
+        "summary": summary,
+        "moments": moments,
+        "opponent": opponent,
+        "recommendation": recommendation,
         "style": style,
         "my_elo": session.get("my_elo"),
         "opp_elo": session.get("opp_elo"),
         "engine": "stockfish",
+        "depth": max(int(settings.stockfish_depth) + 4, 18),
     }
 
 
@@ -1265,9 +1390,18 @@ def _run_opening_analyze_job(
             depth=settings.stockfish_depth, multipv=settings.stockfish_multipv
         ) as engine:
             analysis = engine.analyze_game(game).summary()
+            analysis = _deepen_opening_errors(
+                analysis,
+                moves,
+                session.get("color") or "white",
+                engine=engine,
+            )
 
         user_entries = _opening_user_entries(
-            analysis, session.get("color") or "white", int(settings.opening_plies)
+            analysis,
+            session.get("color") or "white",
+            int(settings.opening_plies),
+            moves=moves,
         )
         opening = classify_opening(moves)
 
@@ -1364,6 +1498,29 @@ def _middlegame_side_win(eval_white: dict[str, Any], white_side: bool) -> float:
     return win_white if white_side else 100.0 - win_white
 
 
+def _pv_to_san(board: chess.Board, pv: list[Any]) -> list[str]:
+    """UCI-линия движка → SAN-линия в текущей позиции (без выдумывания)."""
+    result: list[str] = []
+    cursor = board.copy()
+    for raw in pv or []:
+        text = str(raw).strip()
+        move = None
+        try:
+            candidate = chess.Move.from_uci(text)
+            if candidate in cursor.legal_moves:
+                move = candidate
+        except ValueError:
+            pass
+        if move is None:
+            try:
+                move = cursor.parse_san(text)
+            except ValueError:
+                break
+        result.append(cursor.san(move))
+        cursor.push(move)
+    return result
+
+
 def _middlegame_engine_facts(session: mg.MiddlegameSession) -> list[dict[str, Any]]:
     """Факты Stockfish по каждому полуходу от стартового FEN сессии."""
     facts: list[dict[str, Any]] = []
@@ -1379,11 +1536,11 @@ def _middlegame_engine_facts(session: mg.MiddlegameSession) -> list[dict[str, An
             mover_white = board.turn == chess.WHITE
             top = lines[0]
             eval_before = dict(top.get("eval") or {})
-            pv_before = [str(move) for move in (top.get("pv") or [])][:4]
+            pv_before = _pv_to_san(board, [str(move) for move in (top.get("pv") or [])][:4])
             best_san = pv_before[0] if pv_before else None
             second_san = None
             if len(lines) > 1:
-                second_pv = lines[1].get("pv") or []
+                second_pv = _pv_to_san(board, lines[1].get("pv") or [])
                 second_san = second_pv[0] if second_pv else None
             win_before = _middlegame_side_win(eval_before, mover_white)
             try:
@@ -1407,10 +1564,10 @@ def _middlegame_engine_facts(session: mg.MiddlegameSession) -> list[dict[str, An
                 if not next_lines:
                     break
                 eval_after = dict(next_lines[0].get("eval") or {})
-                pv_after = [
-                    str(chess_move)
-                    for chess_move in (next_lines[0].get("pv") or [])
-                ][:4]
+                pv_after = _pv_to_san(
+                    board,
+                    [str(chess_move) for chess_move in (next_lines[0].get("pv") or [])][:4],
+                )
                 lines = next_lines
             win_after = _middlegame_side_win(eval_after, mover_white)
             facts.append(
@@ -1428,6 +1585,70 @@ def _middlegame_engine_facts(session: mg.MiddlegameSession) -> list[dict[str, An
                 }
             )
     return facts
+
+
+def _ensure_worst_moment(
+    report: dict[str, Any],
+    session: mg.MiddlegameSession,
+    engine_facts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Гарантирует, что худшая ошибка игрока попала в ключевые моменты."""
+    moments = report.get("moments") if isinstance(report.get("moments"), list) else []
+    user_is_white = session.side == "white"
+    candidates = [
+        fact
+        for fact in engine_facts
+        if isinstance(fact, dict)
+        and ((int(fact.get("ply", 0)) % 2 == 1) == user_is_white)
+        and float(fact.get("delta") or 0) >= 5
+    ]
+    if not candidates:
+        return report
+    worst = max(candidates, key=lambda fact: float(fact.get("delta") or 0))
+    worst_ply = worst.get("ply")
+    if any(moment.get("ply") == worst_ply for moment in moments if isinstance(moment, dict)):
+        return report
+    moment = mg._fact_moment(
+        worst,
+        mg._fen_before(session.fen, list(session.moves), int(worst_ply or 0)),
+    )
+    moments = [m for m in moments if isinstance(m, dict)] + [moment]
+    moments.sort(key=lambda item: int(item.get("ply") or 0))
+    report["moments"] = moments
+    return report
+
+
+def _middlegame_fact_text(
+    engine_facts: list[dict[str, Any]], session: mg.MiddlegameSession
+) -> tuple[str, str]:
+    """Фактический разбор плана и урок: только ходы игрока и линии движка."""
+    user_is_white = session.side == "white"
+    errors = [
+        fact
+        for fact in engine_facts
+        if isinstance(fact, dict)
+        and ((int(fact.get("ply", 0)) % 2 == 1) == user_is_white)
+        and float(fact.get("delta") or 0) >= 5
+    ]
+    if not errors:
+        return "Ошибок с потерей ≥5% win по движку нет.", "Движок не видит потерь в этой партии."
+    errors.sort(key=lambda fact: int(fact.get("ply") or 0))
+    parts = []
+    for fact in errors[:4]:
+        line = " ".join(str(move) for move in (fact.get("pv") or [])[:4])
+        parts.append(
+            f"{fact.get('san')} — потеря {float(fact.get('delta') or 0):.1f}%, "
+            f"лучше {fact.get('best_san') or '—'}"
+            + (f" ({line})" if line else "")
+        )
+    worst = max(errors, key=lambda fact: float(fact.get("delta") or 0))
+    worst_line = " ".join(str(move) for move in (worst.get("pv") or [])[:4])
+    lesson = (
+        f"Главный ресурс по движку — {worst.get('best_san') or '—'}"
+        + (f": {worst_line}" if worst_line else "")
+        + "."
+    )
+    return "; ".join(parts) + ".", lesson
 
 
 def _middlegame_report_llm(prompt: str) -> dict[str, Any]:
@@ -1476,6 +1697,11 @@ def _run_middlegame_analyze_job(
             fen=session.fen,
             moves=list(session.moves),
         )
+        report = _ensure_worst_moment(report, session, engine_facts)
+        # Комментарий к плану и урок — только факты, без «активизируй фигуры».
+        plan_comment, lesson = _middlegame_fact_text(engine_facts, session)
+        report["plan_comment"] = plan_comment
+        report["lesson"] = lesson
 
         with Database(app.state.db_path) as db:
             db.init_db()
@@ -1758,7 +1984,7 @@ def _task_payload(db: Database, user: str, date: str | None = None) -> dict[str,
         # игнорируем, кнопка «Объяснить» снова доступна, успешный повтор перезапишет
         # мусор через UPSERT save_task_explanation. Строки из БД не удаляем.
         explanation = None
-    return {
+    result = {
         "date": day,
         "task_key": item["task_key"],
         "game_id": game.id,
@@ -1790,6 +2016,9 @@ def _task_payload(db: Database, user: str, date: str | None = None) -> dict[str,
         "explained": explanation is not None,
         "done": db.get_meta(_task_done_key(day, user)) == "1",
     }
+    # Детерминированная версия для UI: не зависит от качества и наличия LLM.
+    result["explanation_facts"] = facttext.task_text(result)
+    return result
 
 
 # --- План дня, снапшоты рейтинга и админ-когорта ---------------------------
@@ -2517,7 +2746,7 @@ _PLAN_LLM_SYSTEM = """Ты — шахматный тренер сильного 
 "Режим: обычный|предтурнирный"
 "Норма дня ({M} мин):" — далее 3-5 строк формата "- {Блок} — {X} мин ({конкретика: N качественных задач / какие дебюты / сколько партий})" — сумма минут всех строк равна {M}.
 "Итог недели: ..." (1-2 предложения).
-Опирайся ТОЛЬКО на переданные данные: называй ИХ фазу и ИХ дебюты. Если до турнира 14 дней или меньше — предтурнирный режим: решаем задачи и повторяем дебюты, без нового материала. Никакого английского, никаких общих фраз вида "учи эндшпили".
+Опирайся ТОЛЬКО на переданные данные: называй ИХ фазу и ИХ дебюты. Режим "предтурнирный" — только если до турнира 14 дней или меньше; если даты турнира нет — "обычный". Названия дебютов бери дословно из "Топ слабых дебютов", не добавляй другие и не переводи их. Никакого английского, никаких общих фраз вида "учи эндшпили".
 Калибруй сложность под уровень: при рейтинге ниже 1400 допустима база; 1400–1800 — без детской базы; 1800 и выше — ТОЛЬКО продвинутый уровень: сложные реализации, техника, типовые планы из ЕГО дебютов; ЗАПРЕЩЕНЫ темы одиночного мата, оппозиции, "король+пешка против короля" и любая элементарная база. Примеры позиций и дебютов бери ТОЛЬКО из переданных данных, не выдумывай детские."""
 
 

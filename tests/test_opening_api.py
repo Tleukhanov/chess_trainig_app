@@ -584,10 +584,7 @@ class OpeningAnalyzeTests(OpeningApiTestBase):
     def test_analyze_job_completes_and_stores_report(self):
         self._register(self.client, "tester")
         self._seed_session("s1", "tester", moves=_toggle_moves(40), status="done")
-        llm = MagicMock()
-        llm.chat.return_value = _REPORT_JSON
         with patch("app.api.Engine", FakeEngine), \
-                patch("app.api.LLMClient", return_value=llm), \
                 patch("app.api._unload_maia") as unload:
             job_id = self._analyze("s1")
             job = self._wait_job(job_id)
@@ -595,9 +592,10 @@ class OpeningAnalyzeTests(OpeningApiTestBase):
 
         self.assertEqual(job["status"], "done", job.get("error"))
         report = job["result"]["report"]
-        self.assertEqual(report["summary"], "вышел из дебюта нормально")
-        self.assertEqual(report["recommendation"], "тренируй тактику")
-        self.assertEqual(report["opponent"], "играл в заданном стиле")
+        # Моменты и итог дебюта теперь детерминированные: только факты движка.
+        self.assertIn("критических ошибок", report["summary"])
+        self.assertIn("Критических ошибок", report["recommendation"])
+        self.assertIsNone(report["opponent"])
         self.assertIsInstance(report["moments"], list)
         # FakeEngine ставит всем ходам "good", а отчёт больше не показывает
         # хорошие ходы как «моменты» — остаётся пустой список.
@@ -610,7 +608,7 @@ class OpeningAnalyzeTests(OpeningApiTestBase):
             db.init_db()
             row = db.get_opening_session("s1")
         self.assertEqual(row["status"], "analyzed")
-        self.assertEqual(row["report"]["summary"], "вышел из дебюта нормально")
+        self.assertIn("критических ошибок", row["report"]["summary"])
         state = self.client.get("/api/opening/s1").json()
         self.assertIsNotNone(state["report"])
         self.assertTrue(state["finished"])
@@ -812,145 +810,8 @@ class OpeningAnalyzeTests(OpeningApiTestBase):
         self.assertEqual(job["status"], "done", job.get("error"))
         self.assertEqual(calls, ["unload", "engine"])
 
-    def test_analyze_llm_failure_job_error_session_unchanged(self):
-        self._register(self.client, "tester")
-        self._seed_session("s1", "tester", moves=_toggle_moves(40), status="done")
-        llm = MagicMock()
-        llm.chat.return_value = "это не JSON, извини"
-        with patch("app.api.Engine", FakeEngine), \
-                patch("app.api.LLMClient", return_value=llm):
-            job_id = self._analyze("s1")
-            job = self._wait_job(job_id)
-
-        self.assertEqual(job["status"], "error")
-        self.assertIn("JSON", job["error"])
-        with Database(self.db_path) as db:
-            db.init_db()
-            row = db.get_opening_session("s1")
-        self.assertEqual(row["status"], "done")  # сессия не тронута
-        self.assertIsNone(row["report"])
-
-    def test_analyze_retries_without_reasoning_on_empty(self):
-        """Пустой ответ reasoning-модели: повтор без reasoning даёт отчёт."""
-        self._register(self.client, "tester")
-        self._seed_session("s1", "tester", moves=_toggle_moves(40), status="done")
-        llm = MagicMock()
-        llm.chat.side_effect = [
-            RuntimeError(
-                "LLM: пустой ответ (finish_reason=length — модель потратила "
-                "лимит на размышление, увеличьте лимит токенов)"
-            ),
-            _REPORT_JSON,
-        ]
-        with patch("app.api.Engine", FakeEngine), \
-                patch("app.api._ensure_llm_key"), \
-                patch("app.api.LLMClient", return_value=llm):
-            job_id = self._analyze("s1")
-            job = self._wait_job(job_id)
-
-        self.assertEqual(job["status"], "done", job.get("error"))
-        report = job["result"]["report"]
-        self.assertEqual(report["summary"], "вышел из дебюта нормально")
-        self.assertEqual(llm.chat.call_count, 2)
-        first, second = llm.chat.call_args_list
-        self.assertTrue(first.kwargs.get("json_mode"))
-        self.assertIsNone(first.kwargs.get("reasoning_max_tokens"))
-        self.assertTrue(second.kwargs.get("json_mode"))
-        self.assertEqual(second.kwargs.get("reasoning_max_tokens"), 0)
-
-    def test_analyze_third_attempt_without_hints_succeeds(self):
-        """Повтор без reasoning тоже пустой: третья обычная попытка спасает."""
-        self._register(self.client, "tester")
-        self._seed_session("s1", "tester", moves=_toggle_moves(40), status="done")
-        llm = MagicMock()
-        llm.chat.side_effect = [
-            RuntimeError("LLM: пустой ответ (finish_reason=length)"),
-            RuntimeError("LLM: пустой ответ (finish_reason=length)"),
-            _REPORT_JSON,
-        ]
-        with patch("app.api.Engine", FakeEngine), \
-                patch("app.api._ensure_llm_key"), \
-                patch("app.api.LLMClient", return_value=llm):
-            job_id = self._analyze("s1")
-            job = self._wait_job(job_id)
-
-        self.assertEqual(job["status"], "done", job.get("error"))
-        self.assertEqual(job["result"]["report"]["summary"],
-                         "вышел из дебюта нормально")
-        self.assertEqual(llm.chat.call_count, 3)
-        third = llm.chat.call_args_list[2]
-        self.assertIsNone(third.kwargs.get("reasoning_max_tokens"))
-
-    def test_analyze_single_call_happy_path(self):
-        """Успешный ответ с первого раза: повтор не делается."""
-        self._register(self.client, "tester")
-        self._seed_session("s1", "tester", moves=_toggle_moves(40), status="done")
-        llm = MagicMock()
-        llm.chat.return_value = _REPORT_JSON
-        with patch("app.api.Engine", FakeEngine), \
-                patch("app.api._ensure_llm_key"), \
-                patch("app.api.LLMClient", return_value=llm):
-            job_id = self._analyze("s1")
-            job = self._wait_job(job_id)
-
-        self.assertEqual(job["status"], "done", job.get("error"))
-        self.assertEqual(llm.chat.call_count, 1)
-        self.assertEqual(
-            job["result"]["report"]["summary"], "вышел из дебюта нормально"
-        )
-
-    def test_analyze_all_attempts_fail_job_error(self):
-        """Все три вызова падают: job в error, сессия и отчёт не тронуты."""
-        self._register(self.client, "tester")
-        self._seed_session("s1", "tester", moves=_toggle_moves(40), status="done")
-        llm = MagicMock()
-        llm.chat.side_effect = RuntimeError(
-            "LLM: пустой ответ (finish_reason=length)"
-        )
-        with patch("app.api.Engine", FakeEngine), \
-                patch("app.api._ensure_llm_key"), \
-                patch("app.api.LLMClient", return_value=llm):
-            job_id = self._analyze("s1")
-            job = self._wait_job(job_id)
-
-        self.assertEqual(job["status"], "error")
-        self.assertEqual(llm.chat.call_count, 3)
-        with Database(self.db_path) as db:
-            db.init_db()
-            row = db.get_opening_session("s1")
-        self.assertEqual(row["status"], "done")
-        self.assertIsNone(row["report"])
-
-    def test_build_opening_report_retry_exhausted_raises(self):
-        """``_build_opening_report`` бросает RuntimeError, если все попытки пусты."""
-        llm = MagicMock()
-        llm.chat.side_effect = RuntimeError("LLM: пустой ответ")
-        session = {
-            "color": "white",
-            "style": "universal",
-            "my_elo": 1500,
-            "opp_elo": 1600,
-        }
-        user_entries = [
-            {
-                "ply": 1,
-                "san": "e4",
-                "classification": "good",
-                "drop": 0.0,
-                "win_before": 50.0,
-                "win_after": 50.0,
-                "best": "e4",
-            }
-        ]
-        with patch("app.api._ensure_llm_key"), \
-                patch("app.api.LLMClient", return_value=llm):
-            with self.assertRaises(RuntimeError):
-                _build_opening_report(
-                    session, ["e4", "e5"], user_entries, ("Дебют", "C20"), {}
-                )
-        self.assertEqual(llm.chat.call_count, 3)
-
-    def test_analyze_no_llm_key_job_error(self):
+    def test_analyze_without_llm_key_still_builds_report(self):
+        """Отчёт по дебюту больше не зависит от LLM и ключа."""
         self._register(self.client, "tester")
         self._seed_session("s1", "tester", moves=_toggle_moves(40), status="done")
         with patch("app.api.Engine", FakeEngine), \
@@ -960,8 +821,51 @@ class OpeningAnalyzeTests(OpeningApiTestBase):
             )
             self.assertEqual(resp.status_code, 200)
             job = self._wait_job(resp.json()["job_id"])
-        self.assertEqual(job["status"], "error")
-        self.assertIn("LLM_API_KEY", job["error"])
+        self.assertEqual(job["status"], "done", job.get("error"))
+        self.assertIn("критических ошибок", job["result"]["report"]["summary"])
+        with Database(self.db_path) as db:
+            db.init_db()
+            row = db.get_opening_session("s1")
+        self.assertIsNotNone(row["report"])
+
+    def test_build_opening_report_is_deterministic(self):
+        """Моменты/итог/рекомендация — из фактов, без LLM и выдуманных ходов."""
+        session = {
+            "color": "black",
+            "style": "universal",
+            "my_elo": 2050,
+            "opp_elo": 2150,
+        }
+        user_entries = [
+            {
+                "ply": 26,
+                "san": "bxa3",
+                "classification": "blunder",
+                "drop": 21.2,
+                "win_before": 76.0,
+                "win_after": 54.8,
+                "best": "Nc5",
+                "best_line": ["Nc5", "Bxc5", "dxc5"],
+                "fen": "rnbqkb1r/1p2pppp/p2p1n2/8/1P1NP3/2N3P1/P1P2PBP/R1BQK2R b KQkq - 0 12",
+            }
+        ]
+        report = _build_opening_report(
+            session,
+            ["c4", "Nf6"],
+            user_entries,
+            ("English Opening", "A15"),
+            {},
+        )
+        self.assertIn("1 ошибочный ход", report["summary"])
+        self.assertEqual(len(report["moments"]), 1)
+        moment = report["moments"][0]
+        self.assertEqual(moment["san"], "bxa3")
+        self.assertEqual(moment["better"], "Nc5")
+        self.assertIn("Движок предлагал Nc5", moment["text"])
+        self.assertIn("Линия движка", moment["text"])
+        self.assertIn("Nc5", report["recommendation"])
+        self.assertIsNone(report["opponent"])
+        self.assertEqual(report["engine"], "stockfish")
 
     # --- переживание перезапуска (снапшоты в meta) -------------------------- #
 

@@ -1,6 +1,6 @@
 // Chess Trainer Frontend — SPA на vanilla JS, потребляет /api/* эндпоинты.
 
-import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.8.1';
+import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.9.1';
 
 const state = {
   user: null,
@@ -242,8 +242,11 @@ function showNav() {
 
 // Пункт «Админ» показываем только администратору (is_admin из /api/user/current).
 function syncAdminNav() {
-  const link = document.getElementById('nav-admin');
-  if (link) link.hidden = !state.isAdmin;
+  const admin = document.getElementById('nav-admin');
+  if (admin) admin.hidden = !state.isAdmin;
+  // «Инструменты» — внутренний LLM-полигон, не пользовательская фича.
+  const tools = document.getElementById('nav-tools');
+  if (tools) tools.hidden = !state.isAdmin;
 }
 
 function viewAuth(app) {
@@ -2467,15 +2470,15 @@ async function viewTask(app) {
     state.taskResult = null;
     state.taskAnswerText = '';
     state.taskError = null;
-    state.taskExplanation = task.explanation || null;
+    state.taskExplanation = task.explanation_facts || task.explanation || null;
     state.taskExplaining = false;
     state.taskJobId = null;
     state.taskRevealed = !!task.done;
     state.taskLine = null;
     if (state.taskPlayTimer) { clearInterval(state.taskPlayTimer); state.taskPlayTimer = null; }
     resetTaskExplore();
-  } else if (!state.taskExplanation && task.explanation) {
-    state.taskExplanation = task.explanation;
+  } else if (!state.taskExplanation && (task.explanation_facts || task.explanation)) {
+    state.taskExplanation = task.explanation_facts || task.explanation;
   }
   state.task = task;
   drawTask(app);
@@ -2992,7 +2995,7 @@ async function taskExplain(app) {
   if (res.cached) {
     state.taskExplaining = false;
     state.taskJobId = null;
-    state.taskExplanation = res.explanation;
+    state.taskExplanation = (state.task && state.task.explanation_facts) || res.explanation;
     drawTask(app);
     return;
   }
@@ -3021,7 +3024,9 @@ function taskPollExplanation(app, jobId) {
       state.timers.task = null;
       state.taskExplaining = false;
       state.taskJobId = null;
-      state.taskExplanation = (job.result && job.result.explanation) || '';
+      state.taskExplanation = (state.task && state.task.explanation_facts)
+        || (job.result && job.result.explanation)
+        || '';
       drawTask(app);
     } else if (job.status === 'error') {
       clearInterval(state.timers.task);
@@ -3738,7 +3743,7 @@ function drawOpening(app) {
       panel = `
         <div class="card">
           <div class="card-header"><span class="card-title">Партия завершена</span><span class="badge badge-blue">${moves.length} / ${s.plies}</span></div>
-          <p style="color:var(--c-text-muted);font-size:13px;margin-top:0">Пройдено ${moves.length} полуходов. Запусти разбор — Stockfish + LLM соберут отчёт по дебюту.</p>
+          <p style="color:var(--c-text-muted);font-size:13px;margin-top:0">Пройдено ${moves.length} полуходов. Запусти разбор — Stockfish соберёт отчёт по дебюту.</p>
           <button class="btn btn-primary" id="opening-analyze" ${analyzing ? 'disabled' : ''}>${analyzing ? 'Разбираю…' : 'Разобрать дебют'}</button>
           <div id="opening-analysis-status" style="color:var(--c-text-muted);font-size:13px;margin-top:8px"></div>
         </div>`;
@@ -4110,14 +4115,14 @@ function openingReportHtml(report) {
         <span class="drill-san">${esc(m.san || '—')}</span>
         <span class="badge ${momentBadge(m)}">${esc(momentLabel(m))}</span>
         ${m.ply ? `<span style="color:var(--c-text-muted);font-size:12px">полуход ${esc(String(m.ply))}</span>` : ''}
-        ${m.drop ? `<span style="color:var(--c-text-muted);font-size:12px">потеря ${esc(String(m.drop.toFixed ? m.drop.toFixed(1) : m.drop))}%</span>` : ''}
+        ${m.drop ? `<span style="color:var(--c-text-muted);font-size:12px">потеря ${esc(String(m.drop.toFixed ? m.drop.toFixed(1).replace('.', ',') : m.drop))}%</span>` : ''}
       </div>
       ${m.text ? `<div style="margin-top:4px">${esc(m.text)}</div>` : ''}
       ${m.better && m.better !== '—' ? `<div style="margin-top:2px;font-size:13px">${m.classification === 'inaccuracy' ? 'точнее' : 'лучше'}: <span class="drill-best">${esc(m.better)}</span></div>` : ''}
     </div>`).join('') : '<p style="color:var(--c-text-muted)">Критических ошибок в дебюте нет.</p>';
   return `
     <div class="card">
-      <div class="card-header"><span class="card-title">Отчёт тренера</span><span class="badge badge-good">Stockfish + LLM</span></div>
+      <div class="card-header"><span class="card-title">Отчёт тренера</span><span class="badge badge-good">Stockfish${report.depth ? ` ${esc(String(report.depth))}` : ''} · факты</span></div>
       <div style="font-size:15px;font-weight:600;margin-bottom:6px">${esc(name)}${eco ? ` <span class="badge badge-neutral">${esc(eco)}</span>` : ''}</div>
       ${report.summary ? `<div class="mentor-reply">${esc(report.summary)}</div>` : ''}
       <h3 style="font-size:14px;margin:12px 0 8px">Ключевые моменты</h3>
@@ -5437,6 +5442,11 @@ const TOOL_COLOR_RU = { white: 'белые', black: 'чёрные' };
 const FIDE_CONTROL_RU = { standard: 'Классика', rapid: 'Рапид', blitz: 'Блиц' };
 
 async function viewTools(app) {
+  if (!state.isAdmin) {
+    app.innerHTML = '<div class="onboarding card"><div class="empty-icon">🔒</div><h1>Инструменты</h1><p>Этот раздел доступен администратору.</p><a href="#" class="btn btn-primary" data-view="dashboard">На дашборд</a></div>';
+    bindLinks(app);
+    return;
+  }
   const tool = TOOL_LABELS[state.tool] ? state.tool : 'repertoire';
   state.tool = tool;
   const needsUser = tool === 'repertoire' || tool === 'opponent' || tool === 'humanity'
