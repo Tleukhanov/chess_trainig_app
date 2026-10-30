@@ -607,11 +607,54 @@ td.center { text-align: center; }
 .game-meta div { margin-bottom: 4px; }
 .game-meta strong { color: var(--c-text); }
 
+/* Ошибки разбора: сначала значок и «почему», цифры — в деталях движка */
+.err-why,
+.opening-why {
+  border-left: 2px solid var(--c-border);
+  padding-left: 8px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--c-text);
+}
+.err-details,
+.opening-moment-details { font-size: 12px; color: var(--c-text-muted); }
+.err-details summary,
+.opening-moment-details summary {
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--c-link);
+  user-select: none;
+}
+.err-details summary:hover,
+.opening-moment-details summary:hover { color: var(--c-link-hover); }
+.err-details-body,
+.opening-moment-details-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 6px;
+}
+.err-details-body code,
+.opening-moment-details-body code {
+  font-family: "SF Mono", "Fira Mono", Menlo, Consolas, monospace;
+  font-size: 12px;
+  color: var(--c-text);
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
 /* Тренер дебютов */
 .opening-style-desc { color: var(--c-text-muted); font-size: 13px; margin-top: 6px; min-height: 18px; }
 .opening-reply { margin-top: 10px; font-size: 13px; }
 .opening-report-moment { padding: 8px 0; border-bottom: 1px solid var(--c-border); }
 .opening-report-moment:last-child { border-bottom: none; }
+.opening-moment-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
 
 /* Теория в тренере дебютов: линия, статистика, идеи */
 .theory-card-note { color: var(--c-text-muted); font-size: 12px; margin: 0 0 8px; }

@@ -1,6 +1,6 @@
 // Chess Trainer Frontend — SPA на vanilla JS, потребляет /api/* эндпоинты.
 
-import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.9.7';
+import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.9.10';
 
 const state = {
   user: null,
@@ -2189,25 +2189,44 @@ function loadGameExtras(extras) {
 
 // Ошибки игрока: зевки и ошибки, до 10 штук. Ключ — индекс полухода
 // в analysis.moves (0-based), как в /causes и /notes.
-function gameErrorEntries(analysis, game) {
+function gameErrorEntries(analysis, game, review) {
+  // Выбор ошибок — по classification из анализа (blunder/mistake/inaccuracy),
+  // а why/fen/best_line обогащаем из /review по номеру полухода. Это сохраняет
+  // ошибки с бейджем book/missed_win и не теряет их.
   const moves = (analysis && analysis.moves) || [];
+  const byPly = new Map();
+  if (review && Array.isArray(review.moves)) {
+    review.moves.forEach(m => {
+      if (m && m.ply != null) byPly.set(m.ply, m);
+    });
+  }
   const userColor = game && game.user_color;
   const out = [];
   moves.forEach((m, i) => {
     if (!m) return;
     const c = m.classification;
-    if (c !== 'blunder' && c !== 'mistake') return;
+    if (c !== 'blunder' && c !== 'mistake' && c !== 'inaccuracy') return;
     if (userColor && ((i % 2 === 0) !== (userColor === 'white'))) return;
-    out.push({ ply: i, san: m.san, drop: m.drop, classification: c });
+    const r = byPly.get(i) || {};
+    out.push({
+      ply: i,
+      san: m.san,
+      drop: m.drop,
+      classification: c,
+      why: r.why,
+      best_move_san: r.best_move_san || m.best_move_san,
+      best_line: r.best_line || m.best_line,
+      fen_before: r.fen_before,
+    });
   });
   return out;
 }
 
-function gameErrorsInnerHtml(analysis, game, extras) {
-  const errors = gameErrorEntries(analysis, game);
+function gameErrorsInnerHtml(analysis, game, extras, review) {
+  const errors = gameErrorEntries(analysis, game, review);
   if (!errors.length) {
-    return `<div class="card-header" style="margin-top:12px"><span class="card-title">Ошибки: причина и твоя идея</span></div>
-      <p style="color:var(--c-text-muted)">Зевков и ошибок не найдено.</p>`;
+    return `<div class="card-header" style="margin-top:12px"><span class="card-title">Ошибки и неточности: причина и твоя идея</span></div>
+      <p style="color:var(--c-text-muted)">Ошибок и неточностей не найдено.</p>`;
   }
   const shown = errors.slice(0, 10);
   const rows = shown.map(e => {
@@ -2223,28 +2242,56 @@ function gameErrorsInnerHtml(analysis, game, extras) {
       const explain = cause.explanation ? ` title="${esc(cause.explanation)}"` : '';
       causeHtml = `<span class="badge badge-neutral"${explain}>${esc(label)}</span>`;
     }
-    const explanation = cause && cause.explanation
-      ? `<div style="color:var(--c-text-muted);font-size:12px">${esc(cause.explanation)}</div>`
+    const causeExplanation = cause && typeof cause.explanation === 'string'
+      ? cause.explanation.trim()
       : '';
+    const causeDetails = causeExplanation || (cause && cause.label ? String(cause.label) : '');
+    const why = typeof e.why === 'string' && e.why.trim()
+      ? e.why.trim()
+      : causeExplanation;
+    const whyHtml = why ? `<div class="err-why">${esc(why)}</div>` : '';
     const saved = extras && extras.notes ? (extras.notes[e.ply] || '') : '';
     const draft = extras && extras.drafts ? extras.drafts[e.ply] : undefined;
     const value = draft !== undefined ? draft : saved;
     const status = value === saved && saved ? 'сохранено' : '';
-    const clsBadge = e.classification === 'blunder'
-      ? '<span class="badge badge-bad" style="color:var(--c-err-blunder)">Зевок</span>'
-      : '<span class="badge badge-neutral" style="color:var(--c-err-mistake)">Ошибка</span>';
+    const classLabel = e.classification === 'blunder'
+      ? 'Зевок'
+      : e.classification === 'inaccuracy' ? 'Неточность' : 'Ошибка';
+    const classColor = e.classification === 'blunder'
+      ? 'var(--c-err-blunder)'
+      : e.classification === 'inaccuracy' ? 'var(--c-err-inaccuracy)' : 'var(--c-err-mistake)';
     const loss = e.drop != null
       ? `${e.drop >= 0 ? '−' : '+'}${fmt(Math.abs(e.drop))} win%`
       : '—';
+    const bestMove = typeof e.best_move_san === 'string' && e.best_move_san && e.best_move_san !== '—'
+      ? e.best_move_san
+      : '';
+    let bestLine = Array.isArray(e.best_line)
+      ? e.best_line.filter(x => typeof x === 'string' && x).join(' ')
+      : (typeof e.best_line === 'string' ? e.best_line : '');
+    if (bestMove && bestLine) {
+      const first = bestLine.split(/\s+/)[0] || '';
+      if (first.replace(/[+#]$/, '') !== bestMove.replace(/[+#]$/, '')) {
+        bestLine = `${bestMove} ${bestLine}`;
+      }
+    }
     return `
       <div class="game-error" data-ply="${e.ply}" style="padding:10px 0;border-top:1px solid var(--c-border);display:flex;flex-direction:column;gap:6px">
         <div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px">
+          ${reviewBadgeIcon(e.classification)}
+          <span style="font-size:13px;font-weight:600;color:${classColor}">${classLabel}</span>
           <button type="button" class="btn btn-secondary err-jump" data-ply="${e.ply}" style="padding:2px 8px;font-size:13px">${esc(e.san || '—')}</button>
-          ${clsBadge}
-          <span style="color:var(--c-text-muted);font-size:13px">${loss}</span>
-          ${causeHtml}
         </div>
-        ${explanation}
+        ${whyHtml}
+        <details class="err-details">
+          <summary>Детали движка</summary>
+          <div class="err-details-body">
+            <div>Потеря: ${loss}</div>
+            ${causeDetails ? `<div>Причина: ${esc(causeDetails)}</div>` : ''}
+            ${bestMove ? `<div>Лучший ход: <span class="drill-best">${esc(bestMove)}</span></div>` : ''}
+            ${bestLine ? `<div>Линия: <code>${esc(bestLine)}</code></div>` : ''}
+          </div>
+        </details>
         <div class="form-group" style="margin:0">
           <textarea class="err-note" data-ply="${e.ply}" rows="2" maxlength="500" placeholder="Твоя идея: что ты хотел сделать этим ходом?">${esc(value)}</textarea>
           <div style="display:flex;align-items:center;gap:8px;margin-top:4px">
@@ -2260,7 +2307,7 @@ function gameErrorsInnerHtml(analysis, game, extras) {
   const intentHtml = extras && extras.intentReview
     ? `<div class="card" style="margin-top:10px"><div class="card-header"><span class="card-title">Разбор идей</span></div><div style="font-size:13px;line-height:1.5;white-space:pre-wrap">${esc(extras.intentReview)}</div></div>`
     : '';
-  return `<div class="card-header" style="margin-top:12px"><span class="card-title">Ошибки: причина и твоя идея</span>
+  return `<div class="card-header" style="margin-top:12px"><span class="card-title">Ошибки и неточности: причина и твоя идея</span>
       <button type="button" class="btn btn-secondary" id="intent-review-btn" style="font-size:12px;padding:4px 10px">Разобрать мои идеи</button>
     </div>
     <div class="game-errors-list">${rows}</div>${more}${intentHtml}`;
@@ -2281,7 +2328,10 @@ function renderGameErrors(root) {
   const focus = active && box.contains(active) && active.classList.contains('err-note')
     ? { ply: active.dataset.ply, start: active.selectionStart, end: active.selectionEnd }
     : null;
-  box.innerHTML = gameErrorsInnerHtml(data.analysis, data.game, extras);
+  const review = state.gameReview && state.gameReview.status === 'ready'
+    ? state.gameReview.data
+    : null;
+  box.innerHTML = gameErrorsInnerHtml(data.analysis, data.game, extras, review);
   bindGameErrors(box);
   if (focus) {
     const ta = box.querySelector('.err-note[data-ply="' + focus.ply + '"]');
@@ -3101,6 +3151,10 @@ function taskPollExplanation(app, jobId) {
 const OPENING_START_FEN = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
 const OPENING_KIND_RU = { good: 'хорошо', better: 'можно лучше', bad: 'плохо' };
 const TASK_CLASS_RU = { inaccuracy: 'неточность', mistake: 'ошибка', blunder: 'зевок' };
+function plyPrefix(ply) {
+  const n = Math.floor((Number(ply) + 1) / 2);
+  return Number(ply) % 2 === 1 ? `${n}.` : `${n}...`;
+}
 const TREND_LABELS = {
   avg_win_loss: 'Ср. потеря win%',
   avg_win_before: 'Win% до хода',
@@ -3925,7 +3979,9 @@ function drawOpening(app) {
   });
   app.querySelectorAll('[data-opening-moment-ply]').forEach(card => {
     // Совет «вместо хода» относится к позиции ПЕРЕД сыгранным ходом.
-    card.addEventListener('click', () => {
+    card.addEventListener('click', e => {
+      // Не открываем доску, когда пользователь раскрывает «Детали движка».
+      if (e.target.closest('details, summary')) return;
       const ply = Number(card.dataset.openingMomentPly);
       openExploreAtPly(Math.max(0, ply - 1));
     });
@@ -4181,17 +4237,42 @@ function openingReportHtml(report) {
   const kindLabel = k => OPENING_KIND_RU[k] || (k ? esc(k) : '—');
   const momentLabel = m => classRu[m.classification] || kindLabel(m.kind);
   const momentBadge = m => m.classification === 'inaccuracy' ? 'badge-neutral' : (m.classification ? 'badge-bad' : kindBadge(m.kind));
-  const momentsHtml = moments.length ? moments.map(m => `
+  const momentsHtml = moments.length ? moments.map(m => {
+    const text = typeof m.text === 'string' ? m.text.trim() : '';
+    const why = typeof m.why === 'string' && m.why.trim()
+      ? m.why.trim()
+      : (m.better && m.better !== '—' ? `Движок считал важнее ${m.better}.` : '');
+    const whyHtml = why ? `<div class="opening-why">${esc(why)}</div>` : '';
+    const textHtml = text && text !== why ? `<div>${esc(text)}</div>` : '';
+    const betterHtml = m.better && m.better !== '—'
+      ? `<div>${m.classification === 'inaccuracy' ? 'точнее' : 'лучше'}: <span class="drill-best">${esc(m.better)}</span></div>`
+      : '';
+    const lossText = m.drop != null
+      ? String(m.drop.toFixed ? m.drop.toFixed(1).replace('.', ',') : m.drop)
+      : '';
+    const lossHtml = lossText ? `<div>Потеря: ${esc(lossText)}%</div>` : '';
+    const bestLine = Array.isArray(m.best_line)
+      ? m.best_line.filter(x => typeof x === 'string' && x).join(' ')
+      : (typeof m.best_line === 'string' ? m.best_line : '');
+    const lineHtml = bestLine ? `<div>Линия: <code>${esc(bestLine)}</code></div>` : '';
+    // В text уже есть потеря, лучший ход и линия; не дублируем их.
+    const fallbackDetails = textHtml ? '' : `${betterHtml}${lossHtml}${lineHtml}`;
+    const detailsBody = textHtml || fallbackDetails;
+    const detailsHtml = detailsBody
+      ? `<details class="opening-moment-details"><summary>Детали движка</summary><div class="opening-moment-details-body">${detailsBody}</div></details>`
+      : '';
+    return `
     <div class="opening-report-moment${m.ply ? ' opening-report-moment-clickable' : ''}"${m.ply ? ` data-opening-moment-ply="${esc(String(m.ply))}" title="Открыть позицию перед этим ходом"` : ''}>
-      <div>
+      <div class="opening-moment-head">
+        ${reviewBadgeIcon(m.classification)}
+        ${m.ply ? `<span class="move-num" style="font-size:12px">${esc(plyPrefix(m.ply))}</span>` : ''}
         <span class="drill-san">${esc(m.san || '—')}</span>
         <span class="badge ${momentBadge(m)}">${esc(momentLabel(m))}</span>
-        ${m.ply ? `<span style="color:var(--c-text-muted);font-size:12px">полуход ${esc(String(m.ply))}</span>` : ''}
-        ${m.drop ? `<span style="color:var(--c-text-muted);font-size:12px">потеря ${esc(String(m.drop.toFixed ? m.drop.toFixed(1).replace('.', ',') : m.drop))}%</span>` : ''}
       </div>
-      ${m.text ? `<div style="margin-top:4px">${esc(m.text)}</div>` : ''}
-      ${m.better && m.better !== '—' ? `<div style="margin-top:2px;font-size:13px">${m.classification === 'inaccuracy' ? 'точнее' : 'лучше'}: <span class="drill-best">${esc(m.better)}</span></div>` : ''}
-    </div>`).join('') : '<p style="color:var(--c-text-muted)">Критических ошибок в дебюте нет.</p>';
+      ${whyHtml}
+      ${detailsHtml}
+    </div>`;
+  }).join('') : '<p style="color:var(--c-text-muted)">Критических ошибок в дебюте нет.</p>';
   return `
     <div class="card">
       <div class="card-header"><span class="card-title">Отчёт тренера</span><span class="badge badge-good">Stockfish${report.depth ? ` · глубина ${esc(String(report.depth))}` : ''} · факты</span></div>

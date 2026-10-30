@@ -2534,12 +2534,12 @@ class FrontendTests(ApiTestBase):
         html = resp.text
         self.assertIn("app.js?v=", html)
         self.assertIn("style.css?v=", html)
-        self.assertIn("v0.9.7", html)
+        self.assertIn("v0.9.10", html)
         self.assertIn('id="nav-toggle"', html)
         self.assertIn('aria-controls="nav"', html)
 
     def test_api_version(self):
-        self.assertEqual(self.app.version, "0.9.7")
+        self.assertEqual(self.app.version, "0.9.10")
 
 
 class AuthApiTests(ApiTestBase):
@@ -3035,12 +3035,16 @@ class GameCausesNotesApiTests(ApiTestBase):
     ]
 
     @staticmethod
-    def _entry(san: str, classification: str = "good", drop: float = 0.0) -> dict:
+    def _entry(
+        san: str, classification: str = "good", drop: float = 0.0,
+        best: str | None = None,
+    ) -> dict:
         return {
             "san": san,
             "classification": classification,
             "drop": drop,
             "time_pressure": None,
+            "best_move_san": best,
         }
 
     def _analysis(self) -> dict:
@@ -3050,7 +3054,7 @@ class GameCausesNotesApiTests(ApiTestBase):
         # ply 4 (Bb5) — дебют, даже большая потеря остаётся стратегической.
         entries[4] = self._entry("Bb5", "blunder", 25.0)
         # ply 12 (Bb3) — миттельшпиль, потеря >= 20 win.%: тактический зевок.
-        entries[12] = self._entry("Bb3", "blunder", 25.0)
+        entries[12] = self._entry("Bb3", "blunder", 25.0, best="Bxb5")
         return {"moves": entries}
 
     def _seed_game(self, gid: str = "cn1", nick: str = "tester", analysis: bool = True) -> None:
@@ -3120,6 +3124,18 @@ class GameCausesNotesApiTests(ApiTestBase):
         self.assertTrue(review["moves"][0]["comment"])
         # Ошибки получают бейдж не «good».
         self.assertNotIn(review["moves"][12]["badge"], ("good", "excellent", "best", "book"))
+        # У ошибки пользователя есть FEN перед ходом и проверяемое «почему».
+        error = review["moves"][12]
+        self.assertTrue(error["is_user"])
+        self.assertEqual(
+            error["fen_before"],
+            "r1bqk2r/2ppbppp/p1n2n2/1p2p3/B3P3/5N2/PPPP1PPP/RNBQR1K1 w kq - 0 7",
+        )
+        self.assertEqual(error["best_line"], [])
+        self.assertEqual(error["why"], "Ты не забрал пешку на b5: Bxb5.")
+        # У хорошего хода why нет — поле не выдумывается.
+        self.assertNotIn("why", review["moves"][0])
+        self.assertIn("fen_before", review["moves"][0])
         # Без анализа — review = null, а не 500.
         self._seed_game("cn_plain2", analysis=False)
         self.assertEqual(self.client.get("/api/games/cn_plain2/review").status_code, 200)

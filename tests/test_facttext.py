@@ -74,6 +74,77 @@ class FactTextTests(unittest.TestCase):
         self.assertIn("Линия движка: Nf3 d5 d4", text)
         self.assertNotIn("активизировать", text.lower())
 
+    def test_why_text_capture_uses_accusative(self) -> None:
+        text = facttext.why_text(
+            {"best_move_san": "Nxg5"},
+            "rnbqkb1r/pppppppp/8/6n1/8/5N2/PPPPPPPP/RNBQKB1R w KQkq - 2 3",
+            "h3",
+        )
+        self.assertEqual(text, "Ты не забрал коня на g5: Nxg5.")
+        pawn = facttext.why_text(
+            {"best_move_san": "exd5", "best_line": []},
+            "rnbqkbnr/ppp1pppp/8/3p4/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2",
+        )
+        self.assertEqual(pawn, "Ты не забрал пешку на d5: exd5.")
+
+    def test_why_text_empty_when_best_is_played(self) -> None:
+        # Нельзя писать «не забрал», если этот же ход и был лучшим.
+        self.assertEqual(
+            facttext.why_text(
+                {"best_move_san": "Nf3", "best_line": ["d5"]},
+                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+                "Nf3",
+            ),
+            "",
+        )
+
+    def test_why_text_check(self) -> None:
+        text = facttext.why_text(
+            {"best": "Rh8+"},
+            "4k3/8/8/8/8/8/8/4K2R w K - 0 1",
+            "Rg1",
+        )
+        self.assertEqual(text, "Ты не дал шах: Rh8+.")
+
+    def test_why_text_mate(self) -> None:
+        text = facttext.why_text(
+            {"best_move_san": "Ra8#"},
+            "7k/6pp/8/8/8/8/8/R3K3 w Q - 0 1",
+            "Rb1",
+        )
+        self.assertEqual(text, "Ты не поставил мат: Ra8#.")
+
+    def test_why_text_promotion(self) -> None:
+        text = facttext.why_text(
+            {"best": "e8=Q+"},
+            "4k3/4P3/8/8/8/8/8/4K3 w - - 0 1",
+            "Kf1",
+        )
+        self.assertEqual(text, "Ты не провёл превращение: e8=Q+.")
+
+    def test_why_text_quiet_uses_engine_line_only(self) -> None:
+        text = facttext.why_text(
+            {
+                "best_move_san": "Nf3",
+                "best_line": ["d5", "d4"],
+            },
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "Nh3",
+        )
+        self.assertEqual(text, "Ты сыграл Nh3, но движок считал важнее Nf3: d5 d4.")
+
+    def test_why_text_invents_nothing_without_facts(self) -> None:
+        # Нет лучшего хода — нет текста, а не догадка.
+        self.assertEqual(facttext.why_text({}, None), "")
+        # Без линии остаётся только ход движка: никаких «угроз» и «планов».
+        text = facttext.why_text(
+            {"best": "Nf3"},
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        )
+        self.assertEqual(text, "Движок видел Nf3.")
+        self.assertNotIn("угроз", text.lower())
+        self.assertNotIn("активизировать", text.lower())
+
 
 class IntentReviewFactsTests(unittest.TestCase):
     def test_review_is_deterministic_and_engine_backed(self) -> None:

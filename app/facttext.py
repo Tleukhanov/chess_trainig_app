@@ -21,6 +21,7 @@ __all__ = [
     "move_fact",
     "line_text",
     "error_text",
+    "why_text",
     "opening_summary",
     "opening_recommendation",
     "task_text",
@@ -51,6 +52,15 @@ PIECE_INSTR: dict[int, str] = {
     chess.ROOK: "ладьёй",
     chess.QUEEN: "ферзём",
     chess.KING: "королём",
+}
+# Винительный падеж для «Ты не забрал пешку/ладью/...».
+PIECE_ACC: dict[int, str] = {
+    chess.PAWN: "пешку",
+    chess.KNIGHT: "коня",
+    chess.BISHOP: "слона",
+    chess.ROOK: "ладью",
+    chess.QUEEN: "ферзя",
+    chess.KING: "короля",
 }
 
 CLASS_RU: dict[str, str] = {
@@ -169,6 +179,73 @@ def error_text(entry: dict[str, Any], fen: str | None = None) -> str:
     if alternatives:
         parts.append(f"Рядом по оценке: {', '.join(alternatives[:2])}.")
     return " ".join(parts)
+
+
+def why_text(
+    entry: dict[str, Any],
+    fen: str | None,
+    played: str | None = None,
+) -> str:
+    """Короткое «почему ход плох» только из фактов движка и FEN.
+
+    Опирается на лучший ход и его линию. Если лучший ход — мат, превращение,
+    взятие или шах, это называется прямо; иначе остаётся факт «движок видел
+    X; после него ...». Никаких угроз, мотивов и планов, которых нет в данных.
+
+    ``played`` — сыгранный ход (для контекста), текст от него не зависит:
+    если лучшего хода нет, возвращается пустая строка, а не догадка.
+    """
+    best = entry.get("best_move_san") or entry.get("best")
+    best = str(best).strip() if best else ""
+    if not best:
+        return ""
+    played_clean = str(played or "").strip()
+    if played_clean and best.rstrip("+#") == played_clean.rstrip("+#"):
+        # Лучший ход совпал с сыгранным — «почему» не существует.
+        return ""
+    continuation = line_text(entry.get("best_line") or entry.get("pv"))
+    line = full_line(best, entry.get("best_line") or entry.get("pv"))
+
+    # Мат и превращение видны прямо в SAN — их можно назвать без разбора FEN.
+    if "#" in best:
+        return f"Ты не поставил мат: {best}."
+    if "=" in best:
+        return f"Ты не провёл превращение: {best}."
+
+    board: chess.Board | None = None
+    move: chess.Move | None = None
+    if fen:
+        try:
+            board = chess.Board(fen)
+            move = board.parse_san(best)
+        except (ValueError, TypeError):
+            board = None
+            move = None
+    if board is not None and move is not None:
+        if board.is_capture(move):
+            target = chess.square_name(move.to_square)
+            if board.is_en_passant(move):
+                captured_square = move.to_square + (
+                    -8 if board.turn == chess.WHITE else 8
+                )
+            else:
+                captured_square = move.to_square
+            captured = board.piece_at(captured_square)
+            piece = PIECE_ACC.get(captured.piece_type, "фигуру") if captured else "фигуру"
+            return f"Ты не забрал {piece} на {target}: {best}."
+        if board.gives_check(move):
+            return f"Ты не дал шах: {best}."
+    # Для тихого лучшего хода честный контраст: что сыграно и что движок
+    # считал важнее. Это не выдуманная угроза, а сравнение двух ходов.
+    if played:
+        contrast = f"Ты сыграл {played}, но движок считал важнее {best}"
+        # Показываем только продолжение, без повторения best.
+        return contrast + (f": {continuation}." if continuation else ".")
+    # Продолжение добавляем, только если движок его дал: без линии
+    # «после него Nf3» было бы повтором, а не фактом.
+    if len(line.split()) > 1:
+        return f"Движок видел {best}; после него {line}."
+    return f"Движок видел {best}."
 
 
 def opening_summary(entries: list[dict[str, Any]], opening_name: str | None) -> str:

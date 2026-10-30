@@ -670,6 +670,14 @@ class OpeningAnalyzeTests(OpeningApiTestBase):
         self.assertEqual(moments[0]["better"], "Nc6")
         self.assertEqual(moments[0]["classification"], "mistake")
         self.assertEqual(moments[0]["drop"], 14.5)
+        # Момент несёт FEN перед ходом и «почему» строго из фактов движка.
+        self.assertTrue(chess.Board(moments[0]["fen"]).is_valid())
+        self.assertEqual(
+            moments[0]["fen"],
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        )
+        self.assertEqual(moments[0]["best_line"], [])
+        self.assertEqual(moments[0]["why"], f"Ты сыграл {_toggle_moves(40)[0]}, но движок считал важнее Nc6.")
 
     def test_analyze_adds_missing_blunder_from_engine(self):
         """Если LLM забыл зевок, он всё равно попадает в отчёт из движка."""

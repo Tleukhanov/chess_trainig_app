@@ -1336,6 +1336,13 @@ def _build_opening_report(
         source = by_ply.get(moment["ply"])
         if source is not None:
             moment["text"] = facttext.error_text(source, source.get("fen"))
+            # «Почему» — только проверяемые факты движка и FEN перед ходом.
+            moment["why"] = facttext.why_text(
+                source, source.get("fen"), source.get("san")
+            )
+            moment["best_line"] = source.get("best_line") or []
+            # FEN перед сыгранным ходом — для показа позиции в интерфейсе.
+            moment["fen"] = source.get("fen")
 
     # Итог и рекомендацию не отдаём LLM: только проверяемые факты.
     summary = facttext.opening_summary(user_entries, name)
@@ -3168,7 +3175,7 @@ def create_api(
     db_path: Path | None = None,
     data_dir: Path | None = None,
 ) -> FastAPI:
-    app = FastAPI(title="Chess Trainer API", version="0.9.7", docs_url="/api/docs", redoc_url=None)
+    app = FastAPI(title="Chess Trainer API", version="0.9.10", docs_url="/api/docs", redoc_url=None)
     app.state.db_path = Path(db_path) if db_path else settings.db_path
     app.state.data_dir = Path(data_dir) if data_dir else settings.data_dir
 
@@ -4106,27 +4113,39 @@ def create_api(
             if entry.get("classification") in ("blunder", "mistake"):
                 cause = classify_cause(entry, phase_key, repeated=False)
             badge = badge_for(entry, in_book=in_book, sacrifice=sacrifice)
-            items.append(
-                {
-                    "ply": ply,
-                    "san": san,
-                    "color": "w" if ply % 2 == 0 else "b",
-                    "is_user": (ply % 2 == 0) == user_is_white,
-                    "badge": badge,
-                    "label": badge_label(badge),
-                    "comment": move_comment(
-                        entry,
-                        badge,
-                        best_move_san=entry.get("best_move_san"),
-                        phase=phase_key,
-                        cause=cause,
-                    ),
-                    "drop": entry.get("drop"),
-                    "win_before": entry.get("win_before"),
-                    "win_after": entry.get("win_after"),
-                    "best_move_san": entry.get("best_move_san"),
-                }
-            )
+            is_user = (ply % 2 == 0) == user_is_white
+            fen_before = board.fen()
+            best_line = entry.get("best_line") or []
+            item = {
+                "ply": ply,
+                "san": san,
+                "color": "w" if ply % 2 == 0 else "b",
+                "is_user": is_user,
+                "badge": badge,
+                "label": badge_label(badge),
+                "comment": move_comment(
+                    entry,
+                    badge,
+                    best_move_san=entry.get("best_move_san"),
+                    phase=phase_key,
+                    cause=cause,
+                ),
+                "drop": entry.get("drop"),
+                "win_before": entry.get("win_before"),
+                "win_after": entry.get("win_after"),
+                "best_move_san": entry.get("best_move_san"),
+                "best_line": best_line,
+                "fen_before": fen_before,
+            }
+            if is_user and entry.get("classification") in (
+                "blunder",
+                "mistake",
+                "inaccuracy",
+            ):
+                why = facttext.why_text(entry, fen_before, san)
+                if why:
+                    item["why"] = why
+            items.append(item)
             try:
                 board.push_san(san)
             except ValueError:
