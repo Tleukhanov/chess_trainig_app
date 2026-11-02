@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import shutil
 import tempfile
 import threading
 import time
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -20,7 +22,16 @@ from fastapi.testclient import TestClient
 
 import chess
 
-from app.api import create_api, _plan_llm_input, _task_done_key, _today, _JOBS, CoachJob
+from app.api import (
+    create_api,
+    _plan_llm_input,
+    _task_done_key,
+    _today,
+    _JOBS,
+    CoachJob,
+    _SESSION_COOKIE,
+)
+from app.config import settings
 from app.db import Database
 from app.fide import FidePlayer, FideRatings
 from app.games import Game
@@ -99,9 +110,41 @@ class ApiTestBase(unittest.TestCase):
             db.save_analysis(f"{prefix}1", {"summary": []}, depth=8)
 
     def _set_current(self, nick: str) -> None:
+        """Закрепляет игрока и даёт TestClient живую cookie-сессию."""
+        token = secrets.token_hex(32)
         with Database(self.db_path) as db:
             db.init_db()
             db.set_current_user(nick)
+            rec = db.get_user_record(nick)
+            canonical = rec["nick"] if rec else nick
+            db.create_session(canonical, token, days=30)
+        self.client.cookies.set(_SESSION_COOKIE, token)
+
+    def _make_admin(self, nick: str) -> None:
+        with Database(self.db_path) as db:
+            db.init_db()
+            with db._connection() as conn:
+                conn.execute(
+                    "UPDATE users SET role = 'admin' WHERE nick_lower = ?",
+                    (nick.lower(),),
+                )
+
+    def _clear_auth(self) -> None:
+        """Убирает cookie и meta-current: запрос должен быть анонимным."""
+        self.client.cookies.clear()
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.clear_current_user()
+
+    @contextmanager
+    def _legacy_claim(self):
+        """Включает claim старых профилей только внутри теста."""
+        old = settings.allow_legacy_claim
+        object.__setattr__(settings, "allow_legacy_claim", True)
+        try:
+            yield
+        finally:
+            object.__setattr__(settings, "allow_legacy_claim", old)
 
     def _register(
         self,
@@ -110,7 +153,18 @@ class ApiTestBase(unittest.TestCase):
         lichess: str | None = None,
         fide: str = "",
     ) -> None:
-        """Регистрация через /api/auth/register (ставит cookie сессии)."""
+        """Регистрация через /api/auth/register (ставит cookie сессии).
+
+        Если тестовый профиль уже создан seed'ом без пароля, helper просто
+        выдаёт ему сессию: production-claim по умолчанию запрещён, а тесты
+        не должны от него зависеть.
+        """
+        with Database(self.db_path) as db:
+            db.init_db()
+            rec = db.get_user_record(nick)
+        if rec and not rec.get("password_hash"):
+            self._set_current(rec["nick"])
+            return
         resp = self.client.post(
             "/api/auth/register",
             data={
@@ -124,30 +178,45 @@ class ApiTestBase(unittest.TestCase):
 
 
 class UserApiTests(ApiTestBase):
-    """Тесты /api/user/* и /api/users.
+    """Тесты /api/user/* и /api/users после закрытия auth-дыр.
 
-    Legacy-мутации (add/switch/delete) требуют сессию — пользователи
-    создаются через /api/auth/register (он же ставит cookie).
+    Свой профиль — через /api/user/current; /api/users и legacy add/switch —
+    только админ. delete/fide — свой профиль или админ.
     """
 
     def test_current_user_404_when_none(self):
         resp = self.client.get("/api/user/current")
         self.assertEqual(resp.status_code, 404)
 
-    def test_add_user_sets_current(self):
+    def test_http_request_without_cookie_ignores_meta_current_user(self):
+        # Закрепляем пользователя в meta, но убираем cookie: HTTP-запрос
+        # не должен действовать от имени последнего вошедшего.
+        self._set_current("ada")
+        self.client.cookies.clear()
+        self.assertEqual(self.client.get("/api/user/current").status_code, 404)
+        self.assertEqual(self.client.get("/api/overview").status_code, 404)
+        self.assertEqual(self.client.get("/api/admin/cohort").status_code, 403)
+
+    def test_add_user_sets_current_and_requires_admin(self):
         self._register("tester")
-        resp = self.client.post("/api/user/add", data={"nick": "Petya", "fide": "42"})
+        self.assertEqual(
+            self.client.post("/api/user/add", data={"nick": "Petya"}).status_code,
+            403,
+        )
+        self._make_admin("tester")
+        resp = self.client.post(
+            "/api/user/add", data={"nick": "Petya", "fide": "42"}
+        )
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["nick"], "Petya")
-        # add закрепляет Petya в meta; сессия приоритетнее, поэтому проверяем
-        # через клиента без cookie (meta-fallback).
-        fresh = TestClient(self.app)
-        resp = fresh.get("/api/user/current")
-        self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.json()["user"]["nick"], "Petya")
+        with Database(self.db_path) as db:
+            db.init_db()
+            self.assertEqual(db.get_current_user()["nick"], "Petya")
+            self.assertEqual(db.get_user_record("Petya")["fide_id"], "42")
 
     def test_add_user_invalid_nick(self):
         self._register("tester")
+        self._make_admin("tester")
         resp = self.client.post("/api/user/add", data={"nick": "x", "fide": ""})
         self.assertEqual(resp.status_code, 400)
 
@@ -162,8 +231,8 @@ class UserApiTests(ApiTestBase):
         self.assertEqual(
             fresh.post("/api/user/delete", data={"nick": "ada"}).status_code, 401
         )
-        # С сессией — работает.
         self._register("ada")
+        self._make_admin("ada")
         self.assertEqual(
             self.client.post("/api/user/add", data={"nick": "bob", "fide": ""}).status_code,
             200,
@@ -175,31 +244,47 @@ class UserApiTests(ApiTestBase):
             self.client.post("/api/user/delete", data={"nick": "bob"}).status_code, 200
         )
 
-    def test_switch_user(self):
+    def test_legacy_mutations_non_admin_forbidden(self):
+        self._register("ada")
+        self.assertEqual(
+            self.client.post("/api/user/add", data={"nick": "bob"}).status_code,
+            403,
+        )
+        self.assertEqual(
+            self.client.post("/api/user/switch", data={"nick": "bob"}).status_code,
+            403,
+        )
+        self.assertEqual(
+            self.client.post("/api/user/delete", data={"nick": "bob"}).status_code,
+            403,
+        )
+
+    def test_switch_user_only_admin(self):
         self._register("ada")
         self._register("bob")
+        self.assertEqual(
+            self.client.post("/api/user/switch", data={"nick": "ada"}).status_code,
+            403,
+        )
+        self._make_admin("bob")
         resp = self.client.post("/api/user/switch", data={"nick": "ada"})
         self.assertEqual(resp.status_code, 200)
-        # Сессия приоритетна над meta, поэтому проверяем закреплённого
-        # через клиента без cookie (meta-fallback) и напрямую в БД.
         with Database(self.db_path) as db:
             db.init_db()
             self.assertEqual(db.get_current_user()["nick"], "ada")
-        fresh = TestClient(self.app)
-        resp = fresh.get("/api/user/current")
-        self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.json()["user"]["nick"], "ada")
 
-    def test_list_users(self):
+    def test_list_users_admin_only(self):
         self._register("ada")
         self._register("bob")
+        self.assertEqual(self.client.get("/api/users").status_code, 403)
+        self._make_admin("bob")
         resp = self.client.get("/api/users")
         self.assertEqual(resp.status_code, 200)
-        users = resp.json()["users"]
-        self.assertEqual(len(users), 2)
+        self.assertEqual(len(resp.json()["users"]), 2)
 
     def test_users_no_password_hash(self):
         self._register("ada", fide="42")
+        self._make_admin("ada")
         users = self.client.get("/api/users").json()["users"]
         self.assertEqual(len(users), 1)
         self.assertNotIn("password_hash", users[0])
@@ -218,41 +303,89 @@ class UserApiTests(ApiTestBase):
         self.assertEqual(user["lichess"], "ada")
         self.assertEqual(user["fide_id"], "42")
 
-    def test_delete_user_leaves_other(self):
+    def test_delete_other_forbidden_then_admin_allowed(self):
         self._register("ada")
         self._register("bob")
+        # after the second register the session is bob
+        self.assertEqual(
+            self.client.post("/api/user/delete", data={"nick": "ada"}).status_code,
+            403,
+        )
+        self._make_admin("bob")
+        self.assertEqual(
+            self.client.post("/api/user/delete", data={"nick": "ada"}).status_code,
+            200,
+        )
+        with Database(self.db_path) as db:
+            db.init_db()
+            self.assertEqual([u["nick"] for u in db.list_users()], ["bob"])
+
+    def test_delete_self_allowed(self):
+        self._register("ada")
         resp = self.client.post("/api/user/delete", data={"nick": "ada"})
         self.assertEqual(resp.status_code, 200)
         self.assertTrue(resp.json()["ok"])
-        users = self.client.get("/api/users").json()["users"]
-        self.assertEqual(len(users), 1)
-        self.assertEqual(users[0]["nick"], "bob")
-
-    def test_delete_last_user_allowed(self):
-        self._register("ada")
-        resp = self.client.post("/api/user/delete", data={"nick": "ada"})
-        self.assertEqual(resp.status_code, 200)
-        self.assertEqual(self.client.get("/api/users").json()["users"], [])
+        with Database(self.db_path) as db:
+            db.init_db()
+            self.assertEqual(db.list_users(), [])
+        self.assertEqual(self.client.get("/api/user/current").status_code, 404)
 
     def test_delete_current_user_clears_current(self):
         self._register("ada")
         self._register("bob")
-        # switch закрепляет bob в meta
-        self.assertEqual(
-            self.client.post("/api/user/switch", data={"nick": "bob"}).status_code, 200
-        )
-        with Database(self.db_path) as db:
-            db.init_db()
-            self.assertEqual(db.get_current_user()["nick"], "bob")
         resp = self.client.post("/api/user/delete", data={"nick": "bob"})
         self.assertEqual(resp.status_code, 200)
-        # сессия bob мертва (профиль удалён), meta очищен delete_user
-        resp = self.client.get("/api/user/current")
-        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(self.client.get("/api/user/current").status_code, 404)
+
+    def test_delete_removes_private_db_meta_and_jobs(self):
+        self._register("ada")
+        day = "2026-11-02"
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.save_daily_plan("ada", day, [{"id": "secret-task", "title": "secret"}])
+            db.upsert_daily_log("ada", day, minutes=123)
+            db.save_rating_snapshot("ada", day, 1500)
+            db.set_meta(f"site_time_{day}_ada", '{"last":1,"total":2}')
+            db.set_meta("plan_goal_ada", '{"goal":"secret"}')
+            db.set_meta(f"daily_task_{day}_ada", "secret")
+            db.set_meta("intent_review:ada:key", "secret")
+            db.set_meta("job:secretjob", json.dumps({"user": "ada", "status": "running"}))
+        job = CoachJob(id="secretjob", user="ada", phase="Тест")
+        job.status = "running"
+        _JOBS["secretjob"] = job
+        resp = self.client.post("/api/user/delete", data={"nick": "ada"})
+        self.assertEqual(resp.status_code, 200)
+        with Database(self.db_path) as db:
+            db.init_db()
+            self.assertEqual(db.get_daily_plan("ada", day), [])
+            self.assertIsNone(db.get_daily_log("ada", day))
+            self.assertIsNone(db.get_rating_snapshot("ada", day))
+            for key in (
+                f"site_time_{day}_ada",
+                "plan_goal_ada",
+                f"daily_task_{day}_ada",
+                "intent_review:ada:key",
+                "job:secretjob",
+            ):
+                self.assertIsNone(db.get_meta(key), key)
+        self.assertNotIn("secretjob", _JOBS)
+        _JOBS.pop("secretjob", None)
+
+    def test_delete_removes_private_artifacts_and_blocks_reuse(self):
+        self._register("ada")
+        private = self.data_dir / "ada"
+        private.mkdir(parents=True, exist_ok=True)
+        (private / "humanity.json").write_text('{"items":[{"secret":1}]}', encoding="utf-8")
+        resp = self.client.post("/api/user/delete", data={"nick": "ada"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(private.exists())
+        # Новый владелец того же ника не читает старые файлы.
+        self._register("ada")
+        self.assertEqual(self.client.get("/api/humanize").status_code, 404)
 
     def test_delete_user_removes_games_and_analyses(self):
         self._seed_user("tester", "t")
-        self._register("tester")  # claim: профиль уже есть без пароля
+        self._set_current("tester")
         resp = self.client.post("/api/user/delete", data={"nick": "tester"})
         self.assertEqual(resp.status_code, 200)
         with Database(self.db_path) as db:
@@ -262,8 +395,13 @@ class UserApiTests(ApiTestBase):
             self.assertIsNone(db.get_user("tester"))
         self.assertEqual(self.client.get("/api/user/current").status_code, 404)
 
-    def test_delete_unknown_user_still_ok(self):
+    def test_delete_unknown_user_admin_only(self):
         self._register("ada")
+        self.assertEqual(
+            self.client.post("/api/user/delete", data={"nick": "ghost"}).status_code,
+            403,
+        )
+        self._make_admin("ada")
         resp = self.client.post("/api/user/delete", data={"nick": "ghost"})
         self.assertEqual(resp.status_code, 200)
         self.assertTrue(resp.json()["ok"])
@@ -275,8 +413,9 @@ class UserApiTests(ApiTestBase):
         )
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["fide_id"], "4100000")
-        users = self.client.get("/api/users").json()["users"]
-        self.assertEqual(users[0]["fide_id"], "4100000")
+        with Database(self.db_path) as db:
+            db.init_db()
+            self.assertEqual(db.get_user_record("ada")["fide_id"], "4100000")
 
     def test_fide_empty_clears_profile(self):
         self._register("ada", fide="42")
@@ -285,8 +424,50 @@ class UserApiTests(ApiTestBase):
         )
         self.assertEqual(resp.status_code, 200)
         self.assertIsNone(resp.json()["fide_id"])
-        users = self.client.get("/api/users").json()["users"]
-        self.assertIsNone(users[0]["fide_id"])
+        with Database(self.db_path) as db:
+            db.init_db()
+            self.assertIsNone(db.get_user_record("ada")["fide_id"])
+
+    def test_bootstrap_admin_nicks_creates_login(self):
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.bootstrap_admin_nicks(("boss",), "strongpass")
+        resp = self.client.post(
+            "/api/auth/login", data={"login": "boss", "password": "strongpass"}
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        current = self.client.get("/api/user/current").json()
+        self.assertTrue(current["is_admin"])
+
+    def test_reserved_admin_nick_cannot_self_register(self):
+        old = settings.admin_nicks
+        object.__setattr__(settings, "admin_nicks", ("reserved",))
+        try:
+            resp = self.client.post(
+                "/api/auth/register",
+                data={"login": "reserved", "password": "abcd", "lichess": "X"},
+            )
+        finally:
+            object.__setattr__(settings, "admin_nicks", old)
+        self.assertEqual(resp.status_code, 403)
+
+    def test_fide_run_requires_login(self):
+        fresh = TestClient(self.app)
+        resp = fresh.post("/api/fide/run", data={"id": "12345"})
+        self.assertEqual(resp.status_code, 401)
+
+    def test_fide_other_forbidden(self):
+        self._register("ada", fide="42")
+        self._register("bob")
+        resp = self.client.post(
+            "/api/user/fide", data={"nick": "ada", "fide_id": "4100000"}
+        )
+        self.assertEqual(resp.status_code, 403)
+        self._make_admin("bob")
+        resp = self.client.post(
+            "/api/user/fide", data={"nick": "ada", "fide_id": "4100000"}
+        )
+        self.assertEqual(resp.status_code, 200)
 
 
 class DataApiTests(ApiTestBase):
@@ -336,9 +517,7 @@ class DataApiTests(ApiTestBase):
         self.assertIn("total", data)
 
     def test_no_user_404(self):
-        with Database(self.db_path) as db:
-            db.init_db()
-            db.clear_current_user()
+        self._clear_auth()
         resp = self.client.get("/api/overview")
         self.assertEqual(resp.status_code, 404)
 
@@ -433,9 +612,7 @@ class CoachApiTests(ApiTestBase):
         self.assertEqual(resp.status_code, 404)
 
     def test_coach_run_no_user(self):
-        with Database(self.db_path) as db:
-            db.init_db()
-            db.clear_current_user()
+        self._clear_auth()
         resp = self.client.post("/api/coach/run", data={"max": "10", "perf": "rapid", "depth": "8", "multipv": "1"})
         self.assertEqual(resp.status_code, 404)
 
@@ -660,7 +837,7 @@ class GameApiTests(ApiTestBase):
                 [mkgame_moves("g2", ["e4", "e5", "Nf3"], created_at=1)],
                 "tester",
             )
-            db.set_current_user("tester")
+        self._set_current("tester")
 
     def test_list_games(self):
         resp = self.client.get("/api/games?limit=100")
@@ -682,9 +859,7 @@ class GameApiTests(ApiTestBase):
         self.assertEqual(g2["moves"], 3)
 
     def test_list_games_empty(self):
-        with Database(self.db_path) as db:
-            db.init_db()
-            db.set_current_user("nobody")
+        self._set_current("nobody")
         resp = self.client.get("/api/games?limit=100")
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["games"], [])
@@ -717,7 +892,6 @@ class GameApiTests(ApiTestBase):
         with Database(self.db_path) as db:
             db.init_db()
             db.save_games([mkgame("b1")], "tester")
-            db.set_current_user("tester")
             with db._connection() as conn:
                 conn.execute(
                     "UPDATE games SET moves_json = ? WHERE id = ?", ("{bad json", "b1")
@@ -726,9 +900,7 @@ class GameApiTests(ApiTestBase):
         self.assertEqual(resp.status_code, 404)
 
     def test_list_games_no_user(self):
-        with Database(self.db_path) as db:
-            db.init_db()
-            db.clear_current_user()
+        self._clear_auth()
         resp = self.client.get("/api/games")
         self.assertEqual(resp.status_code, 404)
         resp = self.client.get("/api/games/g1")
@@ -773,12 +945,12 @@ class JobAccessTests(ApiTestBase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["id"], job_id)
 
-        # Без сессии — meta-fallback: закрепляем alice напрямую → 200 как раньше
+        # Без cookie meta-current больше не подмешивается: 401.
         with Database(self.db_path) as db:
             db.init_db()
             db.set_current_user("alice")
         self.client.cookies.clear()
-        self.assertEqual(self.client.get(f"/api/jobs/{job_id}").status_code, 200)
+        self.assertEqual(self.client.get(f"/api/jobs/{job_id}").status_code, 401)
 
 
 class ToolsApiTests(ApiTestBase):
@@ -860,16 +1032,12 @@ class ToolsApiTests(ApiTestBase):
         self.assertEqual(resp.status_code, 400)
 
     def test_repertoire_no_user_404(self):
-        with Database(self.db_path) as db:
-            db.init_db()
-            db.clear_current_user()
+        self._clear_auth()
         resp = self.client.get("/api/repertoire")
         self.assertEqual(resp.status_code, 404)
 
     def test_repertoire_no_data_404(self):
-        with Database(self.db_path) as db:
-            db.init_db()
-            db.set_current_user("empty")
+        self._set_current("empty")
         resp = self.client.get("/api/repertoire")
         self.assertEqual(resp.status_code, 404)
 
@@ -919,9 +1087,7 @@ class ToolsApiTests(ApiTestBase):
         self.assertEqual(resp.status_code, 400)
 
     def test_prepare_run_no_user_404(self):
-        with Database(self.db_path) as db:
-            db.init_db()
-            db.clear_current_user()
+        self._clear_auth()
         resp = self.client.post("/api/prepare/run", data={"opponent": "rival"})
         self.assertEqual(resp.status_code, 404)
 
@@ -961,9 +1127,7 @@ class ToolsApiTests(ApiTestBase):
 
     def test_humanize_refresh_job_without_games_errors(self):
         # у ghost нет партий — job падает до запуска движка/сети
-        with Database(self.db_path) as db:
-            db.init_db()
-            db.set_current_user("ghost")
+        self._set_current("ghost")
         resp = self.client.get("/api/humanize?refresh=1")
         self.assertEqual(resp.status_code, 200)
         job = self._wait_job(resp.json()["job_id"])
@@ -971,9 +1135,7 @@ class ToolsApiTests(ApiTestBase):
         self.assertIn("проанализированных", job["error"])
 
     def test_humanize_refresh_no_user_404(self):
-        with Database(self.db_path) as db:
-            db.init_db()
-            db.clear_current_user()
+        self._clear_auth()
         resp = self.client.get("/api/humanize?refresh=1")
         self.assertEqual(resp.status_code, 404)
 
@@ -1071,6 +1233,7 @@ class LlmToolApiTests(ApiTestBase):
 
     def setUp(self) -> None:
         super().setUp()
+        self._set_current("tester")
         with Database(self.db_path) as db:
             db.init_db()
             db.save_games(
@@ -1154,16 +1317,12 @@ class LlmToolApiTests(ApiTestBase):
         self.assertIn("Момент 1", user_msg["content"])
 
     def test_review_no_user_404(self):
-        with Database(self.db_path) as db:
-            db.init_db()
-            db.clear_current_user()
+        self._clear_auth()
         resp = self.client.post("/api/review/run", data={"max": "3"})
         self.assertEqual(resp.status_code, 404)
 
     def test_review_no_analyzed_games_404(self):
-        with Database(self.db_path) as db:
-            db.init_db()
-            db.set_current_user("ghost")
+        self._set_current("ghost")
         resp = self.client.post("/api/review/run", data={"max": "3"})
         self.assertEqual(resp.status_code, 404)
         self.assertIn("проанализированных", resp.json()["detail"])
@@ -1202,9 +1361,7 @@ class LlmToolApiTests(ApiTestBase):
         self.assertIsNotNone(result.get("model"))
 
     def test_mentor_no_user_404(self):
-        with Database(self.db_path) as db:
-            db.init_db()
-            db.clear_current_user()
+        self._clear_auth()
         resp = self.client.post("/api/mentor/run", data={"notes": "x"})
         self.assertEqual(resp.status_code, 404)
 
@@ -1217,6 +1374,10 @@ class TaskApiTests(ApiTestBase):
     best_move_san, best_line, ...}, индексы blunders/mistakes — ply.
     Движок и сеть не запускаются.
     """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._set_current("tester")
 
     @staticmethod
     def _move(
@@ -1421,9 +1582,7 @@ class TaskApiTests(ApiTestBase):
 
     def test_legal_no_user_404(self):
         self._seed_tasks()
-        with Database(self.db_path) as db:
-            db.init_db()
-            db.clear_current_user()
+        self._clear_auth()
         self.assertEqual(self.client.get("/api/task/legal").status_code, 404)
 
     def test_legal_no_errors_404(self):
@@ -1575,9 +1734,7 @@ class TaskApiTests(ApiTestBase):
 
     def test_task_endpoints_no_user_404(self):
         self._seed_tasks()
-        with Database(self.db_path) as db:
-            db.init_db()
-            db.clear_current_user()
+        self._clear_auth()
         self.assertEqual(self.client.get("/api/task/today").status_code, 404)
         self.assertEqual(
             self.client.post("/api/task/answer", data={"answer": "e4"}).status_code,
@@ -1696,9 +1853,7 @@ class TrackApiTests(ApiTestBase):
         self.assertEqual(data["lichess_sec"], 0)
 
     def test_no_user_404(self):
-        with Database(self.db_path) as db:
-            db.init_db()
-            db.clear_current_user()
+        self._clear_auth()
         self.assertEqual(self.client.post("/api/track/ping").status_code, 404)
         self.assertEqual(self.client.get("/api/track/today").status_code, 404)
 
@@ -1752,9 +1907,7 @@ class TrackApiTests(ApiTestBase):
         self.assertEqual(data["manual_sec"], 0)
 
     def test_manual_minutes_no_user_404(self):
-        with Database(self.db_path) as db:
-            db.init_db()
-            db.clear_current_user()
+        self._clear_auth()
         resp = self.client.post(
             "/api/track/lichess_manual", data={"minutes": "30"}
         )
@@ -1871,6 +2024,10 @@ class PlanGoalTests(ApiTestBase):
 
 class PlanWeekTests(ApiTestBase):
     """GET /api/plan/week: детерминированный план из живых данных."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._set_current("tester")
 
     @staticmethod
     def _move(
@@ -2004,9 +2161,7 @@ class PlanWeekTests(ApiTestBase):
 
     def test_week_no_user_404(self):
         self._seed_week()
-        with Database(self.db_path) as db:
-            db.init_db()
-            db.clear_current_user()
+        self._clear_auth()
         self.assertEqual(self.client.get("/api/plan/week").status_code, 404)
 
 
@@ -2314,9 +2469,7 @@ class PlanLlmTests(ApiTestBase):
 
     def test_plan_llm_no_user_404(self):
         self._add_user()
-        with Database(self.db_path) as db:
-            db.init_db()
-            db.clear_current_user()
+        self._clear_auth()
         # Сессия от register жива — проверяем через клиента без cookie.
         fresh = TestClient(self.app)
         self.assertEqual(fresh.get("/api/plan/llm").status_code, 404)
@@ -2534,12 +2687,12 @@ class FrontendTests(ApiTestBase):
         html = resp.text
         self.assertIn("app.js?v=", html)
         self.assertIn("style.css?v=", html)
-        self.assertIn("v0.9.10", html)
+        self.assertIn("v0.9.11", html)
         self.assertIn('id="nav-toggle"', html)
         self.assertIn('aria-controls="nav"', html)
 
     def test_api_version(self):
-        self.assertEqual(self.app.version, "0.9.10")
+        self.assertEqual(self.app.version, "0.9.11")
 
 
 class AuthApiTests(ApiTestBase):
@@ -2604,10 +2757,11 @@ class AuthApiTests(ApiTestBase):
             db.upsert_user("OldNick")
             db.save_games([mkgame("c1")], "OldNick")
             db.save_analysis("c1", {"summary": []}, depth=8)
-        resp = self.client.post(
-            "/api/auth/register",
-            data={"login": "OldNick", "password": "abcd", "lichess": "OldLichess"},
-        )
+        with self._legacy_claim():
+            resp = self.client.post(
+                "/api/auth/register",
+                data={"login": "OldNick", "password": "abcd", "lichess": "OldLichess"},
+            )
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json(), {"ok": True, "nick": "OldNick"})
         with Database(self.db_path) as db:
@@ -2617,6 +2771,30 @@ class AuthApiTests(ApiTestBase):
             self.assertEqual(rec["lichess"], "OldLichess")
             self.assertEqual(len(db.get_games("OldNick")), 1)
             self.assertTrue(db.has_analysis("c1"))
+
+    def test_register_passwordless_profile_denied_by_default(self):
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.upsert_user("OldNick")
+            db.save_games([mkgame("c1")], "OldNick")
+        resp = self.client.post(
+            "/api/auth/register",
+            data={"login": "OldNick", "password": "attacker", "lichess": "X"},
+        )
+        self.assertEqual(resp.status_code, 409)
+        with Database(self.db_path) as db:
+            db.init_db()
+            self.assertIsNone(db.get_user_record("OldNick")["password_hash"])
+        self.assertEqual(self.client.get("/api/games").status_code, 404)
+
+    def test_register_rejects_path_traversal_and_bad_nicks(self):
+        for bad in ("/tmp/x", "../x", "a b", "x" * 31, "кирилл"):
+            with self.subTest(login=bad):
+                resp = self.client.post(
+                    "/api/auth/register",
+                    data={"login": bad, "password": "abcd", "lichess": "X"},
+                )
+                self.assertEqual(resp.status_code, 400, resp.text)
 
     def test_login_wrong_and_unknown_401(self):
         self.client.post(
@@ -2776,6 +2954,10 @@ class GameLinkTests(ApiTestBase):
     Где линка нет (None) — API отдаёт null, а не конструирует URL из id.
     """
 
+    def setUp(self) -> None:
+        super().setUp()
+        self._set_current("tester")
+
     def _seed_two(self) -> None:
         """Партия со ссылкой + партия без ссылки, обе с ошибками белых."""
         mv = TaskApiTests._move
@@ -2850,7 +3032,7 @@ class GameLinkTests(ApiTestBase):
                 },
                 depth=8,
             )
-            db.set_current_user("plantester")
+        self._set_current("plantester")
 
     def test_db_roundtrip(self):
         self._seed_two()
@@ -3227,6 +3409,10 @@ class ChessUtilsApiTests(ApiTestBase):
     Stockfish не поднимается: для eval подменяем ``app.api.Engine`` фейком.
     """
 
+    def setUp(self) -> None:
+        super().setUp()
+        self._set_current("tester")
+
     class FakePositionEngine:
         """Фейк Engine: запоминает параметры и отдаёт одну линию."""
 
@@ -3256,9 +3442,7 @@ class ChessUtilsApiTests(ApiTestBase):
     def setUp(self) -> None:
         super().setUp()
         type(self).FakePositionEngine.calls = []
-        with Database(self.db_path) as db:
-            db.init_db()
-            db.set_current_user("tester")
+        self._set_current("tester")
 
     def test_legal_starting_position_has_20_moves(self):
         resp = self.client.post(
@@ -3379,6 +3563,18 @@ class GameImportApiTests(ApiTestBase):
         self.assertEqual(
             self.client.post("/api/games/import", data={"pgn": "not a pgn"}).status_code,
             400,
+        )
+
+    def test_import_foreign_game_id_does_not_leak_analysis(self) -> None:
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.save_games([mkgame("imp12345")], "victim")
+            db.save_analysis("imp12345", {"secret": "victim-analysis"}, depth=8)
+        self._register("importer")
+        resp = self.client.post("/api/games/import", data={"pgn": self.PGN})
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(
+            self.client.get("/api/games/imp12345").status_code, 404
         )
 
     def test_import_requires_auth(self) -> None:

@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.9.11 — 2026-11-02
+
+Security hardening before a public deployment.
+
+- HTTP requests now use only the session cookie; removing the `meta`
+  `current_user` fallback closes the “act as last logged-in user” hole.
+- `/api/users` and legacy `add`/`switch` are admin-only; `delete`/`fide` are
+  self-or-admin; foreign job and foreign game access return 404.
+- `ADMIN_NICKS` no longer grants rights by itself: it only promotes existing
+  profiles at startup. Admin nicks are reserved against self-registration.
+- Passwordless legacy profiles are no longer claimable by default; local
+  migration requires `ALLOW_LEGACY_CLAIM=1`.
+- Registration validates nicks, the FIDE cache path is traversal-safe, and
+  cohort CSV escapes formula prefixes.
+- Deleting a profile removes `data/<nick>/`, per-user daily plan/log/rating
+  snapshots, user meta, persisted job snapshots and in-memory jobs, so a later
+  owner of the same nick cannot inherit old data.
+- First admin bootstrap: `ADMIN_BOOTSTRAP_PASSWORD` creates a missing
+  `ADMIN_NICKS` profile once; existing passwordless admins get the password
+  without overwriting an existing one.
+- FIDE jobs have a separate light per-user cap; humanize still goes through the
+  heavy engine limit. Session cookies are `Secure` on HTTPS, including
+  `X-Forwarded-Proto` behind a proxy.
+- A PGN import cannot reuse a game id already cached by another player;
+  analysis is hidden if a foreign copy exists.
+- 892 tests pass.
+
 ## 0.9.10 — 2026-10-30
 
 Icon-first error feedback with a short, engine-grounded “why”.

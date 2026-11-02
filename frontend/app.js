@@ -1,6 +1,6 @@
 // Chess Trainer Frontend — SPA на vanilla JS, потребляет /api/* эндпоинты.
 
-import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.9.10';
+import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.9.11';
 
 const state = {
   user: null,
@@ -6194,10 +6194,10 @@ async function viewUsers(app) {
     viewAuth(app);
     return;
   }
-  const users = await api('/api/users');
-  const list = users.users || [];
-  const want = String(status.nick || '').toLowerCase();
-  const me = list.find(u => String(u.nick || '').toLowerCase() === want) || { nick: status.nick };
+  // /api/users — только для админа. Свой профиль берём из /api/user/current.
+  const current = await api('/api/user/current');
+  const me = current.user || { nick: status.nick };
+  state.isAdmin = !!current.is_admin;
   if (me.nick) {
     state.user = me;
     renderUserbox();
@@ -6388,19 +6388,11 @@ async function loadUser() {
     return;
   }
   try {
-    const data = await api('/api/users');
-    const want = String(status.nick || '').toLowerCase();
-    const found = (data.users || []).find(
-      u => String(u.nick || '').toLowerCase() === want
-    );
-    state.user = found || { nick: status.nick };
-  } catch {
-    state.user = { nick: status.nick };
-  }
-  try {
     const current = await api('/api/user/current');
+    state.user = current.user || { nick: status.nick };
     state.isAdmin = !!(current && current.is_admin);
   } catch {
+    state.user = { nick: status.nick };
     state.isAdmin = false;
   }
   syncAdminNav();

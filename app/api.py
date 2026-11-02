@@ -16,6 +16,7 @@ import logging
 import os
 import random
 import secrets
+import shutil
 import threading
 import time
 import urllib.parse
@@ -138,6 +139,28 @@ def _get_job(job_id: str) -> CoachJob | None:
         return _JOBS.get(job_id)
 
 
+def _purge_user_jobs(nick: str) -> None:
+    """Убирает in-memory задачи удалённого профиля.
+
+    Иначе новый владелец того же ника увидит старые ``result`` через
+    /api/jobs/active. Persisted ``job:*`` meta чистит Database.delete_user.
+    """
+    key = (nick or "").strip().lower()
+    if not key:
+        return
+    removed: set[str] = set()
+    with _JOBS_LOCK:
+        for job_id, job in list(_JOBS.items()):
+            if str(job.user or "").strip().lower() == key:
+                _JOBS.pop(job_id, None)
+                removed.add(job_id)
+    if removed:
+        with _MIDDLEGAME_JOBS_LOCK:
+            for session_id, job_id in list(_MIDDLEGAME_JOBS.items()):
+                if job_id in removed:
+                    _MIDDLEGAME_JOBS.pop(session_id, None)
+
+
 # --- persisted job snapshots (переживают перезапуск процесса) --------------
 
 _JOB_META_PREFIX = "job:"
@@ -218,6 +241,19 @@ def _check_job_limits(nick: str) -> None:
             "Сейчас анализируются задачи других игроков — попробуй через минуту",
         )
 
+
+#: Лёгкие задачи (FIDE/человечность) не занимают движок, поэтому не должны
+#: упираться в глобальный лимит. Но один пользователь не должен плодить их
+#: без ограничений.
+LIGHT_JOBS_PER_USER_LIMIT = 5
+
+
+def _check_light_job_limits(nick: str) -> None:
+    if _user_running_jobs_count(nick) >= LIGHT_JOBS_PER_USER_LIMIT:
+        raise HTTPException(
+            503, "Слишком много задач — дождись завершения"
+        )
+
 # --- background job --------------------------------------------------------
 
 def _run_coach_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None:
@@ -237,9 +273,18 @@ def _run_coach_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None:
                     max_games=params["max"],
                     perf=params["perf"],
                 )
+                # Не сохраняем копию чужой партии: analyses общий по game_id.
+                games = [
+                    g for g in games
+                    if not _analysis_has_foreign_copy(db, g.id, job.user)
+                ]
                 db.save_games(games, job.user)
 
-            qualified = [g for g in games if g.is_finished() and g.moves]
+            qualified = [
+                g for g in games
+                if g.is_finished() and g.moves
+                and not _analysis_has_foreign_copy(db, g.id, job.user)
+            ]
             if params["refresh"]:
                 target = qualified
             else:
@@ -445,6 +490,24 @@ def _ensure_llm_key() -> None:
         )
 
 
+def _analysis_has_foreign_copy(db: Database, game_id: str, user: str) -> bool:
+    """У партии с этим id есть копия у другого игрока.
+
+    analyses общий по game_id; без этой проверки импорт PGN с чужим Site id
+    позволял бы прочитать/перезаписать чужой анализ.
+    """
+    return any(
+        p.strip().lower() != (user or "").strip().lower()
+        for p in db.game_players(game_id)
+    )
+
+
+def _analysis_for_user(db: Database, game_id: str, user: str) -> dict | None:
+    if _analysis_has_foreign_copy(db, game_id, user):
+        return None
+    return db.get_analysis(game_id)
+
+
 def _select_analyzed_pairs(
     db: Database,
     user: str,
@@ -454,11 +517,13 @@ def _select_analyzed_pairs(
     """Отбирает пары (игра, анализ) для LLM-инструментов: конкретная
     партия либо топ-партии по blunders+mistakes. Ошибки — RuntimeError."""
     if game_id:
-        game = db.get_game(game_id)
+        game = db.get_game(game_id, user)
         if game is None:
             raise RuntimeError(f"Партия {game_id} не найдена в кеше")
-        analysis = db.get_analysis(game_id)
+        analysis = _analysis_for_user(db, game_id, user)
         if analysis is None:
+            if _analysis_has_foreign_copy(db, game_id, user):
+                raise RuntimeError("Партия уже есть в кеше у другого игрока")
             raise RuntimeError(
                 f"Партия {game_id} не проанализирована — сначала запусти анализ."
             )
@@ -1766,23 +1831,23 @@ def _session_nick(request: Request | None, db: Database) -> str | None:
 
 
 def _current_user(db_path: Path, request: Request | None = None) -> dict | None:
-    """Текущий пользователь: сначала сессия из cookie, иначе meta current_user.
+    """Текущий пользователь.
 
-    Fallback на meta нужен CLI и старым клиентам без cookie. Неактивный
-    пользователь (is_active=0) — везде None (HTTP 404).
+    Для HTTP-запроса — **только** сессия из cookie. Глобальный ``meta``
+    current_user оставлен только для CLI/внутренних вызовов без Request:
+    иначе запрос без cookie мог действовать от имени последнего вошедшего.
+    Неактивный пользователь (is_active=0) — везде None (HTTP 404).
     """
     with Database(db_path) as db:
         db.init_db()
         if request is not None:
-            token = request.cookies.get(_SESSION_COOKIE)
-            if token:
-                nick = db.get_session_nick(token)
-                if nick:
-                    rec = db.get_user_record(nick)
-                    if rec is not None:
-                        if not _is_active_record(rec):
-                            return None
-                        return rec
+            nick = _session_nick(request, db)
+            if not nick:
+                return None
+            rec = db.get_user_record(nick)
+            if rec is None or not _is_active_record(rec):
+                return None
+            return rec
         user = db.get_current_user()
         if user is not None and not _is_active_record(user):
             return None
@@ -1802,7 +1867,17 @@ def _lichess_of(db: Database, nick: str) -> str:
     return nick
 
 
-def _set_session_cookie(response: Response, token: str) -> None:
+def _request_is_https(request: Request) -> bool:
+    """HTTPS с учётом reverse proxy (Heroku/Caddy/Fly)."""
+    if request.url.scheme == "https":
+        return True
+    proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0]
+    return proto.strip().lower() == "https"
+
+
+def _set_session_cookie(
+    response: Response, token: str, *, secure: bool = False
+) -> None:
     """Выставляет cookie сессии (httponly, samesite=lax, 30 дней)."""
     response.set_cookie(
         _SESSION_COOKIE,
@@ -1810,6 +1885,7 @@ def _set_session_cookie(response: Response, token: str) -> None:
         max_age=_SESSION_MAX_AGE,
         httponly=True,
         samesite="lax",
+        secure=secure,
         path="/",
     )
 
@@ -2294,6 +2370,30 @@ _COHORT_CSV_COLUMNS = (
 )
 
 
+def _delete_user_artifacts(data_dir: Path, nick: str) -> None:
+    """Удаляет data/<ник>/ после удаления профиля.
+
+    Только внутри data_dir: защита от path traversal и от удаления корня.
+    """
+    target = user_dir(nick, root=data_dir)
+    root = data_dir.resolve()
+    try:
+        resolved = target.resolve()
+    except OSError:
+        return
+    if resolved == root or root not in resolved.parents:
+        return
+    if resolved.exists():
+        shutil.rmtree(resolved, ignore_errors=True)
+
+
+def _csv_safe(value: Any) -> Any:
+    """Не даём Excel/LibreOffice исполнить ник как формулу."""
+    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + value
+    return value
+
+
 def _cohort_csv(rows: list[dict[str, Any]]) -> str:
     """CSV когорты (RFC 4180, UTF-8, перевод строки ``\\n``)."""
     buffer = io.StringIO()
@@ -2302,9 +2402,11 @@ def _cohort_csv(rows: list[dict[str, Any]]) -> str:
     for row in rows:
         writer.writerow(
             [
-                int(row[column])
-                if isinstance(row.get(column), bool)
-                else ("" if row.get(column) is None else row.get(column))
+                _csv_safe(
+                    int(row[column])
+                    if isinstance(row.get(column), bool)
+                    else ("" if row.get(column) is None else row.get(column))
+                )
                 for column in _COHORT_CSV_COLUMNS
             ]
         )
@@ -3175,9 +3277,17 @@ def create_api(
     db_path: Path | None = None,
     data_dir: Path | None = None,
 ) -> FastAPI:
-    app = FastAPI(title="Chess Trainer API", version="0.9.10", docs_url="/api/docs", redoc_url=None)
+    app = FastAPI(title="Chess Trainer API", version="0.9.11", docs_url="/api/docs", redoc_url=None)
     app.state.db_path = Path(db_path) if db_path else settings.db_path
     app.state.data_dir = Path(data_dir) if data_dir else settings.data_dir
+
+    # ADMIN_NICKS — seed только для существующих профилей. Проверка прав
+    # (is_admin) смотрит исключительно users.role, не env.
+    with Database(app.state.db_path) as db:
+        db.init_db()
+        db.bootstrap_admin_nicks(
+            settings.admin_nicks, settings.admin_bootstrap_password
+        )
 
     # --- User / Auth ---
     @app.get("/api/user/current")
@@ -3196,6 +3306,9 @@ def create_api(
 
     @app.get("/api/users")
     def api_list_users(request: Request):
+        # Список всех игроков — только админу. Свой профиль клиент берёт
+        # из /api/user/current.
+        _admin_user(request, app.state.db_path)
         with Database(app.state.db_path) as db:
             db.init_db()
             users = db.list_users()
@@ -3211,8 +3324,11 @@ def create_api(
             raise HTTPException(400, f"Невалидный ник: {clean}")
         db = Database(app.state.db_path)
         db.init_db()
-        if not _session_nick(request, db):
+        nick = _session_nick(request, db)
+        if not nick:
             raise HTTPException(401, "Нужен вход")
+        if not is_admin(db, nick):
+            raise HTTPException(403, "Доступ только для админа")
         db.upsert_user(clean, fide_id=fide.strip() or None)
         db.set_current_user(clean)
         db.touch_user(clean)
@@ -3225,8 +3341,11 @@ def create_api(
             raise HTTPException(400, "Ник не может быть пустым")
         db = Database(app.state.db_path)
         db.init_db()
-        if not _session_nick(request, db):
+        nick = _session_nick(request, db)
+        if not nick:
             raise HTTPException(401, "Нужен вход")
+        if not is_admin(db, nick):
+            raise HTTPException(403, "Доступ только для админа")
         db.set_current_user(clean)
         db.touch_user(clean)
         return {"ok": True, "nick": clean}
@@ -3239,13 +3358,23 @@ def create_api(
             raise HTTPException(400, "Ник не может быть пустым")
         db = Database(app.state.db_path)
         db.init_db()
-        if not _session_nick(request, db):
+        nick = _session_nick(request, db)
+        if not nick:
             raise HTTPException(401, "Нужен вход")
-        db.delete_user(clean)
+        if clean.lower() != nick.lower() and not is_admin(db, nick):
+            raise HTTPException(403, "Можно удалить только свой профиль")
+        deleted = db.delete_user(clean)
+        if deleted:
+            _purge_user_jobs(clean)
+            _delete_user_artifacts(app.state.data_dir, clean)
         return {"ok": True, "nick": clean}
 
     @app.post("/api/user/fide")
-    def api_user_fide(nick: str = Form(...), fide_id: str = Form("")):
+    def api_user_fide(
+        request: Request,
+        nick: str = Form(...),
+        fide_id: str = Form(""),
+    ):
         """Задаёт (или пустым значением очищает) FIDE ID профиля."""
         clean = nick.strip()
         if not clean:
@@ -3253,6 +3382,11 @@ def create_api(
         value = fide_id.strip()
         with Database(app.state.db_path) as db:
             db.init_db()
+            current = _session_nick(request, db)
+            if not current:
+                raise HTTPException(401, "Нужен вход")
+            if clean.lower() != current.lower() and not is_admin(db, current):
+                raise HTTPException(403, "Можно менять только свой профиль")
             db.set_user_fide(clean, value or None)
         return {"ok": True, "nick": clean, "fide_id": value or None}
 
@@ -3684,11 +3818,12 @@ def create_api(
     @app.get("/api/jobs/{job_id}")
     def api_job_status(job_id: str, request: Request):
         user = _current_user(app.state.db_path, request)
+        if not user:
+            raise HTTPException(401, "Нужен вход")
         job = _get_job(job_id)
         if job is not None:
-            # Чужую задачу (результаты LLM, данные соперника) не отдаём:
-            # с сессией — только свои job'ы; без сессии — meta-fallback как раньше.
-            if user is not None and job.user != user["nick"]:
+            # Чужую задачу (результаты LLM, данные соперника) не отдаём.
+            if job.user != user["nick"]:
                 raise HTTPException(404, "Job not found")
             return job.as_dict()
 
@@ -3696,7 +3831,7 @@ def create_api(
         meta = _load_job_meta(app.state.db_path, job_id)
         if meta is None:
             raise HTTPException(404, "Job not found")
-        if user is not None and meta.get("user") != user["nick"]:
+        if meta.get("user") != user["nick"]:
             raise HTTPException(404, "Job not found")
         if meta.get("status") == "running":
             # Снапшот «running», но процесса-владельца в памяти уже нет — значит
@@ -3798,7 +3933,7 @@ def create_api(
             raise RuntimeError("Game not found")
         return {
             "game": _game_dict(game),
-            "analysis": db.get_analysis(game_id),
+            "analysis": _analysis_for_user(db, game_id, user),
             "fens": _fens_for(game.moves),
         }
 
@@ -4007,6 +4142,12 @@ def create_api(
             raise HTTPException(400, "Не удалось разобрать PGN")
         with Database(app.state.db_path) as db:
             db.init_db()
+            for game in games:
+                if _analysis_has_foreign_copy(db, game.id, user["nick"]):
+                    raise HTTPException(
+                        409,
+                        "Партия с таким id уже есть в кеше другого игрока",
+                    )
             db.save_games(games, user["nick"])
         analyzed = 0
         if (analyze or "").strip().lower() in ("on", "1", "true", "yes"):
@@ -4041,6 +4182,8 @@ def create_api(
                 raise HTTPException(404, "Партия не найдена")
             if not game.moves:
                 raise HTTPException(400, "В партии нет ходов")
+            if _analysis_has_foreign_copy(db, game_id, user["nick"]):
+                raise HTTPException(409, "Партия уже есть в кеше у другого игрока")
             existing = db.get_analysis(game_id)
             if isinstance(existing, dict) and not refresh:
                 return {"analysis": existing, "cached": True}
@@ -4067,7 +4210,7 @@ def create_api(
             game = db.get_game(game_id, user["nick"])
             if game is None:
                 raise HTTPException(404, "Партия не найдена")
-            analysis = db.get_analysis(game_id)
+            analysis = _analysis_for_user(db, game_id, user["nick"])
             if not isinstance(analysis, dict):
                 return {"repeats": []}
             history = db.get_analyzed_games(user["nick"], limit=500)
@@ -4192,7 +4335,7 @@ def create_api(
             game = db.get_game(game_id, user["nick"])
             if game is None:
                 raise HTTPException(404, "Партия не найдена")
-            analysis = db.get_analysis(game_id)
+            analysis = _analysis_for_user(db, game_id, user["nick"])
         if not isinstance(analysis, dict):
             return {"review": None}
         return {"review": _review_payload(game, analysis)}
@@ -4208,7 +4351,7 @@ def create_api(
             game = db.get_game(game_id, user["nick"])
             if game is None:
                 raise HTTPException(404, "Партия не найдена")
-            analysis = db.get_analysis(game_id)
+            analysis = _analysis_for_user(db, game_id, user["nick"])
         if not isinstance(analysis, dict):
             return {"causes": {}}
         return {"causes": _causes_payload(game, analysis)}
@@ -4238,7 +4381,7 @@ def create_api(
             game = db.get_game(game_id, user["nick"])
             if game is None:
                 raise HTTPException(404, "Партия не найдена")
-            analysis = db.get_analysis(game_id)
+            analysis = _analysis_for_user(db, game_id, user["nick"])
             if not isinstance(analysis, dict):
                 raise HTTPException(400, "Сначала проанализируй партию")
             notes = db.get_move_notes(game_id, user["nick"])
@@ -4348,6 +4491,8 @@ def create_api(
         if not user:
             raise HTTPException(404, "No current user")
         if refresh in ("1", "true", "on", "yes"):
+            # humanize поднимает MaiaLite/Stockfish — это тяжёлая задача.
+            _check_job_limits(user["nick"])
             job = CoachJob(
                 id=uuid.uuid4().hex,
                 user=user["nick"],
@@ -4421,9 +4566,12 @@ def create_api(
         if not 1 <= windows <= 52:
             raise HTTPException(400, "windows должен быть от 1 до 52")
         user = _current_user(app.state.db_path, request)
+        if not user:
+            raise HTTPException(401, "Нужен вход")
+        _check_light_job_limits(user["nick"])
         job = CoachJob(
             id=uuid.uuid4().hex,
-            user=user["nick"] if user else "",
+            user=user["nick"],
             phase="Загрузка профиля FIDE",
         )
         _register_job(job)
@@ -5269,15 +5417,27 @@ def create_api(
     # --- Auth: регистрация и вход (логин+пароль+lichess) ---
     @app.post("/api/auth/register")
     def api_auth_register(
+        request: Request,
         response: Response,
         login: str = Form(""),
         password: str = Form(""),
         lichess: str = Form(""),
         fide: str = Form(""),
     ):
+        from .identity import validate_nick
+
         clean = (login or "").strip()
         if not 1 <= len(clean) <= 64:
             raise HTTPException(400, "Логин: от 1 до 64 символов")
+        if validate_nick(clean) is None:
+            raise HTTPException(
+                400, "Логин: 2–30 символов, латиница, цифры, _ и -"
+            )
+        reserved = {
+            str(item).strip().lower()
+            for item in settings.admin_nicks
+            if str(item).strip()
+        }
         if len(password or "") < 4:
             raise HTTPException(400, "Пароль: минимум 4 символа")
         lich = (lichess or "").strip()
@@ -5287,14 +5447,20 @@ def create_api(
         db = Database(app.state.db_path)
         db.init_db()
         rec = db.get_user_record(clean)
+        if rec is None and clean.lower() in reserved:
+            raise HTTPException(403, "Этот ник зарезервирован администратором")
         if rec and rec.get("password_hash"):
             raise HTTPException(409, "Логин занят")
         if rec:
-            # CLAIM: ник уже есть без пароля (старые данные) — дописываем
-            # пароль+lichess(+fide), партии и аналитика сохраняются.
-            # Неактивному пользователю доступ закрыт (как при логине).
+            # Старый профиль без пароля — потенциальный захват аккаунта.
+            # Claim разрешён только явным env-флагом для локальной миграции.
             if not _is_active_record(rec):
                 raise HTTPException(403, "Доступ ограничен")
+            if not settings.allow_legacy_claim:
+                raise HTTPException(
+                    409,
+                    "Логин уже существует; попроси администратора сбросить пароль",
+                )
             db.set_password_hash(rec["nick"], hash_password(password))
             db.set_lichess(rec["nick"], lich)
             if fide_clean:
@@ -5323,11 +5489,14 @@ def create_api(
             nick = clean
         token = secrets.token_hex(32)
         db.create_session(nick, token, days=_SESSION_DAYS)
-        _set_session_cookie(response, token)
+        _set_session_cookie(
+            response, token, secure=_request_is_https(request)
+        )
         return {"ok": True, "nick": nick}
 
     @app.post("/api/auth/login")
     def api_auth_login(
+        request: Request,
         response: Response,
         login: str = Form(""),
         password: str = Form(""),
@@ -5344,7 +5513,9 @@ def create_api(
             raise HTTPException(403, "Доступ ограничен")
         token = secrets.token_hex(32)
         db.create_session(rec["nick"], token, days=_SESSION_DAYS)
-        _set_session_cookie(response, token)
+        _set_session_cookie(
+            response, token, secure=_request_is_https(request)
+        )
         return {"ok": True, "nick": rec["nick"]}
 
     @app.post("/api/auth/logout")

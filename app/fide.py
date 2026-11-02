@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import settings
+from .paths import user_dir
 
 __all__ = [
     "FidePlayer",
@@ -220,7 +221,9 @@ def _cache_path(user: str | None = None) -> Path:
     if user:
         nick = (user or "").strip().lower()
         if nick:
-            return settings.data_dir / nick / "fide.json"
+            # user_dir отбрасывает path traversal и возвращает корень,
+            # а не пишет за пределы data_dir.
+            return user_dir(nick) / "fide.json"
     return settings.data_dir / "fide.json"
 
 

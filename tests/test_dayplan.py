@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import secrets
 import shutil
 import tempfile
 import unittest
@@ -14,7 +15,12 @@ from zoneinfo import ZoneInfo
 from fastapi.testclient import TestClient
 
 from app import timeutil
-from app.api import create_api, _maybe_snapshot_rating, _snapshot_rating_worker
+from app.api import (
+    create_api,
+    _SESSION_COOKIE,
+    _maybe_snapshot_rating,
+    _snapshot_rating_worker,
+)
 from app.db import Database, is_admin
 from app.dayplan import KINDS, build_tasks
 
@@ -255,7 +261,7 @@ class DailyPlanDbTests(unittest.TestCase):
             _maybe_snapshot_rating(self.db, "bob", "2026-10-28")
         self.assertEqual(thread_cls.call_count, 1)
 
-    def test_is_admin_by_role_and_env(self) -> None:
+    def test_is_admin_by_role_only_and_seed(self) -> None:
         self.db.upsert_user("alice")
         self.db.upsert_user("carol")
         self.assertFalse(is_admin(self.db, "carol"))
@@ -265,12 +271,20 @@ class DailyPlanDbTests(unittest.TestCase):
             )
         self.assertTrue(is_admin(self.db, "alice"))
 
+        # Env-ник сам по себе прав не даёт; он лишь seed для существующего
+        # профиля и не создаёт запись.
         with patch(
             "app.db.settings", SimpleNamespace(admin_nicks=("Boss",))
         ):
-            self.assertTrue(is_admin(self.db, "boss"))
-            self.assertTrue(is_admin(self.db, "BOSS"))
+            self.assertFalse(is_admin(self.db, "boss"))
+            self.assertFalse(is_admin(self.db, "BOSS"))
             self.assertFalse(is_admin(self.db, "carol"))
+
+        self.db.promote_admin_nicks(("boss",))
+        self.assertFalse(is_admin(self.db, "boss"))
+        self.db.upsert_user("boss")
+        self.db.promote_admin_nicks(("boss",))
+        self.assertTrue(is_admin(self.db, "boss"))
 
 
 class AdminCohortApiTests(unittest.TestCase):
@@ -313,6 +327,9 @@ class AdminCohortApiTests(unittest.TestCase):
                     "UPDATE users SET role = 'admin' WHERE nick_lower = 'boss'"
                 )
             db.set_current_user("boss")
+            token = secrets.token_hex(32)
+            db.create_session("boss", token, days=30)
+        self.client.cookies.set(_SESSION_COOKIE, token)
 
         resp = self.client.get("/api/admin/cohort?days=30")
         self.assertEqual(resp.status_code, 200, resp.text)

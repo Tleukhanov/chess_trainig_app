@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import shutil
 import tempfile
 import unittest
@@ -20,7 +21,7 @@ import chess
 from fastapi.testclient import TestClient
 
 from app import theory
-from app.api import create_api
+from app.api import create_api, _SESSION_COOKIE
 from app.config import settings
 from app.db import Database
 
@@ -260,9 +261,12 @@ class TheoryApiTests(unittest.TestCase):
         self.client = TestClient(self.app)
 
     def _set_current(self, nick: str = "Alice") -> None:
+        token = secrets.token_hex(32)
         with Database(self.db_path) as db:
             db.init_db()
             db.set_current_user(nick)
+            db.create_session(nick, token, days=30)
+        self.client.cookies.set(_SESSION_COOKIE, token)
 
     def test_get_theory_auth_and_invalid_fen(self) -> None:
         resp = self.client.get("/api/theory", params={"fen": START_FEN, "plies": 3})

@@ -816,6 +816,14 @@ class Database:
             ).fetchall()
         return [_row_to_game(row) for row in rows]
 
+    def game_players(self, game_id: str) -> list[str]:
+        """Все игроки, у которых в кеше есть копия партии с этим id."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT player FROM games WHERE id = ?", (game_id,)
+            ).fetchall()
+        return [str(row["player"]) for row in rows]
+
     def get_game(self, game_id: str, user: str | None = None) -> Game | None:
         """Возвращает одну партию по id.
 
@@ -1144,6 +1152,57 @@ class Database:
                 "ORDER BY u.bound_at ASC, u.nick_lower ASC"
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def promote_admin_nicks(self, nicks: tuple[str, ...] | list[str]) -> None:
+        """Выставляет role='admin' уже существующим профилям из env.
+
+        Новые записи не создаются: иначе регистрация свободного ника из
+        ``ADMIN_NICKS`` получила бы админку. Идемпотентно.
+        """
+        keys = []
+        for nick in nicks or ():
+            key = (nick or "").strip().lower()
+            if key:
+                keys.append(key)
+        if not keys:
+            return
+        with self._connection() as conn:
+            for key in keys:
+                conn.execute(
+                    "UPDATE users SET role = 'admin' WHERE nick_lower = ?",
+                    (key,),
+                )
+
+    def bootstrap_admin_nicks(
+        self, nicks: tuple[str, ...] | list[str], password: str = ""
+    ) -> None:
+        """Seed админов: существующим — role, отсутствующим — профиль по паролю.
+
+        Пароль нужен только для первого запуска на пустой БД; на существующий
+        профиль он не перезаписывается. Без пароля новые записи не создаются.
+        """
+        for nick in nicks or ():
+            clean = (nick or "").strip()
+            if not clean:
+                continue
+            rec = self.get_user_record(clean)
+            if rec is None:
+                if not password:
+                    continue
+                self.upsert_user(clean)
+                self.set_password_hash(clean, hash_password(password))
+                self.set_lichess(clean, clean)
+            elif not rec.get("password_hash") and password:
+                # Старый админ без пароля: даём bootstrap-пароль, не трогая
+                # уже установленный.
+                self.set_password_hash(rec["nick"], hash_password(password))
+                if not (rec.get("lichess") or "").strip():
+                    self.set_lichess(rec["nick"], rec["nick"])
+            with self._connection() as conn:
+                conn.execute(
+                    "UPDATE users SET role = 'admin' WHERE nick_lower = ?",
+                    (clean.lower(),),
+                )
 
     def get_current_user(self) -> dict[str, Any] | None:
         """Закреплённый на прошлых запусках игрок (профиль) или None."""
@@ -1932,6 +1991,41 @@ class Database:
             conn.execute("DELETE FROM middlegame_sessions WHERE LOWER(player) = LOWER(?)", (key,))
             conn.execute("DELETE FROM task_explanations WHERE LOWER(player) = LOWER(?)", (key,))
             conn.execute("DELETE FROM move_notes WHERE LOWER(player) = LOWER(?)", (key,))
+            conn.execute('DELETE FROM daily_plan WHERE LOWER("user") = LOWER(?)', (key,))
+            conn.execute('DELETE FROM daily_log WHERE LOWER("user") = LOWER(?)', (key,))
+            conn.execute('DELETE FROM rating_snapshots WHERE LOWER("user") = LOWER(?)', (key,))
+            # Meta-ключи пользователя: трекер, задачи, план, intent-review,
+            # job-снапшоты. Без этого новый владелец ника наследует старые
+            # приватные результаты.
+            meta_rows = conn.execute("SELECT key, value FROM meta").fetchall()
+            for meta_row in meta_rows:
+                meta_key = str(meta_row["key"] or "")
+                meta_low = meta_key.lower()
+                meta_value = str(meta_row["value"] or "")
+                drop = False
+                if meta_low == _CURRENT_USER_KEY.lower():
+                    drop = meta_value.strip().lower() == key
+                elif meta_low.startswith("job:"):
+                    try:
+                        payload = json.loads(meta_value)
+                    except (TypeError, ValueError):
+                        payload = None
+                    drop = (
+                        isinstance(payload, dict)
+                        and str(payload.get("user") or "").strip().lower() == key
+                    )
+                elif meta_low.startswith("intent_review:"):
+                    parts = meta_low.split(":", 2)
+                    drop = len(parts) > 1 and parts[1] == key
+                elif meta_low in (f"plan_goal_{key}", f"plan_llm_{key}"):
+                    drop = True
+                elif meta_low.startswith(
+                    ("daily_task_", "daily_done_", "site_time_",
+                     "lichess_manual_", "rating_snapshot_try_")
+                ) and meta_low.endswith("_" + key):
+                    drop = True
+                if drop:
+                    conn.execute("DELETE FROM meta WHERE key = ?", (meta_key,))
             cur = conn.execute("DELETE FROM users WHERE nick_lower = ?", (key,))
         if is_current:
             self.clear_current_user()
@@ -1956,22 +2050,16 @@ class Database:
 
 
 def is_admin(db: Database, nick: str | None) -> bool:
-    """Админ ли игрок: ``users.role == 'admin'`` или ник в ``ADMIN_NICKS``.
+    """Админ ли игрок: только ``users.role == 'admin'``.
 
-    Env-список нужен демо-стенду: роль в БД можно не выставлять, достаточно
-    ``ADMIN_NICKS=nick1,nick2``. Сравнение ников регистронезависимое.
+    ``ADMIN_NICKS`` — не источник прав, а seed для существующих профилей
+    (см. :meth:`Database.promote_admin_nicks`). Иначе свободный ник из env
+    можно было бы зарегистрировать и сразу получить админку.
     """
     clean = (nick or "").strip()
     if not clean:
         return False
     record = db.get_user_record(clean)
-    if record is not None:
-        role = str(record.get("role") or "").strip().lower()
-        if role == "admin":
-            return True
-    allowed = {
-        str(item).strip().lower()
-        for item in (getattr(settings, "admin_nicks", ()) or ())
-        if str(item).strip()
-    }
-    return clean.lower() in allowed
+    if record is None:
+        return False
+    return str(record.get("role") or "").strip().lower() == "admin"
