@@ -25,6 +25,9 @@ Security hardening before a public deployment.
   `X-Forwarded-Proto` behind a proxy.
 - A PGN import cannot reuse a game id already cached by another player;
   analysis is hidden if a foreign copy exists.
+- README refreshed for the current web + CLI product, security/bootstrap
+  settings and deployment requirements; `python -m trainer --version` now
+  reports 0.9.11.
 - 892 tests pass.
 
 ## 0.9.10 — 2026-10-30

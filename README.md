@@ -1,351 +1,269 @@
 # Chess Trainer
 
-Персональный шахматный тренер: парсит партии с Lichess, анализирует через Stockfish,
-объясняет ошибки с помощью LLM (OpenRouter/любой OpenAI-совместимый провайдер),
-строит дебютный репертуар и генерирует дрели из собственных зевков.
+Персональный шахматный тренер для игроков **1600–2400**: забирает партии с Lichess,
+считает Stockfish, объясняет ошибки без «воды», собирает дебютный репертуар,
+готовит к сопернику и тренирует на твоих же зевках.
 
-Цель концепции — принцип 80/20: минимум времени, максимум роста (до уровня КМС).
+Веб-приложение и CLI работают с одним кешем: разбор в браузере сразу доступен
+из терминала.
 
-## Статус
+> Текущая версия: **0.9.11**. История изменений — [CHANGELOG.md](CHANGELOG.md).
 
-- [x] M0.0 Скелет проекта + окружение (git, venv, Stockfish)
-- [x] M0.A Клиент Lichess (выгрузка партий)
-- [x] M0.B Stockfish-анализ + классификация ходов
-- [x] M0.C SQLite-кеш
-- [x] M0.D CLI-отчёт (`coach`)
-- [x] M1 LLM-коуч (`review`: OpenRouter или любой OpenAI-compat, grounding по Stockfish)
-- [x] M2 Слабости и дрели (`coach` — узоры/фазы, `drills` — PGN/JSON)
-- [x] M3 Человеческий слой (`humanize`: Maia/MaiaLite, фильтр дрелей по вердикту)
-- [x] M4 Дебютный репертуар
-- [x] M5 Динамика прогресса (`progress`: метрики по окнам, тренд, вердикт)
-- [x] M6 FIDE-профиль и разбор турнира (`fide`, `tournament`)
-- [x] M7 Подготовка к сопернику (`prepare`)
-- [x] M8 Дрели под соперника (`drills --opponent/--focus`)
-- [x] M9 Мульти-пользователи и CLI `user`
+## Что это
 
-## Версии
+- **FastAPI + vanilla JS** — без сборки фронтенда и тяжёлых фреймворков.
+- **SQLite** по умолчанию, **PostgreSQL** через `DATABASE_URL`.
+- **Stockfish** — оценки, классификация ходов, варианты.
+- **Maia-2 ONNX** — человеко-подобный соперник и оценка «человечности» ошибок.
+- **LLM опционально** — только для тренерских текстов и идей, не для конкретных
+  ошибок: причина хода строится из FEN/SAN/линии движка.
 
-Проект версионируется по SemVer: текущая версия — **v0.4.0**
-(`python -m trainer --version`). Пока проект в разработке (0.x), минорная
-версия растёт на каждом крупном милестоуне, патч — на фиксах. Дальше
-продолжаем расти: v0.5.0 и так далее.
+## Что умеет
 
-Фронтенд (SPA) версионируется отдельно: текущая версия ассетов — **v0.5.4** (см. query-параметры `?v=` в `frontend/index.html`).
+### Веб
 
-- **v0.4.0** — милестоун M9: мульти-пользователи. База переведена на составной
-  ключ `(id, user)`, появились профили `users`/`meta` и команда
-  `user list|whoami|add|switch`; `--user` стал необязательным — кого использовать
-  спрашиваем один раз в TTY и запоминаем.
+- вход/регистрация, несколько профилей, админ-когорта;
+- дашборд, план дня, прогресс, задача дня;
+- список партий и разбор с доской, графиком и комментариями;
+- ошибки в разборе: **значок → класс хода → короткое «почему»**, цифры и PV —
+  под «Детали движка»;
+- отчёт по дебюту: лучший ход, линия, потеря win%, объяснение и переход к позиции;
+- тренажёр миттельшпиля;
+- репертуар, подготовка к сопернику, человечность, FIDE, турнир;
+- светлая/тёмная тема.
 
-- **v0.3.0** — милестоун M8: дрели под конкретного соперника
-  (`drills --opponent RIVAL --focus mine|his|both`) из уже кешированных партий,
-  без Stockfish и сети.
-- **v0.2.0** — милестоун M7: подготовка к конкретному сопернику (`prepare`) и
-  честные названия метрик (`avg_win_loss` вместо ACPL, `avg_win_before` вместо
-  «точности»).
-- **v0.1.0** — милестоуны M0–M6: окружение и Stockfish, клиент Lichess,
-  SQLite-кеш, CLI (`coach`), LLM-коуч (`review`), слабости и дрели,
-  человеческий слой (`humanize`), дебютный репертуар, динамика прогресса
-  (`progress`), FIDE-профиль с трендом рейтинга (`fide`) и разбор
-  турнира (`tournament`).
+### Анализ
 
-## Метрики: почему не ACPL
+- Stockfish depth 14 / multipv 3 по умолчанию; профили `quick` (10/1),
+  `standard` (12/2), `deep` (14/3).
+- Классы ходов: `best/good/inaccuracy/mistake/blunder`, упущенные выигрыши.
+- `avg_win_loss` — средняя потеря win% на ход; `avg_win_before` — средний win%
+  перед ходом. Это не ACPL и не «точность»; старые ключи кеша читаются.
+- Разбор дебюта считается **одним детерминированным проходом** Stockfish:
+  depth 18, `threads=1`, без ограничения времени.
 
-Раньше средняя потеря win% за ход игрока называлась ACPL, а средний win% перед
-ходом — «точностью». Это было неверно: ACPL у Lichess — средняя потеря **в
-центпойнах**, а «точность» не имеет ничего общего с win%. Теперь в отчётах,
-JSON и подсказках для LLM:
+### Тренировка
 
-- `avg_win_loss` — средняя потеря win% на ход игрока (то, что раньше ACPL);
-- `avg_win_before` — средний win% перед ходом игрока (то, что раньше «точность»).
+- Дрели из своих ошибок → PGN/JSON для Lichess.
+- Дрели под конкретного соперника: его ошибки + твои провалы в матчах с ним.
+- Задача дня с проверкой ответа и объяснением после ответа.
+- План и недельный фокус по слабым фазам/дебютам.
+- Человечность ошибок: `natural / borderline / unnatural`; фильтр дрелей.
 
-Старые записи в кеше читаются как раньше: `app/metrics.py` подставляет
-исторические ключи `acpl`/`accuracy`, пересчитывать базу не нужно.
+### Дебюты и соперники
 
-## Возможности M0
+- Личный репертуар по твоим партиям, слабые ветви, экспорт PGN/JSON.
+- Maia-2 как соперник выбранной силы.
+- Подготовка к сопернику: его репертуар, слабости, точки встречи.
+- FIDE-профиль и тренд рейтинга через публичный Lichess-прокси, без токена.
 
-- Выгрузка рейтинговых партий с Lichess (`rapid/blitz/classical`).
-- Анализ Stockfish: средняя потеря win% на ход (`avg_win_loss`, раньше ACPL),
-  классификация ходов
-  (best/good/inaccuracy/mistake/blunder по порогам Lichess), упущенные выигрыши.
-- Локальная классификация дебютов по ходам партии
-  (датасет [lichess-org/chess-openings](https://github.com/lichess-org/chess-openings), CC0).
-- Кеш партий и анализа в SQLite: повторные отчёты мгновенны.
-- Русскоязычный текстовый отчёт + JSON.
+### CLI
 
-## Возможности M2
+```bash
+python -m trainer web
+python -m trainer coach --user NICK
+python -m trainer review --user NICK
+python -m trainer drills --user NICK
+python -m trainer prepare --user NICK --opponent RIVAL
+python -m trainer humanize --user NICK
+python -m trainer repertoire --user NICK
+python -m trainer plan --user NICK
+python -m trainer overview --user NICK
+python -m trainer progress --user NICK
+python -m trainer fide --id FIDE_ID
+python -m trainer tournament --games "Ivan:white:win:2100"
+python -m trainer user list
+```
 
-- «Слабости по фазам»: распределение зевков/ошибок по дебюту, миттельшпилю и
-  эндшпилю со средними потерями win% — добавляется в отчёт `coach`.
-- «Узоры ошибок»: классификация каждой ошибки по мотиву
-  (вилка, связка, висячая фигура, пропущенный мат) со статистıкой по встречаемости.
-- Генерация дрелей из собственных ошибок: `python -m trainer drills --user NICK`
-  выбирает позиции, где ты зевнул/ошибся при ясном перевесе, и собирает их в
-  `data/drills.pgn` (можно импортировать в Lichess) или `.json` — каждая дрель
-  с FEN, лучшим ходом движка и линией.
+Полный список флагов: `python -m trainer <команда> --help`.
 
-## Возможности M3
+## Стек
 
-- Оценка «человечности» каждой ошибки: насколько её сделал бы человек твоего уровня.
-  Вердикты: **неестественная** (явно исправимая тактика — тренировать в первую
-  очередь) / **пограничная** / **естественная** (сам движок-человек её допустил).
-- Два движка-политики:
-  - `MaiaLite` (по умолчанию) — мягкое «человекоподобное» распределение Stockfish
-    (температура `--temperature`, по умолчанию 15), работает прямо сейчас;
-- реальная **Maia** (`--engine maia`) — подключается если задать `MAIA_PATH`
-  на бинарь с maia-chess.net (иначе переключение на MaiaLite с предупреждением).
-- `python -m trainer humanize` считает человечность всех твоих зевков/ошибок из
-  кеша и пишет `data/humanity.json`, а `drills --verdict unnatural` собирает
-  дрели только из самых «неестественных» промахов.
+| Слой | Что используется |
+|---|---|
+| Backend | Python 3.12, FastAPI, Uvicorn |
+| Frontend | HTML/CSS/JS без сборки |
+| БД | SQLite или PostgreSQL (`DATABASE_URL`) |
+| Движки | Stockfish, Maia-2 ONNX |
+| LLM | любой OpenAI-совместимый API (OpenRouter по умолчанию) |
+| Тесты | pytest |
 
-## Возможности M4
+## Быстрый старт
 
-- Личный дебютный репертуар по ТВОИМ ходам из проанализированных партий:
-  `python -m trainer repertoire --user NICK` печатает деревья твоих линий
-  отдельно для белых и чёрных с числом партий и прочностью линии
-  (накопительная доля хороших ходов по всему пути), помечая слабые линии
-  («⚠ слабое место»).
-- Таблица «Слабые места репертуара»: дебюты с наибольшим числом зевков/ошибок
-  на партию и средними потерями win% — куда смотреть в первую очередь.
-- Экспорт: `data/repertoire_white.pgn` / `data/repertoire_black.pgn`
-  (импорт в Lichess) и `data/repertoire.json`; фильтр по фрагментам имён
-  дебютов `--opening` и глубина дерева `--max-depth` (ходов пользователя).
-- `plan` — план тренировки из кеша без движка: частые ветви репертуара,
-  слабые дебюты, узоры ошибок и фазы, человечность и дрели одним блоком.
-- `mentor` — LLM-тренер: собирает ту же сводку из кеша и через OpenRouter
-  (или любой OpenAI-совместимый API) даёт разговорный разбор твоего стиля
-  игры и персональный план тренировки, учитывая доп. заметки игрока
-  (`--notes`). Модель, ключ и URL — из env (`LLM_MODEL`, `LLM_API_KEY`,
-  `LLM_BASE_URL`) или флагов `--model/--key/--base-url`.
-- `overview` — быстрая сводка тренера (ветви, слабые дебюты, человечность,
-  число дрелей) по кешу.
-- `progress` — динамика прогресса: партии разбиваются на временные окна
-  (по числу партий, устойчиво к редким месяцам), для каждого окна считаются
-  очки, средняя потеря win% на ход, средний win% перед ходом, зевки/ошибки на
-  партию, доля неестественных промахов
-  и средний рейтинг; в конце — тренд первого и последнего окна и общий
-  вердикт (улучшение / спад / стабильно). Тренд также добавляется в запрос
-  `mentor` (отключить: `--no-progress`).
+### Linux / macOS
 
-## Возможности M6
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 
-- `fide` — профиль и тренд рейтинга FIDE **без токена** (через публичный
-  Lichess-прокси): `python -m trainer fide --id 1503014`. Печатает страну,
-  год рождения, текущий рейтинг (классика/рапид/блиц) и тренд по временным
-  окнам (`--windows`, по умолчанию 4). Ответы кешируются в `data/fide.json`,
-  так что повторный запуск не ходит в сеть; без кеша и без сети команда
-  завершается понятной ошибкой, а не трассировкой.
-- `tournament` — разбор очного турнира (OTB) **полностью офлайн**: ручной ввод
-  результатов вида `--games "Иванов:white:win:2100" --games "Петров:black:draw:2050"`
-  (`opponent:color:result[:рейтинг]`, `color` — `white`/`black`, `result` —
-  `win`/`draw`/`loss`), опционально начальный рейтинг `--initial 2000`.
-  Считает очки, средний рейтинг соперников, перформанс и прирост по K=20.
-- Обе команды умеют `--json ПУТЬ` — выгрузка отчёта в JSON (`ensure_ascii=False`).
+python tools/fetch_maia_onnx.py
+python -m trainer web
+```
 
-## Возможности M7
+Открой `http://127.0.0.1:8000`.
 
-- `prepare` — лист подготовки к конкретному сопернику по его собственным партиям:
-  `python -m trainer prepare --user ТЫ --opponent СОПЕРНИК`.
-  Чужие партии выгружаются с Lichess, анализируются Stockfish и кладутся в тот же
-  кеш, но **под ником соперника** (`games.user`), поэтому твои `coach`,
-  `overview` и `progress` их не видят. По умолчанию берётся 30 партий
-  (`--max`, настройка `GAMES_OPPONENT_MAX`) — полная выгрузка слишком долгая,
-  а 30 партий хватает, чтобы увидеть репертуар.
-- В листе: очки, рейтинг и его динамика, разбивка по цветам и контролю времени,
-  тренд качества игры, его репертуар по дебютным семействам (с частым вариантом),
-  точки встречи и вердикт по каждому столкновению, фазы и мотивы, где он ошибается
-  больше всего.
-- **Точки встречи** — самое полезное: его дебютные семейства сопоставляются с
-  твоими по **противоположному цвету** (он белыми играет Сицилианскую — ты
-  отвечаешь ей чёрными) и по **семейству** (часть имени до `:`), потому что
-  полные названия вариантов у разных людей не совпадают. По каждой точке видно,
-  сколько партий за твоим ходом, какой он прочный и чьи ошибки больше: твоя
-  слабость, его слабость или примерно поровну. Точки, где у тебя меньше двух
-  партий с этим ходом, не показываются: единичный повтор ничего не значит.
-- Флаги: `--color white|black|both` (смотреть только на один его цвет),
-  `--top N` (сколько дебютов и столкновений), `--cached-only` (без сети),
-  `--refresh` (переанализировать заново), `--no-save` (не писать в кеш),
-  `--json ПУТЬ`.
-- Метрики переименованы честно: `avg_win_loss` и `avg_win_before` вместо ACPL
-  и «точности», см. раздел выше; старые записи кеша читаются без пересчёта.
-
-## Возможности M8
-
-- `drills --opponent` — дрели под конкретный матч, **полностью офлайн**:
-  ни Stockfish, ни сети. Требует только кеш: сначала прогони
-  `prepare --user ТЫ --opponent СОПЕРНИК`, чтобы его партии лежали под его ником.
-  `python -m trainer drills --user ТЫ --opponent СОПЕРНИК`.
-- `--focus mine|his|both` (по умолчанию `both`):
-  - `mine` — твои провалы **в матчах с ним** (берутся только партии, где он твой
-    соперник, а не все твои игры);
-  - `his` — его собственные ошибки, отсортированные по потере win%: это
-    наказания за его слабость, сначала играй их;
-  - `both` — оба набора, сначала его (так быстрее растёт твой win%).
-- Обычные флаги `drills` работают как раньше (`--limit`, `--min-drop`,
-  `--min-win`, `--max-per-game`, `--verdict`, `--out`). Фильтр вердиктов
-  применяется только к тому набору, который покрыт `humanity.json`; если
-  человечность не покрывает партии — дрели отбираются без неё, а лист
-  предупредит об этом. `--out` по умолчанию `data/drills_vs_<СОПЕРНИК>.pgn`.
-  `--game` с `--opponent` несовместимы (набор и так узкий), а `--focus` без
-  `--opponent` — ошибка, а не молчаливый игнор.
-- В листе: счётчики обоих наборов, дебютные семейства «сначала эти» (его — как
-  наказания, твои — как провалы), и мотивы его ошибок.
-
-## Возможности M9
-
-- Несколько игроков в одной базе: партии помечаются ником `user`, ключ партии
-  стал составным `(id, user)` — при подготовке к сопернику его игры больше не
-  мешают твоим, а анализ ссылается на партию без жёсткой привязки к владельцу.
-- Профили: команда `user` — `list` (ник, FIDE ID, число партий и анализов,
-  закреплённый помечен `*`), `whoami`, `add NICK [--fide ID]` (регистрирует и
-  закрепляет), `switch [NICK]` (сменить закреплённого; без ника — выбор из
-  списка).
-- `--user` больше не обязателен: фиксированный пользователь спрашивается один
-  раз (или вписывается «вручную» при старте в TTY) и запоминается в `meta` как
-  `current_user`; новые партии/арт-факты идут под ним. Флаг `--yes` глушит
-  вопросы для скриптов; конфликт `--user X` против закреплённого Y в не-TTY
-  просто уведомляет и работает от `--user X`.
-- Миграция v0.3 → v0.4 автоматическая при первом запуске: профили заводятся из
-  ник-колонки уже кешированных партий, данные не трогаются.
-
-## Возможности M1
-
-- LLM-коуч на любом OpenAI-совместимом API (по умолчанию OpenRouter; можно указать
-  свою базу/модель — поддерживаются и локальные модели вроде Ollama).
-- Отбор ключевых моментов партии (зевки/ошибки/упущенные выигрыши) и объяснение
-  каждого на русском в 2–4 предложениях + итог по партии.
-- Grounding: модель получает только факты движка (ход, оценки до/после, лучший ход
-  и вариант, продолжение партии) и ей запрещено выдумывать оценки.
-- `review --dry-run` печатает готовые промпты без обращения к API.
-
-## Веб-интерфейс
-
-Веб-версия тренера: бэкенд — чистый JSON API (`app/api.py`, FastAPI),
-фронтенд — отдельная папка `frontend/` (vanilla JS/CSS, без сборки и фреймворков).
-Одинаковые данные с CLI: тот же кеш, та же БД, общий слой `app/data.py`.
-
-Страницы: Дашборд, Обзор, План, Прогресс, **Партии** (список + просмотр разбора:
-доска, ходы с подсветкой своих ошибок, метрики), Дрели, Анализ (фоновый разбор
-движком с прогрессом), **Инструменты** (репертуар, подготовка к сопернику,
-человечность, турнир, FIDE, LLM-разбор «Разбор» и LLM-тренер «Тренер»),
-Профили (добавить/переключить/удалить, FIDE ID). Светлая и тёмная тема
-(переключатель в шапке).
-
-API: профили (`/api/user/*`), отчёты (`/api/overview|plan|progress|drills|report`),
-партии (`/api/games`, `/api/games/{id}` — с FEN по ходам), выгрузки
-(`/api/drills.pgn|json`), инструменты (`/api/repertoire|humanize|tournament|...`),
-долгие операции — через `POST /api/*/run` → `GET /api/jobs/{id}` (анализ, соперник,
-LLM), документация — `GET /api/docs`.
-
-Запуск: `python -m trainer web` (порт 8000, откроется браузер), `--port 9000`,
-`--no-browser` — без автозапуска браузера.
-
-## Установка
+### Windows
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+
+python tools\fetch_maia_onnx.py
+python -m trainer web
 ```
 
-Stockfish: скачать с <https://stockfishchess.org/download/windows/> и положить в
-`C:\Users\huawei\Stockfish\` (путь по умолчанию указан в `app/config.py`) или
-задать переменную `STOCKFISH_PATH`.
+Если русский текст в консоли ломается — `chcp 65001` или `PYTHONUTF8=1`.
 
-Если русский текст в консоли выводится кракозябрами — выполни `chcp 65001`
-или запусти `python` с `PYTHONUTF8=1`.
+## Stockfish
+
+Нужен бинарь Stockfish. Варианты:
+
+- Linux: `sudo apt install stockfish`, затем `STOCKFISH_PATH=/usr/games/stockfish`;
+- Windows/macOS: скачать с <https://stockfishchess.org/download/> и указать
+  `STOCKFISH_PATH` в `.env`;
+- если `STOCKFISH_PATH` не задан, приложение ищет `stockfish` в `PATH`.
+
+Проверка:
+
+```bash
+stockfish --version
+```
+
+## Maia-2
+
+Модель и словари скачиваются в `data/maia/`:
+
+```bash
+python tools/fetch_maia_onnx.py
+```
+
+Путь можно переопределить через `MAIA_ONNX_PATH` / `MAIA_DIR`. Модель нужна
+для тренажёра дебютов и человечности; без неё остальной анализ работает.
 
 ## Конфигурация
 
-Все настройки через переменные окружения (см. `app/config.py`). Пример — файл `.env`.
+Все настройки — через переменные окружения (см. `app/config.py`). Создай `.env`
+в корне репозитория; **не коммить его**.
 
-Админы: `ADMIN_NICKS=nick1,nick2` только повышает **уже существующие** профили
-при старте. Для первого запуска на пустой БД задай `ADMIN_BOOTSTRAP_PASSWORD`
-— отсутствующий админ будет создан с этим паролем; после входа смени пароль.
-`ALLOW_LEGACY_CLAIM=1` включает захват старых профилей без пароля; включай
-только на короткое окно миграции.
+Минимально:
 
-## Использование
+```dotenv
+LLM_API_KEY=
+LLM_BASE_URL=https://openrouter.ai/api/v1
+LLM_MODEL=openai/gpt-4o-mini
 
-```powershell
-# Анализ Stockfish + текстовый отчёт (слабости по фазам, узоры ошибок)
-python -m trainer coach --user YOUR_LICHESS_NICK
-
-# Дрели из своих ошибок (PGN — импортируй на lichess.org/analysis)
-python -m trainer drills --user YOUR_LICHESS_NICK --out data/drills.pgn
-python -m trainer drills --user YOUR_LICHESS_NICK --out data/drills.json --min-drop 10
-
-# Дрели под матч (из кеша, без сети): его ошибки + твои провалы против него
-python -m trainer prepare --user YOUR_LICHESS_NICK --opponent RIVAL_NICK
-python -m trainer drills --user YOUR_LICHESS_NICK --opponent RIVAL_NICK
-python -m trainer drills --user YOUR_LICHESS_NICK --opponent RIVAL_NICK --focus his
-
-# Человеческий слой: человечность ошибок + дрели только «неестественных»
-python -m trainer humanize --user YOUR_LICHESS_NICK
-python -m trainer drills --user YOUR_LICHESS_NICK --verdict unnatural
-
-# Дебютный репертуар (деревья линий, слабые дебюты, PGN/JSON)
-python -m trainer repertoire --user YOUR_LICHESS_NICK
-python -m trainer repertoire --user YOUR_LICHESS_NICK --color black --max-depth 10
-python -m trainer repertoire --user YOUR_LICHESS_NICK --opening "Sicilian" --no-write
-
-# LLM-разбор ключевых моментов (из кеша; без ключа — только --dry-run)
-python -m trainer review --user YOUR_LICHESS_NICK
-python -m trainer review --user YOUR_LICHESS_NICK --dry-run   # промпты без вызова API
-python -m trainer review --game GAME_ID                       # одна партия по id
-
-# План тренировки и сводка (из кеша, без движка и сети)
-python -m trainer plan --user YOUR_LICHESS_NICK
-python -m trainer overview --user YOUR_LICHESS_NICK
-
-# Динамика прогресса: метрики по временным окнам (потеря win% на ход, win%
-# перед ходом, зевки/игру, человечность, рейтинг) и тренд «первое → последнее окно»
-python -m trainer progress --user YOUR_LICHESS_NICK
-python -m trainer progress --user YOUR_LICHESS_NICK --windows 3
-python -m trainer progress --user YOUR_LICHESS_NICK --json data/progress.json
-
-# Подготовка к сопернику: его репертуар, слабости и твои ответы на его дебюты
-python -m trainer prepare --user YOUR_LICHESS_NICK --opponent RIVAL
-python -m trainer prepare --user YOUR_LICHESS_NICK --opponent RIVAL --max 30 --perf rapid
-python -m trainer prepare --user YOUR_LICHESS_NICK --opponent RIVAL --cached-only
-python -m trainer prepare --user YOUR_LICHESS_NICK --opponent RIVAL --color white --json data/prep.json
-
-# LLM-тренер: расскажет стиль игры и составит персональный план,
-# учитывая твои доп. заметки (цели, время, слабые места — передай через --notes)
-python -m trainer mentor --user YOUR_LICHESS_NICK
-python -m trainer mentor --user YOUR_LICHESS_NICK --notes "Хочу усилить эндшпиль, 30 мин/день"
-python -m trainer mentor --user YOUR_LICHESS_NICK --dry-run   # промпт без вызова API
-python -m trainer mentor --user YOUR_LICHESS_NICK --json data/mentor.json
-# модель/ключ/URL — из env LLM_MODEL, LLM_API_KEY, LLM_BASE_URL (или флаги --model/--key/--base-url)
-
-# FIDE-профиль и тренд рейтинга (без токена, через Lichess-прокси; кеш в data/fide.json)
-python -m trainer fide --id YOUR_FIDE_ID
-python -m trainer fide --id YOUR_FIDE_ID --windows 6 --json data/fide.json
-
-# Мульти-пользователи: --user теперь не обязателен, фиксированный игрок
-# запоминается. Команда user, чтобы посмотреть/добавить/переключить профили.
-python -m trainer user list
-python -m trainer user whoami
-python -m trainer user add NICK --fide YOUR_FIDE_ID
-python -m trainer user switch RIVAL            # сменить закреплённого
-python -m trainer coach --user NICK            # явно указать игрока
-python -m trainer coach --yes --user NICK      # без единого вопроса (для скриптов)
-
-# Турнир OTB: ручной ввод результатов, перформанс и прирост рейтинга (без сети)
-python -m trainer tournament --games "Иванов:white:win:2100" --games "Петров:black:draw:2050" --initial 2000
-python -m trainer tournament --games "Иванов:white:win:2100" --json data/tournament.json
-
-# Веб-интерфейс: JSON API + SPA-фронт (http://127.0.0.1:8000)
-python -m trainer web
-python -m trainer web --port 9000 --no-browser
-
-# Тесты
-python -m unittest discover -s tests -v
+LICHESS_TOKEN=
+STOCKFISH_PATH=/usr/games/stockfish
+APP_TZ=Asia/Almaty
 ```
 
-Для дрелей с полными линиями движка переанализируй кеш:
-`python -m trainer coach --user NICK --refresh` (линии `best_line` появляются
-только в анализах, сделанных после M1).
+Основные переменные:
 
-LLM-ключ: положи `LLM_API_KEY` в `.env` (корень репо). Опционально
-`LLM_BASE_URL=https://openrouter.ai/api/v1` и `LLM_MODEL`.
+| Переменная | По умолчанию | Зачем |
+|---|---|---|
+| `LLM_API_KEY` | пусто | тренерские тексты; без ключа часть LLM-функций отключена |
+| `LLM_MODEL` | `openai/gpt-4o-mini` | модель OpenAI-совместимого API |
+| `LLM_BASE_URL` | OpenRouter | база API |
+| `LICHESS_TOKEN` | пусто | приватные/лимитированные запросы Lichess |
+| `STOCKFISH_PATH` | поиск в `PATH` | путь к бинарю |
+| `STOCKFISH_DEPTH` | `14` | глубина анализа партии |
+| `STOCKFISH_MULTIPV` | `3` | число линий |
+| `STOCKFISH_THREADS` | `4` | потоки Stockfish |
+| `STOCKFISH_HASH_MB` | `512` | hash Stockfish |
+| `STOCKFISH_TIME_MS` | `3000` | лимит на позицию, мс |
+| `APP_TZ` | `Asia/Almaty` | даты задачи/плана/прогресса |
+| `DATABASE_URL` | пусто | PostgreSQL вместо SQLite |
+| `ADMIN_NICKS` | пусто | seed-список админов |
+| `ADMIN_BOOTSTRAP_PASSWORD` | пусто | первый админ на пустой БД |
+| `ALLOW_LEGACY_CLAIM` | `0` | временный claim старых профилей без пароля |
+| `MAIA_ONNX_PATH` | `data/maia/maia2-rapid.onnx` | модель Maia |
+
+### Админы
+
+`ADMIN_NICKS=nick1,nick2` повышает **только уже существующие** профили при
+старте. Для первого запуска на пустой базе:
+
+```dotenv
+ADMIN_NICKS=boss
+ADMIN_BOOTSTRAP_PASSWORD=change-me-after-login
+```
+
+После входа смени пароль. `ALLOW_LEGACY_CLAIM=1` включай только на короткое
+окно миграции.
+
+## Запуск
+
+```bash
+# CLI + браузер
+python -m trainer web
+
+# без автозапуска браузера
+python -m trainer web --port 9000 --no-browser
+
+# напрямую Uvicorn (для сервера)
+uvicorn app.api:create_api --factory --host 0.0.0.0 --port 8000
+```
+
+## API
+
+- Swagger/OpenAPI: `GET /api/docs`.
+- Авторизация — cookie-сессия; приватные эндпоинты без неё возвращают 401/404.
+- Партии: `GET /api/games`, `GET /api/games/{id}`, `GET /api/games/{id}/review`.
+- Дебюты: `POST /api/opening/start`, `POST /api/opening/move`, `GET /api/opening`.
+- Миттельшпиль: `POST /api/middlegame/session`, `GET /api/middlegame/session/{id}`.
+- Долгие операции: `POST /api/{coach,review,mentor,prepare}/run` → `GET /api/jobs/{id}`.
+- Админ: `GET /api/admin/cohort`, `GET /api/admin/cohort.csv`.
+
+## Тесты
+
+```bash
+pip install pytest
+pytest -q
+```
+
+На версии 0.9.11 — 892 теста. Отдельные группы:
+
+```bash
+pytest tests/test_api.py -q
+pytest tests/test_analyzer_lines.py -q
+```
+
+## Деплой
+
+Требования к серверу для веба: **2 vCPU / 4 ГБ RAM / 40+ ГБ диска**,
+постоянный диск под `data/` (SQLite и Maia). Stockfish + Maia вместе
+чувствительны к RAM.
+
+- **VPS**: Uvicorn/systemd или Docker + Caddy/Nginx для TLS; `data/` на
+  постоянном диске; бэкап `data/trainer.db`.
+- **PostgreSQL**: задай `DATABASE_URL`; SQLite тогда не используется.
+- **PaaS с эфемерным диском** (Heroku eco и т.п.) без volume/Postgres не
+  подходит: база и модель будут теряться.
+- **Домен**: свой или временный `sslip.io`/DuckDNS/Cloudflare Tunnel.
+- Секреты — только в env/секретах хостинга, не в git.
+
+`Procfile`/`Aptfile`/`app.json` в корне — старые Heroku-заготовки; для VPS
+удобнее обычный systemd/Docker-запуск.
+
+## Метрики
+
+- `avg_win_loss` — средняя потеря win% на ход игрока.
+- `avg_win_before` — средний win% перед ходом игрока.
+- `drop` — потеря win% на конкретном ходу.
+- `best_line` — продолжение после лучшего хода, без самого лучшего хода.
+
+Это не ACPL и не «точность»: ACPL считается в центпойнах, а win% — вероятность.
+Старые записи кеша читаются без пересчёта.
+
+## Структура
+
+```text
+app/            FastAPI, анализ, БД, дебюты, миттельшпиль, LLM
+frontend/       SPA без сборки
+data/           SQLite, Maia, пользовательские артефакты (не коммитить)
+tests/          pytest
+tools/          fetch_maia_onnx.py
+__main__.py     CLI `python -m trainer`
+```
