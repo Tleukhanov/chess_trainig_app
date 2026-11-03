@@ -2957,14 +2957,14 @@ def _plan_week_payload(db: Database, nick: str, data_dir: Any) -> dict[str, Any]
 
 # --- Индивидуальный LLM-план недели ---------------------------------------
 
-_PLAN_LLM_SYSTEM = """Ты — шахматный тренер сильного любителя. Отвечай СРАЗУ готовым планом, без разбора шагов. Только русский язык.
-Структура ответа строго такая:
-"Неделя {n}: {заголовок}"
-"Режим: обычный|предтурнирный"
-"Норма дня ({M} мин):" — далее 3-5 строк формата "- {Блок} — {X} мин ({конкретика: N качественных задач / какие дебюты / сколько партий})" — сумма минут всех строк равна {M}.
-"Итог недели: ..." (1-2 предложения).
-Опирайся ТОЛЬКО на переданные данные: называй ИХ фазу и ИХ дебюты. Если есть строка «Фаза …: ошибки в …% партий» и пример — обязательно используй процент и конкретную партию/ход в итоге, не выдумывай другие. Режим "предтурнирный" — только если до турнира 14 дней или меньше; если даты турнира нет — "обычный". Названия дебютов бери дословно из "Топ слабых дебютов", не добавляй другие и не переводи их. Никакого английского, никаких общих фраз вида "учи эндшпили".
-Калибруй сложность под уровень: при рейтинге ниже 1400 допустима база; 1400–1800 — без детской базы; 1800 и выше — ТОЛЬКО продвинутый уровень: сложные реализации, техника, типовые планы из ЕГО дебютов; ЗАПРЕЩЕНЫ темы одиночного мата, оппозиции, "король+пешка против короля" и любая элементарная база. Примеры позиций и дебютов бери ТОЛЬКО из переданных данных, не выдумывай детские."""
+_PLAN_LLM_SYSTEM = """Ты — шахматный тренер сильного любителя. Объясни, ПОЧЕМУ такой недельный план. Не составляй новый список задач и не повторяй ежедневную норму минут.
+Отвечай 3–5 предложениями по-русски. Обязательно:
+1) назови процент партий с ошибками в фокус-фазе и числа (сколько из скольких);
+2) назови один конкретный пример: дебют/партия, ход, потеря win%;
+3) свяжи это с фокусом и задачами недели.
+Опирайся ТОЛЬКО на переданные данные. Если конкретного примера нет — скажи, что данных мало, а не выдумывай. Запрещены заголовки «Неделя 1», «Норма дня», списки минут и общие фразы вида «учи эндшпили».
+Калибруй сложность под уровень: ниже 1400 допустима база; 1400–1800 — без детской базы; 1800 и выше — только продвинутый уровень. Для 1800+ запрещены оппозиция, король+пешка против короля и элементарная база."""
+
 
 
 def _plan_llm_key(nick: str) -> str:
@@ -3131,6 +3131,14 @@ def _plan_llm_input(db: Database, nick: str, data_dir: Any) -> dict[str, Any]:
         "drills_unnatural": drills_unnatural,
         "score_pct": score_pct,
         "avg_win_loss": avg_win_loss,
+        "week_tasks": _build_week_tasks(
+            minutes,
+            drills_unnatural,
+            weak_openings[0] if weak_openings else None,
+            focus_phase,
+            focus_reason,
+        ),
+        "prompt_version": 2,
     }
 
 
@@ -3201,10 +3209,15 @@ def _plan_llm_messages(entry: dict[str, Any]) -> list[ChatMessage]:
         f"Слабая фаза: {entry.get('focus_phase')} ({entry.get('focus_reason')}).",
         f"Топ слабых дебютов: {weak_txt}.",
         _evidence_line(entry.get("evidence")),
+        "Задачи недели: " + "; ".join(
+            str(t.get("text") or "")
+            for t in (entry.get("week_tasks") or [])
+            if isinstance(t, dict) and t.get("text")
+        ) + ".",
         f"Человечность: {entry.get('unnatural_verdict')}.",
         f"Дрели: всего {entry.get('drills_total')}, неестественных {entry.get('drills_unnatural')}.",
         f"Счёт: {score if score is not None else '—'}%; средняя потеря: {loss if loss is not None else '—'}%.",
-        "Ответ — только план по структуре выше.",
+        "Ответ — только объяснение, почему такой план, без нового списка задач.",
     ]
     return [
         ChatMessage("system", _PLAN_LLM_SYSTEM),
@@ -3301,6 +3314,7 @@ def _run_plan_llm_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> No
                 "created_at": created,
                 "input_hash": params["input_hash"],
                 "weeks_left": params["input"].get("weeks_left"),
+                "prompt_version": params["input"].get("prompt_version"),
             }
             with Database(app.state.db_path) as db:
                 db.init_db()
@@ -3342,6 +3356,8 @@ def _load_plan_llm(db: Database, nick: str) -> dict[str, Any] | None:
         "text": text,
         "created_at": data.get("created_at"),
         "weeks_left": data.get("weeks_left"),
+        "input_hash": data.get("input_hash"),
+        "prompt_version": data.get("prompt_version"),
     }
 
 # --- Мини-трекер времени ---------------------------------------------------
@@ -3819,9 +3835,14 @@ def create_api(
         if not user:
             raise HTTPException(404, "No current user")
         with Database(app.state.db_path) as db:
+            db.init_db()
             saved = _load_plan_llm(db, user["nick"])
         if saved is None:
             return {"text": None}
+        if saved.get("prompt_version") != 2:
+            # Старый комментарий после смены промпта не показываем: иначе UI
+            # выдаёт устаревший «план» вместо объяснения.
+            return {"text": None, "stale": True}
         return saved
 
     @app.post("/api/plan/generate")

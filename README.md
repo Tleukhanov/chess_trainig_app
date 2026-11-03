@@ -225,7 +225,7 @@ pip install pytest
 pytest -q
 ```
 
-На версии 0.9.11 — 892 теста. Отдельные группы:
+На версии 0.9.13 — 894 теста. Отдельные группы:
 
 ```bash
 pytest tests/test_api.py -q

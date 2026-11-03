@@ -9,7 +9,10 @@
   mention the percentage and the concrete example; it is still a commentary,
   not a second plan.
 - Fixed the Russian phase task wording (“в миттельшпиле”, not “в миттельшпиль”).
-- 893 tests pass.
+- The LLM block is now an explanation prompt, not another plan; it must cite
+  the percentage and the concrete example. Old cached plan texts are hidden
+  after the prompt-version change and can be regenerated with one click.
+- 894 tests pass.
 
 ## 0.9.12 — 2026-11-03
 

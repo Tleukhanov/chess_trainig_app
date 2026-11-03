@@ -2481,6 +2481,26 @@ class PlanLlmTests(ApiTestBase):
         self.assertEqual(job["status"], "error")
         self.assertIn("разбор", job["error"])
 
+    def test_stale_plan_comment_is_hidden(self):
+        """Старый кэш «плана» не показывается после смены промпта."""
+        self._add_user()
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.set_meta(
+                "plan_llm_plantester",
+                json.dumps(
+                    {
+                        "text": "Неделя 1: старый план",
+                        "created_at": "2026-11-01",
+                        "input_hash": "old",
+                        "prompt_version": 1,
+                    }
+                ),
+            )
+        resp = self.client.get("/api/plan/llm")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json(), {"text": None, "stale": True})
+
     def test_plan_llm_no_user_404(self):
         self._add_user()
         self._clear_auth()
