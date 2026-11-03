@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.12 — 2026-11-03
+
+- Plan page no longer looks like two competing weekly plans. The deterministic
+  “План на неделю” comes first; the LLM text is now “Комментарий тренера”
+  inside a collapsed “Почему такой план” explanation. The generation button
+  is “Собрать комментарий”, not “создать ещё один план”.
+- Remove duplicate “Дрели в кеше” stat card.
+- 892 tests pass.
+
 ## 0.9.11 — 2026-11-02
 
 Security hardening before a public deployment.

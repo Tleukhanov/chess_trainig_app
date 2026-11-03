@@ -1,6 +1,6 @@
 // Chess Trainer Frontend — SPA на vanilla JS, потребляет /api/* эндпоинты.
 
-import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.9.11';
+import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.9.12';
 
 const state = {
   user: null,
@@ -1100,18 +1100,19 @@ async function viewPlan(app) {
 
   let llmHtml = '';
   if (state.planLlmGenerating) {
-    llmHtml = `<div class="card"><div class="card-header"><span class="card-title">Индивидуальный план</span></div>
+    llmHtml = `<div class="card"><div class="card-header"><span class="card-title">Комментарий тренера</span><span class="badge badge-neutral">пояснение</span></div>
       <p style="color:var(--c-text-muted);font-size:13px;margin:0">генерирую…</p></div>`;
   } else if (llmData && llmData.text) {
-    llmHtml = `<div class="card"><div class="card-header"><span class="card-title">Индивидуальный план</span>${llmData.created_at ? `<span class="badge badge-neutral">${esc(llmData.created_at)}</span>` : ''}</div>
-      <div class="mentor-reply">${esc(llmData.text)}</div>
+    llmHtml = `<div class="card"><div class="card-header"><span class="card-title">Комментарий тренера</span><span class="badge badge-neutral">пояснение</span></div>
+      <p style="color:var(--c-text-muted);font-size:13px;margin-top:0">Это объяснение к недельному плану, а не отдельный список задач.</p>
+      <details class="plan-comment"><summary>Почему такой план</summary><div class="mentor-reply">${esc(llmData.text)}</div></details>
       ${state.planLlmError ? `<div class="alert alert-error" style="margin-top:8px">${esc(state.planLlmError)}</div>` : ''}
-      <div style="margin-top:8px"><button class="btn btn-secondary" id="plan-llm-refresh" style="font-size:12px;padding:4px 10px">Обновить</button></div></div>`;
+      <div style="margin-top:8px"><button class="btn btn-secondary" id="plan-llm-refresh" style="font-size:12px;padding:4px 10px">Обновить комментарий</button></div></div>`;
   } else {
-    llmHtml = `<div class="card"><div class="card-header"><span class="card-title">Индивидуальный план</span><span class="badge badge-blue">шаг 2 из 2</span></div>
-      <p style="color:var(--c-text-muted);font-size:13px;margin-top:0">Пройди опросник выше — и тренер соберёт неделю под твою цель, время и слабые места.</p>
+    llmHtml = `<div class="card"><div class="card-header"><span class="card-title">Комментарий тренера</span><span class="badge badge-neutral">пояснение</span></div>
+      <p style="color:var(--c-text-muted);font-size:13px;margin-top:0">План на неделю уже собран из твоих партий. Можно попросить тренера объяснить, почему он такой.</p>
       ${state.planLlmError ? `<div class="alert alert-error" style="margin-bottom:8px">${esc(state.planLlmError)}</div>` : ''}
-      <button class="btn btn-primary" id="plan-llm-create" style="width:fit-content">Создать план на неделю (LLM)</button></div>`;
+      <button class="btn btn-secondary" id="plan-llm-create" style="width:fit-content">Собрать комментарий</button></div>`;
   }
 
   let weekHtml = '';
@@ -1155,8 +1156,8 @@ async function viewPlan(app) {
   app.innerHTML = `
     <div class="card-header"><h1>План тренировки</h1><span class="badge badge-blue">${esc(state.user.nick)}</span></div>
     ${goalHtml}
-    ${llmHtml}
     ${weekHtml}
+    ${llmHtml}
     ${todayHtml}
     <div class="grid grid-4">
       <div class="card stat"><div class="stat-value">${plan.games}</div><div class="stat-label">Партий</div></div>
