@@ -1,6 +1,6 @@
 // Chess Trainer Frontend — SPA на vanilla JS, потребляет /api/* эндпоинты.
 
-import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.9.13';
+import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.9.14';
 
 const state = {
   user: null,
@@ -1006,6 +1006,27 @@ async function viewOverview(app) {
     </div>`;
 }
 
+function coachCommentHtml(text, evidence) {
+  const raw = String(text || '');
+  if (!raw) return '';
+  let html = esc(raw);
+  const targets = new Map();
+  const worst = evidence && evidence.worst;
+  const openingWorst = evidence && evidence.opening_worst;
+  if (worst && worst.game_id) {
+    targets.set(String(worst.game_id), worst.ply);
+  }
+  if (openingWorst && openingWorst.game_id && !targets.has(String(openingWorst.game_id))) {
+    targets.set(String(openingWorst.game_id), openingWorst.ply);
+  }
+  // Ссылки на конкретные партии внутри комментария тренера.
+  for (const [gameId, ply] of targets) {
+    const anchor = `<a href="#" class="game-link" data-comment-game="${esc(gameId)}" data-comment-ply="${esc(String(ply ?? ''))}" title="Открыть партию в анализе">${esc(gameId)}</a>`;
+    html = html.split(esc(gameId)).join(anchor);
+  }
+  return html;
+}
+
 async function viewPlan(app) {
   if (!state.user) {
     app.innerHTML = '<div class="onboarding card"><div class="empty-icon">📋</div><h1>Нет плана</h1><p>Профиль не выбран.</p></div>';
@@ -1106,7 +1127,7 @@ async function viewPlan(app) {
   } else if (llmData && llmData.text) {
     llmHtml = `<div class="card"><div class="card-header"><span class="card-title">Комментарий тренера</span><span class="badge badge-neutral">пояснение</span></div>
       <p style="color:var(--c-text-muted);font-size:13px;margin-top:0">Это объяснение к недельному плану, а не отдельный список задач.</p>
-      <details class="plan-comment"><summary>Почему такой план</summary><div class="mentor-reply">${esc(llmData.text)}</div></details>
+      <details class="plan-comment"><summary>Почему такой план</summary><div class="mentor-reply">${coachCommentHtml(llmData.text, weekData && weekData.evidence)}</div></details>
       ${state.planLlmError ? `<div class="alert alert-error" style="margin-top:8px">${esc(state.planLlmError)}</div>` : ''}
       <div style="margin-top:8px"><button class="btn btn-secondary" id="plan-llm-refresh" style="font-size:12px;padding:4px 10px">Обновить комментарий</button></div></div>`;
   } else {
@@ -1210,6 +1231,17 @@ async function viewPlan(app) {
       const ply = Number(btn.dataset.evidencePly);
       navigate('games', {
         gameId: btn.dataset.evidenceGame,
+        ply: Number.isFinite(ply) ? ply : null,
+      });
+    });
+  });
+
+  app.querySelectorAll('[data-comment-game]').forEach(link => {
+    link.addEventListener('click', e => {
+      e.preventDefault();
+      const ply = Number(link.dataset.commentPly);
+      navigate('games', {
+        gameId: link.dataset.commentGame,
         ply: Number.isFinite(ply) ? ply : null,
       });
     });

@@ -931,3 +931,12 @@ td.center { text-align: center; }
   font-size: 13px;
   padding: 0;
 }
+
+.game-link {
+  color: var(--c-accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.game-link:hover {
+  opacity: 0.8;
+}

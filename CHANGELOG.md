@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.14 — 2026-11-03
+
+- Game IDs cited in the coach commentary are now clickable links. They open
+  the game inside the app at the exact ply when the evidence provides one;
+  no external Lichess jump is required.
+- 894 tests pass.
+
 ## 0.9.13 — 2026-11-03
 
 - Weekly plan now shows evidence, not just an average: “N% партий — ошибки в
