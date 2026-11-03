@@ -1,6 +1,6 @@
 // Chess Trainer Frontend — SPA на vanilla JS, потребляет /api/* эндпоинты.
 
-import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.9.12';
+import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.9.13';
 
 const state = {
   user: null,
@@ -169,6 +169,7 @@ function navigate(view, options = {}) {
   if (view === 'games') {
     state.gameId = options.gameId || null;
     state.gameData = null;
+    state.pendingGamePly = Number.isFinite(options.ply) ? options.ply : null;
   }
   document.querySelectorAll('#nav a').forEach(a => {
     a.classList.toggle('active', a.dataset.view === view);
@@ -1118,9 +1119,22 @@ async function viewPlan(app) {
   let weekHtml = '';
   if (weekData && weekData.focus && Array.isArray(weekData.week_tasks)) {
     const wPhase = esc(focusRu[weekData.focus.phase] || weekData.focus.phase);
+    const ev = weekData.evidence || null;
+    const worst = ev && ev.worst;
+    const evidenceHtml = ev && ev.games_total ? `
+      <div class="plan-evidence">
+        <div><strong>${fmt(ev.share_pct, 0)}% партий</strong> — ошибки в фазе «${esc(wPhase)}» (${ev.games_with_error} из ${ev.games_total}).</div>
+        ${worst ? `<div class="plan-evidence-example">Самый явный пример:
+          <button type="button" class="btn btn-link" data-evidence-game="${esc(worst.game_id)}" data-evidence-ply="${esc(String(worst.ply))}">
+            ${esc(worst.opening || worst.opponent || 'партия')} · ${esc(worst.move_label || worst.san)} · −${fmt(worst.drop)}%
+          </button>
+          ${worst.link ? `<a href="${esc(worst.link)}" target="_blank" rel="noopener" class="btn btn-link">Lichess</a>` : ''}
+        </div>` : ''}
+      </div>` : '';
     weekHtml = `<div class="card"><div class="card-header"><span class="card-title">План на неделю</span>
         <span class="badge badge-blue">фокус: ${wPhase}</span></div>
       <div style="color:var(--c-text-muted);font-size:13px;margin-bottom:8px">${esc(weekData.focus.reason || '')}</div>
+      ${evidenceHtml}
       ${weekData.week_tasks.map(t => `<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:6px 0"><span class="badge badge-neutral">${esc(t.key)}</span><span style="flex:1;min-width:180px"><strong>${esc(t.text)}</strong><br><span style="color:var(--c-text-muted);font-size:12px">${esc(t.detail || '')}</span></span></div>`).join('')}
       ${weekData.human_summary ? `<div class="mentor-reply" style="margin-top:8px">${esc(weekData.human_summary)}</div>` : ''}</div>`;
   }
@@ -1190,6 +1204,16 @@ async function viewPlan(app) {
       <div class="card-header"><span class="card-title">Человечность ошибок</span></div>
       ${plan.humanity ? `<div class="grid grid-4"><div class="stat"><div class="stat-value">${plan.humanity.total}</div><div class="stat-label">Всего</div></div><div class="stat"><div class="stat-value">${plan.humanity.natural}</div><div class="stat-label">Естественные</div></div><div class="stat"><div class="stat-value">${plan.humanity.borderline}</div><div class="stat-label">Пограничные</div></div><div class="stat"><div class="stat-value">${plan.humanity.unnatural}</div><div class="stat-label">Неестественные</div></div></div><div style="margin-top:8px"><strong>Доля неестественных: </strong>${fmt(plan.humanity.unnatural_share_pct)}%</div>` : '<p style="color:var(--c-text-muted)">Нет данных: запусти оценку ошибок.</p>'}
     </div>`;
+
+  app.querySelectorAll('[data-evidence-game]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const ply = Number(btn.dataset.evidencePly);
+      navigate('games', {
+        gameId: btn.dataset.evidenceGame,
+        ply: Number.isFinite(ply) ? ply : null,
+      });
+    });
+  });
 
   app.querySelectorAll('[data-plan-act]').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -1504,6 +1528,7 @@ async function viewGameList(app) {
   app.querySelectorAll('.game-row').forEach(row => {
     row.addEventListener('click', () => {
       state.gameId = row.dataset.id;
+      state.pendingGamePly = null;
       viewGames(app);
     });
   });
@@ -1575,7 +1600,9 @@ async function viewGameDetail(app) {
     return;
   }
   state.gameData = data;
-  state.gamePly = 0;
+  const pendingPly = state.pendingGamePly;
+  state.pendingGamePly = null;
+  state.gamePly = Number.isFinite(pendingPly) ? pendingPly : 0;
   state.gameExtras = null;
   state.gameReview = null;
   state.gameRepeats = null;

@@ -79,7 +79,7 @@ from .openings import (
 from .accuracy import accuracy as acc_accuracy, category_stats, estimate_rating, phase_stats
 from .comments import game_summary, move_comment
 from .paths import user_dir
-from .patterns import phase
+from .patterns import analyze_user_moves, phase
 from .review_moves import badge_for, badge_label, detect_sacrifice
 from .pgn_import import MAX_PGN_BYTES, parse_pgn_games
 from .plan import build_plan
@@ -2485,6 +2485,11 @@ _PLAN_FOCUS_RU = {
     "middlegame": "миттельшпиль",
     "endgame": "эндшпиль",
 }
+_PLAN_FOCUS_PREP = {
+    "opening": "дебюте",
+    "middlegame": "миттельшпиле",
+    "endgame": "эндшпиле",
+}
 # Фазы в build_plan/build_report: opening | midgame | endgame.
 _INTERNAL_TO_PUBLIC_PHASE = {
     "opening": "opening",
@@ -2666,6 +2671,7 @@ def _build_week_tasks(
     """Детерминированный список задач на неделю (ключи key/text/detail)."""
     portion = _week_drills_portion(unnatural)
     phase_ru = _PLAN_FOCUS_RU.get(focus_phase, focus_phase)
+    phase_prep = _PLAN_FOCUS_PREP.get(focus_phase, phase_ru)
     tasks = [
         {
             "key": "daily-task",
@@ -2700,7 +2706,7 @@ def _build_week_tasks(
     tasks.append(
         {
             "key": "phase",
-            "text": f"Разобрать 3 партии с ошибками в {phase_ru}",
+            "text": f"Разобрать 3 партии с ошибками в {phase_prep}",
             "detail": f"фокус недели: {phase_ru} ({focus_reason})",
         }
     )
@@ -2762,6 +2768,96 @@ def _build_human_summary(
         "плюс разбор партий из списка выше."
     )
     return " ".join(parts)
+
+
+def _move_label(ply: int, san: str) -> str:
+    """``0`` + e4 -> ``1.e4``; ``1`` + e5 -> ``1...e5``."""
+    try:
+        n = int(ply)
+    except (TypeError, ValueError):
+        n = 0
+    return f"{n // 2 + 1}{'.' if n % 2 == 0 else '...'}{san}"
+
+
+def _week_evidence(
+    db: Database, nick: str, focus_phase: str, weak_opening: str | None = None
+) -> dict[str, Any]:
+    """Evidence for the weekly focus: % of games + the worst concrete move.
+
+    The plan must answer “в 60% партий ошибка в эндшпиле” and point to one
+    game + move, instead of only an aggregate. Uses the same cached analyses
+    as the plan; no engine/network.
+    """
+    try:
+        pairs = shared_data.repertoire_pairs(db, nick)
+    except RuntimeError:
+        pairs = []
+    internal = {v: k for k, v in _INTERNAL_TO_PUBLIC_PHASE.items()}.get(
+        focus_phase, focus_phase
+    )
+    games_total = len(pairs)
+    games_with_error = 0
+    worst: dict[str, Any] | None = None
+    opening_worst: dict[str, Any] | None = None
+    for game, analysis in pairs:
+        records = analyze_user_moves(game, analysis)
+        phase_records = [item for item in records if item.get("phase") == internal]
+        if phase_records:
+            games_with_error += 1
+        for item in phase_records:
+            drop = item.get("drop")
+            score = float(drop) if isinstance(drop, (int, float)) else 0.0
+            if worst is None or score > float(worst.get("_score", 0.0)):
+                worst = {
+                    "game_id": game.id,
+                    "link": game.link,
+                    "ply": int(item.get("ply") or 0),
+                    "san": str(item.get("san") or "—"),
+                    "move_label": _move_label(
+                        int(item.get("ply") or 0), str(item.get("san") or "—")
+                    ),
+                    "classification": item.get("classification"),
+                    "drop": round(score, 1),
+                    "phase": focus_phase,
+                    "opening": game.opening,
+                    "opponent": game.opponent,
+                    "_score": score,
+                }
+        if weak_opening:
+            for item in records:
+                if str(game.opening or "").strip().lower() != str(weak_opening).strip().lower():
+                    continue
+                drop = item.get("drop")
+                score = float(drop) if isinstance(drop, (int, float)) else 0.0
+                if opening_worst is None or score > float(opening_worst.get("_score", 0.0)):
+                    opening_worst = {
+                        "game_id": game.id,
+                        "link": game.link,
+                        "ply": int(item.get("ply") or 0),
+                        "san": str(item.get("san") or "—"),
+                        "move_label": _move_label(
+                            int(item.get("ply") or 0), str(item.get("san") or "—")
+                        ),
+                        "classification": item.get("classification"),
+                        "drop": round(score, 1),
+                        "opening": game.opening,
+                        "opponent": game.opponent,
+                        "_score": score,
+                    }
+    if worst is not None:
+        worst.pop("_score", None)
+    if opening_worst is not None:
+        opening_worst.pop("_score", None)
+    return {
+        "phase": focus_phase,
+        "games_total": games_total,
+        "games_with_error": games_with_error,
+        "share_pct": round(games_with_error * 100.0 / games_total, 1)
+        if games_total
+        else None,
+        "worst": worst,
+        "opening_worst": opening_worst,
+    }
 
 
 def _plan_week_payload(db: Database, nick: str, data_dir: Any) -> dict[str, Any]:
@@ -2835,10 +2931,16 @@ def _plan_week_payload(db: Database, nick: str, data_dir: Any) -> dict[str, Any]
     except (ValueError, TypeError, OSError):
         time_sec = 0
 
+    weak_opening_name = (
+        str((weak_opening or {}).get("opening") or "").strip() or None
+    )
+    evidence = _week_evidence(db, nick, focus_phase, weak_opening_name)
+
     return {
         "goal": goal["goal"],
         "minutes_per_day": minutes,
         "focus": {"phase": focus_phase, "reason": focus_reason},
+        "evidence": evidence,
         "week_tasks": _build_week_tasks(
             minutes, unnatural, weak_opening, focus_phase, focus_reason
         ),
@@ -2861,7 +2963,7 @@ _PLAN_LLM_SYSTEM = """Ты — шахматный тренер сильного 
 "Режим: обычный|предтурнирный"
 "Норма дня ({M} мин):" — далее 3-5 строк формата "- {Блок} — {X} мин ({конкретика: N качественных задач / какие дебюты / сколько партий})" — сумма минут всех строк равна {M}.
 "Итог недели: ..." (1-2 предложения).
-Опирайся ТОЛЬКО на переданные данные: называй ИХ фазу и ИХ дебюты. Режим "предтурнирный" — только если до турнира 14 дней или меньше; если даты турнира нет — "обычный". Названия дебютов бери дословно из "Топ слабых дебютов", не добавляй другие и не переводи их. Никакого английского, никаких общих фраз вида "учи эндшпили".
+Опирайся ТОЛЬКО на переданные данные: называй ИХ фазу и ИХ дебюты. Если есть строка «Фаза …: ошибки в …% партий» и пример — обязательно используй процент и конкретную партию/ход в итоге, не выдумывай другие. Режим "предтурнирный" — только если до турнира 14 дней или меньше; если даты турнира нет — "обычный". Названия дебютов бери дословно из "Топ слабых дебютов", не добавляй другие и не переводи их. Никакого английского, никаких общих фраз вида "учи эндшпили".
 Калибруй сложность под уровень: при рейтинге ниже 1400 допустима база; 1400–1800 — без детской базы; 1800 и выше — ТОЛЬКО продвинутый уровень: сложные реализации, техника, типовые планы из ЕГО дебютов; ЗАПРЕЩЕНЫ темы одиночного мата, оппозиции, "король+пешка против короля" и любая элементарная база. Примеры позиций и дебютов бери ТОЛЬКО из переданных данных, не выдумывай детские."""
 
 
@@ -3015,6 +3117,14 @@ def _plan_llm_input(db: Database, nick: str, data_dir: Any) -> dict[str, Any]:
         "focus": goal.get("focus") or "auto",
         "focus_phase": focus_phase,
         "focus_reason": focus_reason,
+        "evidence": _week_evidence(
+            db,
+            nick,
+            focus_phase,
+            str((weak_openings[0] or {}).get("opening") or "").strip()
+            if weak_openings
+            else None,
+        ),
         "weak_openings": weak_openings,
         "unnatural_verdict": _plan_unnatural_verdict(humanity),
         "drills_total": drills_total,
@@ -3022,6 +3132,30 @@ def _plan_llm_input(db: Database, nick: str, data_dir: Any) -> dict[str, Any]:
         "score_pct": score_pct,
         "avg_win_loss": avg_win_loss,
     }
+
+
+def _evidence_line(evidence: Any) -> str:
+    """Одна строка факта для LLM: % партий + конкретный худший ход."""
+    if not isinstance(evidence, dict) or not evidence.get("games_total"):
+        return "Пример: нет данных для конкретного примера."
+    share = evidence.get("share_pct")
+    total = evidence.get("games_total")
+    with_err = evidence.get("games_with_error")
+    if share is None:
+        return "Пример: нет данных для конкретного примера."
+    line = (
+        f"Фаза {evidence.get('phase')}: ошибки в {share}% партий "
+        f"({with_err} из {total})."
+    )
+    worst = evidence.get("worst")
+    if isinstance(worst, dict):
+        line += (
+            f" Самый явный пример: партия {worst.get('game_id')} "
+            f"({worst.get('opening') or 'без дебюта'}), ход "
+            f"{worst.get('move_label') or worst.get('san')}, "
+            f"потеря {worst.get('drop')}%."
+        )
+    return line
 
 
 def _plan_llm_messages(entry: dict[str, Any]) -> list[ChatMessage]:
@@ -3066,6 +3200,7 @@ def _plan_llm_messages(entry: dict[str, Any]) -> list[ChatMessage]:
         f"Минут в день: {entry.get('minutes')}.",
         f"Слабая фаза: {entry.get('focus_phase')} ({entry.get('focus_reason')}).",
         f"Топ слабых дебютов: {weak_txt}.",
+        _evidence_line(entry.get("evidence")),
         f"Человечность: {entry.get('unnatural_verdict')}.",
         f"Дрели: всего {entry.get('drills_total')}, неестественных {entry.get('drills_unnatural')}.",
         f"Счёт: {score if score is not None else '—'}%; средняя потеря: {loss if loss is not None else '—'}%.",
@@ -3277,7 +3412,7 @@ def create_api(
     db_path: Path | None = None,
     data_dir: Path | None = None,
 ) -> FastAPI:
-    app = FastAPI(title="Chess Trainer API", version="0.9.12", docs_url="/api/docs", redoc_url=None)
+    app = FastAPI(title="Chess Trainer API", version="0.9.13", docs_url="/api/docs", redoc_url=None)
     app.state.db_path = Path(db_path) if db_path else settings.db_path
     app.state.data_dir = Path(data_dir) if data_dir else settings.data_dir
 

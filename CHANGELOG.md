@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.13 — 2026-11-03
+
+- Weekly plan now shows evidence, not just an average: “N% партий — ошибки в
+  фазе X (a из b)” and the worst concrete example with game, move, loss and a
+  button that opens the game at that ply.
+- The LLM commentary input receives the same evidence and is instructed to
+  mention the percentage and the concrete example; it is still a commentary,
+  not a second plan.
+- Fixed the Russian phase task wording (“в миттельшпиле”, not “в миттельшпиль”).
+- 893 tests pass.
+
 ## 0.9.12 — 2026-11-03
 
 - Plan page no longer looks like two competing weekly plans. The deterministic

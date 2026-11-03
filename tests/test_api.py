@@ -2115,8 +2115,8 @@ class PlanWeekTests(ApiTestBase):
     def test_week_structure(self):
         data = self._get_week()
         for key in (
-            "goal", "minutes_per_day", "focus", "week_tasks", "today",
-            "human_summary",
+            "goal", "minutes_per_day", "focus", "evidence", "week_tasks",
+            "today", "human_summary",
         ):
             self.assertIn(key, data)
         self.assertEqual(set(data["focus"]), {"phase", "reason"})
@@ -2135,6 +2135,20 @@ class PlanWeekTests(ApiTestBase):
         data = self._get_week()
         # миттельшпиль −30 против дебюта −10: слабейшая фаза по avg_drop.
         self.assertEqual(data["focus"]["phase"], "middlegame")
+
+    def test_week_evidence_has_percent_and_example(self):
+        data = self._get_week()
+        evidence = data["evidence"]
+        self.assertEqual(evidence["phase"], "middlegame")
+        self.assertEqual(evidence["games_total"], 1)
+        self.assertEqual(evidence["games_with_error"], 1)
+        self.assertEqual(evidence["share_pct"], 100.0)
+        worst = evidence["worst"]
+        self.assertEqual(worst["game_id"], "wk1")
+        self.assertEqual(worst["ply"], 12)
+        self.assertEqual(worst["san"], "Bb3")
+        self.assertEqual(worst["move_label"], "7.Bb3")
+        self.assertEqual(worst["drop"], 30.0)
 
     def test_week_human_summary_russian_and_digits(self):
         data = self._get_week()
@@ -2687,12 +2701,12 @@ class FrontendTests(ApiTestBase):
         html = resp.text
         self.assertIn("app.js?v=", html)
         self.assertIn("style.css?v=", html)
-        self.assertIn("v0.9.12", html)
+        self.assertIn("v0.9.13", html)
         self.assertIn('id="nav-toggle"', html)
         self.assertIn('aria-controls="nav"', html)
 
     def test_api_version(self):
-        self.assertEqual(self.app.version, "0.9.12")
+        self.assertEqual(self.app.version, "0.9.13")
 
 
 class AuthApiTests(ApiTestBase):

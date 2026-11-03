@@ -79,7 +79,7 @@ def _make_parser() -> argparse.ArgumentParser:
         prog="trainer",
         description="Chess Trainer — персональный шахматный тренер",
     )
-    parser.add_argument("--version", action="version", version="chess-trainer 0.9.12")
+    parser.add_argument("--version", action="version", version="chess-trainer 0.9.13")
     parser.add_argument(
         "--yes", action="store_true",
         help="не задавать вопросов: соглашаться на переключение профиля",

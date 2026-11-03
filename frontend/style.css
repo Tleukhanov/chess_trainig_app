@@ -914,3 +914,20 @@ td.center { text-align: center; }
 .plan-comment .mentor-reply {
   margin-top: 8px;
 }
+
+.plan-evidence {
+  border-left: 3px solid var(--c-accent);
+  padding: 8px 10px;
+  margin: 8px 0 10px;
+  background: var(--c-bg-soft);
+  font-size: 13px;
+  line-height: 1.45;
+}
+.plan-evidence-example {
+  margin-top: 4px;
+  color: var(--c-text-muted);
+}
+.plan-evidence-example .btn-link {
+  font-size: 13px;
+  padding: 0;
+}
