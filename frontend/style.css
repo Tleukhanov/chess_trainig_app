@@ -940,3 +940,13 @@ td.center { text-align: center; }
 .game-link:hover {
   opacity: 0.8;
 }
+
+.endgame-layout { display: grid; grid-template-columns: minmax(260px, .78fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+.endgame-list { display: flex; flex-direction: column; gap: 10px; }
+.endgame-task { width: 100%; border: 1px solid var(--c-border); border-radius: 12px; background: var(--c-bg-card); color: var(--c-text); padding: 12px; text-align: left; cursor: pointer; transition: border-color .15s, box-shadow .15s; }
+.endgame-task:hover, .endgame-task.active { border-color: var(--c-accent); box-shadow: 0 0 0 1px var(--c-accent); }
+.endgame-task-title { font-weight: 600; line-height: 1.35; }
+.endgame-task-badges { display: flex; gap: 6px; flex-wrap: wrap; margin: 4px 0; }
+.endgame-task-meta, .endgame-detail { color: var(--c-text-muted); font-size: 12px; line-height: 1.4; }
+.endgame-detail { margin-top: 4px; }
+@media (max-width: 960px) { .endgame-layout { grid-template-columns: 1fr; } }

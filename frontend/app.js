@@ -1,6 +1,6 @@
 // Chess Trainer Frontend — SPA на vanilla JS, потребляет /api/* эндпоинты.
 
-import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.9.14';
+import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.9.15';
 
 const state = {
   user: null,
@@ -151,7 +151,7 @@ function setupTheme() {
 
 // --- Navigation ---
 
-const views = ['dashboard', 'overview', 'plan', 'progress', 'games', 'drills', 'task', 'opening', 'middlegame', 'coach', 'tools', 'users', 'admin'];
+const views = ['dashboard', 'overview', 'plan', 'progress', 'games', 'drills', 'task', 'opening', 'endgame', 'middlegame', 'coach', 'tools', 'users', 'admin'];
 
 function clearAllTimers() {
   if (state.taskPlayTimer) { clearInterval(state.taskPlayTimer); state.taskPlayTimer = null; }
@@ -525,6 +525,7 @@ async function render(view) {
       case 'task': await viewTask(app); break;
       case 'opening': await viewOpening(app); break;
       case 'middlegame': await viewMiddlegame(app); break;
+      case 'endgame': await viewEndgame(app); break;
       case 'coach': await viewCoach(app); break;
       case 'tools': await viewTools(app); break;
       case 'users': await viewUsers(app); break;
@@ -3224,7 +3225,244 @@ const TREND_LABELS = {
   score_pct: 'Счёт',
 };
 const TREND_VERDICT_RU = { better: 'лучше', worse: 'хуже', same: 'без изменений', stable: 'без изменений' };
-const TREND_OVERALL_RU = { improving: 'УЛУЧШЕНИЕ', worsening: 'УХУДШЕНИЕ', stable: 'БЕЗ ИЗМЕНЕНИЙ' };
+const TREND_OVERALL_RU = { improving: "УЛУЧШЕНИЕ", worsening: "УХУДШЕНИЕ", stable: "БЕЗ ИЗМЕНЕНИЙ" };
+
+const ENDGAME_SOURCES = [
+  { key: 'master', label: 'Мастер' },
+  { key: 'own', label: 'Твои партии' },
+];
+
+function endgameTasksFor(meta, source) {
+  return source === 'own' ? (meta && meta.own ? meta.own : []) : (meta && meta.master ? meta.master : []);
+}
+
+function endgameTaskFor(meta, source, taskKey) {
+  return endgameTasksFor(meta, source).find(task => task.task_key === taskKey) || null;
+}
+
+function endgameBadgeClass(text) {
+  const s = String(text || '').toLowerCase();
+  if (/б|п|win|побед/.test(s) || s.includes('мат') || s.includes('hold')) return 'badge-blue';
+  if (/ничь|draw|спас/.test(s)) return 'badge-neutral';
+  return 'badge-neutral';
+}
+
+function endgameProgressHtml(meta) {
+  const p = (meta && meta.progress) || { master: { total: 0, solved: 0 }, own: { total: 0, solved: 0 } };
+  return `
+    <div class="grid grid-2" style="margin-top:12px">
+      <div class="card stat"><div class="stat-value">${esc(String(p.master.solved))}/${esc(String(p.master.total))}</div><div class="stat-label">Мастер-эндшпили решены</div></div>
+      <div class="card stat"><div class="stat-value">${esc(String(p.own.solved))}/${esc(String(p.own.total))}</div><div class="stat-label">Твои партии решены</div></div>
+    </div>`;
+}
+
+function endgameTaskCardHtml(task, active) {
+  const badges = [];
+  badges.push(`<span class="badge badge-blue">${esc(task.goal || '')}</span>`);
+  badges.push(`<span class="badge badge-neutral">${esc(task.concept_title || task.concept || '')}</span>`);
+  if (task.source === 'own') {
+    badges.push(`<span class="badge badge-bad">${esc(TASK_CLASS_RU[task.classification] || task.classification || '')}</span>`);
+    if (task.drop != null) badges.push(`<span class="badge badge-neutral">−${fmt(Math.abs(Number(task.drop) || 0))}%</span>`);
+  }
+  let metaLine = '';
+  if (task.source === 'own') {
+    metaLine = [task.opening, task.eco, task.opponent ? `против ${task.opponent}` : ''].filter(Boolean).join(' · ');
+  }
+  return `
+    <button type="button" class="endgame-task${active ? ' active' : ''}" data-endgame-task="${esc(task.task_key)}">
+      <div class="endgame-task-title">${esc(task.title || '—')}</div>
+      <div class="endgame-task-badges" style="display:flex;gap:6px;flex-wrap:wrap;margin:4px 0">${badges.join('')}</div>
+      ${metaLine ? `<div class="endgame-task-meta">${esc(metaLine)}</div>` : ''}
+    </button>`;
+}
+
+function endgameDetailHtml(task, answered) {
+  const badges = [
+    `<span class="badge badge-blue">${esc(task.goal || '')}</span>`,
+    `<span class="badge badge-neutral">${esc(task.concept_title || task.concept || '')}</span>`,
+  ];
+  if (task.source === 'own' && task.classification) badges.push(`<span class="badge badge-bad">${esc(TASK_CLASS_RU[task.classification] || task.classification)}</span>`);
+  let metaLine = '';
+  if (task.source === 'own') {
+    metaLine = [task.opening, task.eco, task.opponent ? `против ${task.opponent}` : '', task.san_played ? `сыграно: ${task.san_played}` : ''].filter(Boolean).join(' · ');
+  } else {
+    metaLine = task.concept_title || task.concept || '';
+  }
+  return `
+    <div class="card">
+      <div class="card-header"><span class="card-title">${esc(task.title || '—')}</span></div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">${badges.join('')}</div>
+      ${metaLine ? `<div class="endgame-detail">${esc(metaLine)}</div>` : ''}
+      ${answered ? '' : `<div id="endgame-board-hint" class="endgame-detail" style="margin-top:8px">кликни фигуру, затем клетку — или введи ход текстом</div>`}
+    </div>`;
+}
+
+function endgameResultHtml(result, task) {
+  if (!result) return '';
+  const ok = result.result === 'correct';
+  const t = result.task || {};
+  const line = Array.isArray(t.best_line) ? t.best_line.join(' ') : (t.best_line || '');
+  const judge = result.judge;
+  return `
+    <div class="card">
+      <div class="card-header"><span class="card-title">Результат</span><span class="badge ${ok ? 'badge-good' : 'badge-bad'}">${ok ? 'верно ✓' : 'неверно'}</span></div>
+      ${t.why ? `<div class="mentor-reply" style="margin-bottom:8px">${esc(t.why)}</div>` : ''}
+      ${t.best_move_san ? `<div><strong>Лучший ход:</strong> <span class="drill-best">${esc(t.best_move_san)}</span>${Array.isArray(t.alt_moves_san) && t.alt_moves_san.length ? `, также: ${esc(t.alt_moves_san.join(' / '))}` : ''}</div>` : ''}
+      ${line ? `<div><strong>Линия:</strong> ${esc(line)}</div>` : ''}
+      ${task.source === 'own' && t.classification ? `<div><strong>Класс:</strong> ${esc(TASK_CLASS_RU[t.classification] || t.classification)}${t.drop != null ? `, потеря −${fmt(Math.abs(Number(t.drop)))}%` : ''}</div>` : ''}
+      ${judge && judge.kind ? `<div class="endgame-detail">Судья: ${esc(judge.kind)}</div>` : ''}
+      ${task.source === 'own' && task.game_id ? `<button class="btn btn-secondary" id="endgame-open-game" style="margin-top:8px">Открыть партию в анализе</button>` : ''}
+    </div>`;
+}
+
+async function selectEndgameTask(app, taskKey) {
+  state.endgameSelectedKey = taskKey;
+  state.endgameResult = null;
+  state.endgameAnswerText = '';
+  drawEndgame(app);
+}
+
+async function submitEndgameAnswer(app, move) {
+  const meta = state.endgameMeta;
+  const source = state.endgameSource === 'own' ? 'own' : 'master';
+  const task = selectedEndgameTask(meta, source, state.endgameSelectedKey);
+  const san = String(move || '').trim();
+  if (!task || !san) return;
+  state.endgameError = null;
+  state.endgameAnswerText = san;
+  try {
+    const res = await api('/api/endgame/answer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source, task_key: task.task_key, move: san }),
+    });
+    state.endgameResult = { source, task_key: task.task_key, ...res };
+    state.endgameSolved = state.endgameSolved || {};
+    state.endgameSolved[task.task_key] = res.result;
+    if (res.result === 'correct') {
+      try {
+        const fresh = await api('/api/endgame/meta?source=' + source);
+        state.endgameMeta = fresh;
+      } catch {}
+    }
+    drawEndgame(app);
+  } catch (err) {
+    state.endgameError = err.message;
+    showToast(err.message, 'error');
+    drawEndgame(app);
+  }
+}
+
+function selectedEndgameTask(meta, source, taskKey) {
+  const tasks = endgameTasksFor(meta, source);
+  return endgameTaskFor(meta, source, taskKey) || tasks[0] || null;
+}
+
+async function viewEndgame(app) {
+  if (!state.user) {
+    app.innerHTML = '<div class="onboarding card"><div class="empty-icon">♟</div><h1>Эндшпиль</h1><p>Выбери профиль на странице Профили.</p><a href="#" class="btn btn-primary" data-view="users">Профили</a></div>';
+    bindLinks(app);
+    return;
+  }
+  const source = state.endgameSource === 'own' ? 'own' : 'master';
+  state.endgameSource = source;
+  state.endgameError = null;
+  app.innerHTML = '<div class="card"><p>Загружаю эндшпили...</p></div>';
+  try {
+    const meta = await api('/api/endgame/meta?source=' + source);
+    state.endgameMeta = meta;
+    const tasks = endgameTasksFor(meta, source);
+    const current = state.endgameSelectedKey ? endgameTaskFor(meta, source, state.endgameSelectedKey) : null;
+    state.endgameSelectedKey = current ? current.task_key : (tasks[0] && tasks[0].task_key) || null;
+    state.endgameResult = null;
+    drawEndgame(app);
+  } catch (err) {
+    if (isSessionError(err)) { handleSessionExpired(); return; }
+    app.innerHTML = `<div class="card-header"><h1>Эндшпиль</h1></div><div class="alert alert-error">${esc(err.message)}</div><button class="btn btn-secondary" id="endgame-retry">Повторить</button>`;
+    document.getElementById('endgame-retry').addEventListener('click', () => viewEndgame(app));
+  }
+}
+
+function drawEndgame(app) {
+  const source = state.endgameSource === 'own' ? 'own' : 'master';
+  const meta = state.endgameMeta || { sources: ['master', 'own'], progress: { master: { total: 0, solved: 0 }, own: { total: 0, solved: 0 } }, master: [], own: [] };
+  const tasks = endgameTasksFor(meta, source);
+  const task = selectedEndgameTask(meta, source, state.endgameSelectedKey);
+  const resultFor = state.endgameResult && state.endgameResult.source === source && task && state.endgameResult.task_key === task.task_key ? state.endgameResult : null;
+  const answered = !!resultFor;
+  app.innerHTML = `
+    <div class="card-header"><h1>Эндшпиль</h1><span class="badge badge-blue">${esc(state.user.nick)}</span></div>
+    ${state.endgameError ? `<div class="alert alert-error">${esc(state.endgameError)}</div>` : ''}
+    <div class="card">
+      <div class="games-filter">
+        ${ENDGAME_SOURCES.map(src => `<button class="btn btn-secondary ${source === src.key ? 'btn-active' : ''}" data-endgame-source="${src.key}">${esc(src.label)}</button>`).join('')}
+      </div>
+      ${endgameProgressHtml(meta)}
+    </div>
+    ${tasks.length ? `
+      <div class="endgame-layout">
+        <div class="card endgame-list">
+          ${tasks.map(t => endgameTaskCardHtml(t, task && t.task_key === task.task_key)).join('')}
+        </div>
+        <div>
+          ${task ? `
+            <div class="card">
+              ${boardHtml(task.fen, { flip: task.turn === 'black' || task.user_color === 'black' })}
+              <div class="board-meta">
+                <span class="badge badge-blue">${esc(task.goal || '')}</span>
+                <span class="badge badge-neutral">${esc(task.concept_title || task.concept || '')}</span>
+                <span class="badge badge-neutral">ход: ${esc(task.turn || '')}</span>
+              </div>
+            </div>
+            ${endgameDetailHtml(task, answered)}
+            ${answered ? `<div class="game-side">${endgameResultHtml(resultFor, task)}</div>` : `
+              <form id="endgame-answer-form" class="form-row" style="gap:8px;align-items:flex-end;margin-top:8px">
+                <div class="form-group" style="flex:1;min-width:140px;margin-bottom:0"><label>Ход (SAN/UCI)</label><input type="text" id="endgame-answer" name="move" placeholder="напр. Rd1+ или Rd1d4" autocomplete="off" spellcheck="false" required></div>
+                <button class="btn btn-primary" style="height:38px">Ответить</button>
+              </form>`}
+          ` : '<div class="card"><p>Задач нет.</p></div>'}
+        </div>
+      </div>` : `
+      <div class="onboarding card"><div class="empty-icon">♟</div><h1>Нет эндшпилей</h1><p>${source === 'own' ? 'В анализе пока нет эндшпильных зевков/ошибок. Запусти анализ партий, тогда здесь появится твой материал.' : 'Нет доступных задач.'}</p>${source === 'own' ? '<a href="#" class="btn btn-primary" data-view="coach">Запустить анализ</a>' : ''}</div>`}`;
+  bindLinks(app);
+  app.querySelectorAll('[data-endgame-source]').forEach(btn => btn.addEventListener('click', () => {
+    state.endgameSource = btn.dataset.endgameSource;
+    state.endgameSelectedKey = null;
+    state.endgameResult = null;
+    viewEndgame(app);
+  }));
+  app.querySelectorAll('[data-endgame-task]').forEach(btn => btn.addEventListener('click', () => selectEndgameTask(app, btn.dataset.endgameTask)));
+  const form = document.getElementById('endgame-answer-form');
+  if (form) {
+    form.addEventListener('submit', e => {
+      e.preventDefault();
+      const input = document.getElementById('endgame-answer');
+      submitEndgameAnswer(app, input ? input.value : '');
+    });
+  }
+  const openGame = document.getElementById('endgame-open-game');
+  if (openGame) openGame.addEventListener('click', () => {
+    const t = task;
+    if (!t || !t.game_id) return;
+    navigate('games', { gameId: t.game_id, ply: Number(t.ply) });
+  });
+  const board = app.querySelector('.board');
+  if (board && task) {
+    if (answered) {
+      bindBoard(board);
+      return;
+    }
+    const taskKey = task.task_key;
+    api('/api/endgame/legal?source=' + encodeURIComponent(source) + '&task_key=' + encodeURIComponent(taskKey)).then(res => {
+      const current = document.querySelector('.board');
+      if (!current || state.endgameSelectedKey !== taskKey || state.endgameResult) return;
+      const moves = Array.isArray(res && res.moves) ? res.moves : [];
+      bindBoard(current, { moves, onMove: m => submitEndgameAnswer(app, m.san) });
+      const hint = document.getElementById('endgame-board-hint');
+      if (hint) hint.textContent = 'кликни фигуру, затем клетку — или введи ход текстом';
+    }).catch(() => { bindBoard(board); });
+  }
+}
 
 function openingStyleLabel(key) {
   const s = (state.openingStyles || []).find(x => x.key === key);

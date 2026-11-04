@@ -34,6 +34,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import data as shared_data
+from . import endgame as eg
 from . import middlegame as mg
 from . import theory
 from . import timeutil
@@ -777,6 +778,14 @@ class MiddlegamePlanBody(BaseModel):
 class MiddlegameMoveBody(BaseModel):
     """Тело POST /api/middlegame/session/{id}/move."""
 
+    move: str = ""
+
+
+class EndgameAnswerBody(BaseModel):
+    """Тело POST /api/endgame/answer."""
+
+    source: str = ""
+    task_key: str = ""
     move: str = ""
 
 
@@ -3428,7 +3437,7 @@ def create_api(
     db_path: Path | None = None,
     data_dir: Path | None = None,
 ) -> FastAPI:
-    app = FastAPI(title="Chess Trainer API", version="0.9.14", docs_url="/api/docs", redoc_url=None)
+    app = FastAPI(title="Chess Trainer API", version="0.9.15", docs_url="/api/docs", redoc_url=None)
     app.state.db_path = Path(db_path) if db_path else settings.db_path
     app.state.data_dir = Path(data_dir) if data_dir else settings.data_dir
 
@@ -5569,6 +5578,163 @@ def create_api(
         if session is None:
             raise HTTPException(404, "Сессия не найдена")
         return {"session": _middlegame_payload(session)}
+
+    # --- Тренер эндшпиля: задачи из своих партий + эталонные позиции ---
+
+    _ENDGAME_SOLVED_KEY = "endgame_solved"
+
+    def _endgame_solved_state(db: Database, nick: str) -> dict[str, Any]:
+        """Список решённых задач по источникам из meta (JSON, по пользователю)."""
+        raw = db.get_meta(f"{_ENDGAME_SOLVED_KEY}_{nick}")
+        if not raw:
+            return {"master": [], "own": []}
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            return {"master": [], "own": []}
+        if not isinstance(data, dict):
+            return {"master": [], "own": []}
+        result: dict[str, Any] = {"master": [], "own": []}
+        for source in ("master", "own"):
+            keys = data.get(source)
+            if isinstance(keys, list):
+                result[source] = [str(key) for key in keys if key]
+        return result
+
+    def _endgame_progress(
+        solved: dict[str, Any], source: str, task_keys: list[str]
+    ) -> dict[str, int]:
+        """Прогресс источника: всё и решённое (учёт только существующих задач)."""
+        done = set(solved.get(source) or [])
+        return {
+            "total": len(task_keys),
+            "solved": sum(1 for key in task_keys if key in done),
+        }
+
+    @app.get("/api/endgame/meta")
+    def api_endgame_meta(request: Request, source: str = ""):
+        user = _require_user(request)
+        key = (source or "").strip().lower()
+        if key not in ("", "own", "master"):
+            raise HTTPException(400, "source: own, master или пусто (оба источника)")
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            rows = eg.own_task_rows(db.get_analyzed_games(user["nick"], limit=500))
+            solved = _endgame_solved_state(db, user["nick"])
+        master_tasks = [eg.master_payload(task) for task in eg.MASTER_TASKS]
+        own_tasks = [eg.own_payload(row) for row in rows]
+        progress = {
+            "master": _endgame_progress(
+                solved, "master", [item["task_key"] for item in master_tasks]
+            ),
+            "own": _endgame_progress(
+                solved, "own", [item["task_key"] for item in own_tasks]
+            ),
+        }
+        return {
+            "sources": list(eg.SOURCES),
+            "progress": progress,
+            "master": master_tasks if key in ("", "master") else [],
+            "own": own_tasks if key in ("", "own") else [],
+        }
+
+    @app.get("/api/endgame/legal")
+    def api_endgame_legal(request: Request, source: str = "", task_key: str = ""):
+        """Легальные ходы задачи — для click-to-move на доске (без решения)."""
+        user = _require_user(request)
+        key = (source or "").strip().lower()
+        if key not in ("own", "master"):
+            raise HTTPException(400, "source: own или master")
+        chess_task_key = (task_key or "").strip()
+        if not chess_task_key:
+            raise HTTPException(400, "Нужен task_key")
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            if key == "master":
+                task = eg.MASTER_TASK_BY_KEY.get(chess_task_key)
+                if task is None:
+                    raise HTTPException(404, "Задача не найдена")
+                fen = task.fen
+            else:
+                rows = eg.own_task_rows(db.get_analyzed_games(user["nick"], limit=500))
+                row = next(
+                    (item for item in rows if item["task_key"] == chess_task_key), None
+                )
+                if row is None:
+                    raise HTTPException(404, "Задача не найдена")
+                fen = row["fen"]
+        board = chess.Board(fen)
+        moves = [
+            {
+                "from": chess.square_name(m.from_square),
+                "to": chess.square_name(m.to_square),
+                "san": board.san(m),
+            }
+            for m in board.legal_moves
+        ]
+        return {
+            "source": key,
+            "task_key": chess_task_key,
+            "fen": fen,
+            "turn": "white" if board.turn == chess.WHITE else "black",
+            "moves": moves,
+        }
+
+    @app.post("/api/endgame/answer")
+    def api_endgame_answer(request: Request, body: EndgameAnswerBody):
+        user = _require_user(request)
+        nick = user["nick"]
+        key = (body.source or "").strip().lower()
+        if key not in ("own", "master"):
+            raise HTTPException(400, "source: own или master")
+        chess_task_key = (body.task_key or "").strip()
+
+        def _check(db: Database) -> dict[str, Any]:
+            if key == "master":
+                task = eg.MASTER_TASK_BY_KEY.get(chess_task_key)
+                if task is None:
+                    raise HTTPException(404, "Задача не найдена")
+                board = chess.Board(task.fen)
+                solution = eg.master_solution(task)
+                payload = eg.master_payload(task, with_solution=True)
+            else:
+                rows = eg.own_task_rows(db.get_analyzed_games(nick, limit=500))
+                row = next(
+                    (item for item in rows if item["task_key"] == chess_task_key), None
+                )
+                if row is None:
+                    raise HTTPException(404, "Задача не найдена")
+                board = chess.Board(row["fen"])
+                solution = eg.own_solution(row)
+                payload = {**eg.own_payload(row), **solution}
+
+            move, san = eg.parse_move(board, body.move)
+            if move is None:
+                raise HTTPException(400, "Нет такого хода")
+            correct = eg.same_san(san, solution["best_move_san"]) or any(
+                eg.same_san(san, alt) for alt in solution.get("alt_moves_san") or []
+            )
+
+            # Судья опционален: Syzygy по SYZYGY_PATH, иначе Stockfish, сбой — None.
+            after = board.copy()
+            after.push(move)
+            judge = eg.judge_position(after)
+
+            result = "correct" if correct else "wrong"
+            if correct:
+                state = _endgame_solved_state(db, nick)
+                done = list(state.get(key) or [])
+                if chess_task_key not in done:
+                    done.append(chess_task_key)
+                    db.set_meta(
+                        f"{_ENDGAME_SOLVED_KEY}_{nick}",
+                        json.dumps({**state, key: done}, ensure_ascii=False),
+                    )
+            return {"ok": True, "result": result, "task": payload, "judge": judge}
+
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            return _check(db)
 
     # --- Auth: регистрация и вход (логин+пароль+lichess) ---
     @app.post("/api/auth/register")

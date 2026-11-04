@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.15 — 2026-11-04
+
+- New “Эндшпиль” trainer in the web app: choose between master endgame positions and endgame mistakes from your own analyzed games. Master tasks are curated theory (Lucena, Philidor, opposition, triangulation, key squares, active king, fortress, pawn race, rook exchange, mate net). Own tasks are derived only from cached analysis (blunder/mistake, phase=endgame) and show the game/ply with an “Открыть партию” button.
+- Answer endpoint validates SAN/UCI, returns the solution/line and optional engine/tablebase verdict; optional `SYZYGY_PATH` enables Syzygy tables, otherwise Stockfish is used; missing path never breaks the API.
+- Progress is stored per user in meta and shown in the trainer header.
+- Backend tests added; frontend uses the existing board and opens the exact ply in the game view.
+- 931 tests pass.
+
 ## 0.9.14 — 2026-11-03
 
 - Game IDs cited in the coach commentary are now clickable links. They open

@@ -104,6 +104,15 @@ def _resolve_stockfish_path() -> str:
     return configured
 
 
+def _resolve_syzygy_path() -> str:
+    """Путь к каталогу таблиц Syzygy из env SYZYGY_PATH; пусто — не используется.
+
+    Существование каталога не проверяем: судья (app.endgame._open_syzygy)
+    сам проверит и без таблиц тихо откатится на Stockfish.
+    """
+    return _cfg("SYZYGY_PATH", "").strip()
+
+
 @dataclass(frozen=True)
 class Settings:
     # --- аналитика ---
@@ -115,6 +124,10 @@ class Settings:
     stockfish_threads: int = _SF_THREADS
     stockfish_hash_mb: int = _SF_HASH_MB
     stockfish_time_ms: int = _SF_TIME_MS
+
+    # --- таблицы Syzygy (судья хода в эндшпильном тренере, опционально) ---
+    # Пусто по умолчанию: судья тогда использует Stockfish (app.analyzer.Engine).
+    syzygy_path: str = _resolve_syzygy_path()
 
     # --- lichess ---
     lichess_base_url: str = _cfg("LICHESS_BASE_URL", "https://lichess.org")
