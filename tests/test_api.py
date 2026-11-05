@@ -2721,12 +2721,12 @@ class FrontendTests(ApiTestBase):
         html = resp.text
         self.assertIn("app.js?v=", html)
         self.assertIn("style.css?v=", html)
-        self.assertIn("v0.9.16", html)
+        self.assertIn("v0.9.17", html)
         self.assertIn('id="nav-toggle"', html)
         self.assertIn('aria-controls="nav"', html)
 
     def test_api_version(self):
-        self.assertEqual(self.app.version, "0.9.16")
+        self.assertEqual(self.app.version, "0.9.17")
 
 
 class AuthApiTests(ApiTestBase):

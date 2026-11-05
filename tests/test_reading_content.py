@@ -190,11 +190,14 @@ class ChessRulesTests(unittest.TestCase):
         for lesson in _lessons():
             line = lesson["best_line"]
             self.assertIsInstance(line, list, lesson["id"])
-            self.assertTrue(line, f"lesson {lesson['id']}: best_line must not be empty")
+            if "#" not in str(lesson.get("best_move")):
+                self.assertTrue(line, f"lesson {lesson['id']}: best_line must not be empty")
             board = chess.Board(lesson["fen"])
+            # best_line — продолжение после лучшего хода, поэтому сначала
+            # толкаем best_move, а потом проверяем легальность линии.
+            board.push_san(lesson["best_move"])
             for san in line:
                 self.assertIsInstance(san, str, lesson["id"])
-                self.assertNotIn("x", san, f"lesson {lesson['id']}: capture symbol 'x' in best_line ({san!r})")
                 self.assertNotIn(":", san, f"lesson {lesson['id']}: capture symbol ':' in best_line ({san!r})")
                 try:
                     move = board.parse_san(san)

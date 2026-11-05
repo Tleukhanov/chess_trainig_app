@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.17 — 2026-11-05
+
+- Reading course answers corrected to engine-best moves. Accepted moves are now
+  only moves within ~20 cp of Stockfish depth 14; every best move and line was
+  revalidated with a fresh engine.
+- 1032 tests pass.
+
 ## 0.9.16 — 2026-11-05
 
 - New “Моя система” reading trainer in the nav: 6 original chapters based on
