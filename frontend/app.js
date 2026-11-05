@@ -82,6 +82,16 @@ const state = {
   middlegameOptimistic: null,
   middlegameHuman: true,
   openingHuman: true,
+  readingMeta: null,
+  readingSession: null,
+  readingResult: null,
+  readingAnswerText: '',
+  readingPlanDraft: '',
+  readingBusy: false,
+  readingError: null,
+  readingChapterSummary: null,
+  readingReview: null,
+  readingBoardShown: false,
   authMode: 'login',
   trackStarted: false,
 };
@@ -151,7 +161,7 @@ function setupTheme() {
 
 // --- Navigation ---
 
-const views = ['dashboard', 'overview', 'plan', 'progress', 'games', 'drills', 'task', 'opening', 'endgame', 'middlegame', 'coach', 'tools', 'users', 'admin'];
+const views = ['dashboard', 'overview', 'plan', 'progress', 'games', 'drills', 'task', 'opening', 'endgame', 'middlegame', 'reading', 'coach', 'tools', 'users', 'admin'];
 
 function clearAllTimers() {
   if (state.taskPlayTimer) { clearInterval(state.taskPlayTimer); state.taskPlayTimer = null; }
@@ -525,6 +535,7 @@ async function render(view) {
       case 'task': await viewTask(app); break;
       case 'opening': await viewOpening(app); break;
       case 'middlegame': await viewMiddlegame(app); break;
+      case 'reading': await viewReading(app); break;
       case 'endgame': await viewEndgame(app); break;
       case 'coach': await viewCoach(app); break;
       case 'tools': await viewTools(app); break;
@@ -6632,6 +6643,550 @@ async function viewUsers(app) {
       openLichessManual();
     });
   }
+}
+
+// --- Тренер чтения: «Моя система» (Нимцович) ---
+
+const READING_VERDICT_RU = {
+  correct: 'верно ✓',
+  acceptable: 'приемлемо',
+  incorrect: 'неверно',
+  invalid: 'ход не разобран',
+};
+const READING_REVIEW_VERDICT_RU = { incorrect: 'неверно', invalid: 'ход не разобран' };
+const READING_STATUS_RU = {
+  completed: ['пройдена', 'badge-good'],
+  in_progress: ['в процессе', 'badge-blue'],
+  not_started: ['не начата', 'badge-neutral'],
+};
+const READING_LESSON_STATUS_RU = {
+  completed: ['пройден', 'badge-good'],
+  in_progress: ['в процессе', 'badge-blue'],
+  not_started: ['не начат', 'badge-neutral'],
+};
+const READING_SIDE_RU = { white: 'белые', black: 'чёрные' };
+
+function readingStatusBadge(status, map) {
+  const source = map || READING_STATUS_RU;
+  const entry = source[status] || [String(status || '—'), 'badge-neutral'];
+  return `<span class="badge ${entry[1]}">${esc(entry[0])}</span>`;
+}
+
+function readingAccuracyPct(value) {
+  if (value == null || Number.isNaN(Number(value))) return '—';
+  return `${Math.round(Number(value) * 100)}%`;
+}
+
+function readingSourceHtml(source) {
+  if (!source) return '';
+  const title = esc(source.title || '');
+  const url = safeHttp(source.url || '');
+  const linked = url !== '#' && source.url
+    ? `<a href="${esc(url)}" target="_blank" rel="noopener">${title}</a>`
+    : title;
+  const note = source.license_note ? ` · ${esc(source.license_note)}` : '';
+  return `<div class="reading-source">Источник: ${linked}${note}</div>`;
+}
+
+function readingReviewItemHtml(item) {
+  const dateValue = Number(item && item.created_at);
+  const date = Number.isFinite(dateValue) && dateValue > 0
+    ? new Date(dateValue).toLocaleDateString('ru-RU')
+    : '';
+  const verdict = READING_REVIEW_VERDICT_RU[item && item.verdict] || String((item && item.verdict) || '');
+  const meta = [item && item.move ? `сыграно: ${item.move}` : '', verdict, date].filter(Boolean).join(' · ');
+  return `
+    <div class="reading-review-item">
+      <div>
+        <div class="endgame-task-title">${esc((item && (item.lesson_title || item.lesson_id)) || 'Урок')}</div>
+        <div class="endgame-task-meta">${esc(meta)}</div>
+      </div>
+      <button type="button" class="btn btn-secondary" data-reading-retry-chapter="${esc((item && item.chapter_id) || '')}" data-reading-retry-lesson="${esc((item && item.lesson_id) || '')}">Повторить</button>
+    </div>`;
+}
+
+function readingCatalogHtml(meta, review) {
+  const course = (meta && meta.course) || {};
+  const source = meta && meta.source;
+  const chapters = (meta && Array.isArray(meta.chapters) ? meta.chapters : []).slice().sort((a, b) => (Number(a.order) || 0) - (Number(b.order) || 0));
+  const reviewItems = (review && Array.isArray(review.items)) ? review.items : [];
+  const reviewCount = review && Number.isFinite(Number(review.count)) ? Number(review.count) : reviewItems.length;
+  const cards = chapters.map(ch => {
+    const total = Number(ch.lessons_total) || 0;
+    const completed = Number(ch.completed) || 0;
+    const pct = total ? Math.round((completed / total) * 100) : 0;
+    return `
+      <button type="button" class="endgame-task reading-chapter-card" data-reading-chapter="${esc(ch.id)}">
+        <div class="endgame-task-title">${esc(String(ch.order != null ? ch.order : ''))}. ${esc(ch.title || '')}</div>
+        <div class="endgame-task-meta">${esc(ch.summary || '')}</div>
+        <div class="job-progress" role="progressbar" aria-label="Пройдено уроков" aria-valuemin="0" aria-valuemax="${total}" aria-valuenow="${completed}"><div class="job-progress-bar" style="width:${pct}%"></div></div>
+        <div class="endgame-task-badges">
+          <span class="badge badge-neutral">${completed}/${total} уроков</span>
+          <span class="badge badge-neutral" title="Доля верных ответов от всех попыток">точность: ${esc(readingAccuracyPct(ch.accuracy))}</span>
+          ${readingStatusBadge(ch.status, READING_STATUS_RU)}
+        </div>
+      </button>`;
+  }).join('');
+  return `
+    <div class="card-header"><h1>Моя система</h1><span class="badge badge-blue">${esc((state.user && state.user.nick) || '')}</span></div>
+    <div class="card">
+      <div class="card-header"><span class="card-title">${esc(course.title || 'Курс')}</span>${course.version != null ? `<span class="badge badge-neutral">v${esc(String(course.version))}</span>` : ''}</div>
+      <p class="reading-muted">Главы курса: читайте идею, затем решайте позицию на доске. Решение раскрывается только после ответа.</p>
+      ${readingSourceHtml(source)}
+    </div>
+    ${chapters.length ? `<div class="endgame-list">${cards}</div>` : '<div class="card"><p>Глав пока нет.</p></div>'}
+    <div class="card" style="margin-top:16px">
+      <div class="card-header"><span class="card-title">Повторение ошибок</span><span class="badge ${reviewCount ? 'badge-bad' : 'badge-good'}">${esc(String(reviewCount))}</span></div>
+      ${review && reviewItems.length
+        ? reviewItems.map(readingReviewItemHtml).join('')
+        : '<p class="reading-muted">Неверных ответов пока нет.</p>'}
+      ${readingSourceHtml(source)}
+    </div>`;
+}
+
+function readingChapterHtml(summary, source) {
+  const chapter = (summary && summary.chapter) || {};
+  const progress = (summary && summary.progress) || {};
+  const lessons = (summary && Array.isArray(summary.lessons)) ? summary.lessons : [];
+  const total = Number(progress.lessons_total) || lessons.length || 0;
+  const completed = Number(progress.completed) || 0;
+  const pct = total ? Math.round((completed / total) * 100) : 0;
+  const correctFirst = Number(progress.correct_first_attempt) || 0;
+  const rows = lessons.map(l => `
+    <div class="reading-lesson-row">
+      <div>
+        <div class="endgame-task-title">${esc(l.title || '')}</div>
+        <div class="endgame-task-meta">сложность ${esc(String(l.difficulty != null ? l.difficulty : '—'))} · попыток: ${esc(String(l.attempts != null ? l.attempts : 0))}</div>
+      </div>
+      <div class="reading-lesson-actions">
+        ${readingStatusBadge(l.status, READING_LESSON_STATUS_RU)}
+        <button type="button" class="btn btn-secondary" data-reading-lesson="${esc(l.lesson_id || '')}">${l.status === 'completed' ? 'Повторить' : 'Решать'}</button>
+      </div>
+    </div>`).join('');
+  return `
+    <div class="card-header"><h1>Моя система</h1><span class="badge badge-blue">${esc((state.user && state.user.nick) || '')}</span></div>
+    <div class="card">
+      <div class="card-header"><span class="card-title">${esc(String(chapter.order != null ? chapter.order : ''))}. ${esc(chapter.title || '')}</span>${readingStatusBadge(progress.status, READING_STATUS_RU)}</div>
+      <p>${esc(chapter.summary || '')}</p>
+      <div class="job-progress" role="progressbar" aria-label="Пройдено уроков" aria-valuemin="0" aria-valuemax="${total}" aria-valuenow="${completed}"><div class="job-progress-bar" style="width:${pct}%"></div></div>
+      <div class="grid grid-2" style="margin-top:12px">
+        <div class="card stat"><div class="stat-value">${esc(String(completed))}/${esc(String(total))}</div><div class="stat-label">Пройдено уроков</div></div>
+        <div class="card stat"><div class="stat-value">${esc(readingAccuracyPct(progress.accuracy))}</div><div class="stat-label">Точность</div></div>
+      </div>
+      <div class="endgame-detail" style="margin-top:8px">С первой попытки верно: ${esc(String(correctFirst))} из ${esc(String(total))}</div>
+      <div class="games-filter" style="margin-top:12px">
+        <button type="button" class="btn btn-primary" id="reading-start-chapter" ${state.readingBusy ? 'disabled' : ''}>${completed > 0 ? 'Продолжить главу' : 'Начать главу'}</button>
+        <button type="button" class="btn btn-secondary" id="reading-back-catalog">← Все главы</button>
+      </div>
+      ${readingSourceHtml(source)}
+    </div>
+    <div class="card">
+      <div class="card-header"><span class="card-title">Уроки</span><span class="badge badge-neutral">${esc(String(lessons.length))}</span></div>
+      <div class="endgame-list">${rows || '<p class="reading-muted">В этой главе пока нет уроков.</p>'}</div>
+      ${readingSourceHtml(source)}
+    </div>`;
+}
+
+function readingBoardCardHtml(lesson, source) {
+  const side = lesson && lesson.side;
+  const flip = side === 'black';
+  return `
+    <div class="card">
+      ${boardHtml((lesson && lesson.fen) || '', { flip })}
+      <div class="board-meta">
+        <span class="badge badge-blue">ход: ${esc(READING_SIDE_RU[side] || side || '—')}</span>
+        ${lesson && lesson.difficulty != null ? `<span class="badge badge-neutral">сложность ${esc(String(lesson.difficulty))}</span>` : ''}
+        ${lesson && lesson.type ? `<span class="badge badge-neutral">${esc(lesson.type)}</span>` : ''}
+      </div>
+      ${readingSourceHtml(source)}
+    </div>`;
+}
+
+function readingResultHtml(result, session) {
+  if (!result) {
+    // 409: ответ уже на сервере, но раскрытие решения в этом сеансе не вернуть.
+    return `
+    <div class="card reading-verdict" id="reading-verdict" tabindex="-1" aria-live="polite">
+      <div class="card-header"><span class="card-title">Ответ уже отправлен</span><span class="badge badge-neutral">учтено</span></div>
+      <p class="reading-muted">Ход засчитан ранее. Раскрытие решения в этом сеансе недоступно — откройте главу, чтобы увидеть прогресс.</p>
+      <div class="games-filter" style="margin-top:12px">
+        <button type="button" class="btn btn-secondary" id="reading-back-chapter">К главе</button>
+      </div>
+    </div>`;
+  }
+  const verdict = (result && result.verdict) || '';
+  const revealed = (result && result.revealed) || {};
+  const move = (result && result.move) || {};
+  const ok = verdict === 'correct';
+  const badgeClass = ok ? 'badge-good' : (verdict === 'acceptable' ? 'badge-blue' : 'badge-bad');
+  const verdictLabel = READING_VERDICT_RU[verdict] || verdict || '—';
+  const line = Array.isArray(revealed.best_line) ? revealed.best_line.join(' ') : String(revealed.best_line || '');
+  const accepted = Array.isArray(result && result.accepted_moves) ? result.accepted_moves
+    : (Array.isArray(revealed.accepted_moves) ? revealed.accepted_moves : []);
+  const concepts = Array.isArray(revealed.concepts) ? revealed.concepts : [];
+  return `
+    <div class="card reading-verdict" id="reading-verdict" tabindex="-1" aria-live="polite">
+      <div class="card-header"><span class="card-title">Результат</span><span class="badge ${badgeClass}">${esc(verdictLabel)}</span></div>
+      <div style="margin-bottom:8px">Ваш ход: <span class="drill-best">${esc(move.played_san || state.readingAnswerText || '—')}</span></div>
+      ${revealed.best_move ? `<div><strong>Лучший ход:</strong> <span class="drill-best">${esc(revealed.best_move)}</span></div>` : ''}
+      ${line ? `<div><strong>Линия:</strong> ${esc(line)}</div>` : ''}
+      ${accepted.length ? `<div class="reading-muted" style="margin-top:4px">Принимаются также: ${esc(accepted.join(' / '))}</div>` : ''}
+      ${revealed.why ? `<div class="mentor-reply" style="margin-top:10px">${esc(revealed.why)}</div>` : ''}
+      ${concepts.length ? `<div class="endgame-task-badges" style="margin-top:10px">${concepts.map(c => `<span class="badge badge-neutral">${esc(c)}</span>`).join('')}</div>` : ''}
+      ${result && result.judge_kind ? `<div class="endgame-detail" style="margin-top:8px">Судья: ${esc(result.judge_kind)}</div>` : ''}
+      <div class="games-filter" style="margin-top:12px">
+        <button type="button" class="btn btn-primary" id="reading-next" ${state.readingBusy ? 'disabled' : ''}>Следующая позиция</button>
+        <button type="button" class="btn btn-secondary" id="reading-back-chapter">К главе</button>
+      </div>
+    </div>`;
+}
+
+function readingSkippedHtml(session) {
+  return `
+    <div class="card" id="reading-verdict" tabindex="-1" aria-live="polite">
+      <div class="card-header"><span class="card-title">Урок пропущен</span><span class="badge badge-neutral">пропущен</span></div>
+      <p class="reading-muted">Ответ не раскрыт. Можно вернуться к уроку позже.</p>
+      <div class="games-filter" style="margin-top:12px">
+        <button type="button" class="btn btn-primary" id="reading-retry-lesson" ${state.readingBusy ? 'disabled' : ''}>Повторить урок</button>
+        <button type="button" class="btn btn-secondary" id="reading-back-chapter">К главе</button>
+      </div>
+    </div>`;
+}
+
+function readingSessionHtml(session, source) {
+  const lesson = (session && session.lesson) || {};
+  const status = (session && session.status) || 'active';
+  const answered = status === 'answered';
+  const skipped = status === 'skipped';
+  const showBoard = state.readingBoardShown || answered || skipped;
+  const header = `
+    <div class="card-header"><h1>Моя система</h1><span class="badge badge-blue">${esc((state.user && state.user.nick) || '')}</span></div>`;
+  if (!showBoard) {
+    return `${header}
+    <div class="card reading-lesson-card">
+      <div class="card-header"><span class="card-title">${esc(lesson.title || 'Урок')}</span>${lesson.difficulty != null ? `<span class="badge badge-neutral">сложность ${esc(String(lesson.difficulty))}</span>` : ''}</div>
+      <div class="mentor-reply reading-text">${esc(lesson.text || '')}</div>
+      ${session && session.goal ? `<div class="endgame-detail" style="margin-top:10px"><strong>Задание:</strong> ${esc(session.goal)}</div>` : ''}
+      ${lesson.question ? `<div class="reading-question"><strong>Вопрос:</strong> ${esc(lesson.question)}</div>` : ''}
+      <div class="games-filter" style="margin-top:12px">
+        <button type="button" class="btn btn-primary" id="reading-show-board">К позиции</button>
+        <button type="button" class="btn btn-secondary" id="reading-back-chapter">К главе</button>
+      </div>
+      ${readingSourceHtml(source)}
+    </div>`;
+  }
+  let side;
+  if (answered) {
+    side = readingResultHtml(state.readingResult, session);
+  } else if (skipped) {
+    side = readingSkippedHtml(session);
+  } else {
+    side = `
+    <div class="card">
+      <div class="card-header"><span class="card-title">Ответ</span></div>
+      ${lesson.question ? `<div class="reading-question" style="margin-top:0"><strong>Вопрос:</strong> ${esc(lesson.question)}</div>` : ''}
+      <form id="reading-answer-form" style="margin-top:12px">
+        <div class="form-group">
+          <label for="reading-answer">Ход (SAN или UCI)</label>
+          <input type="text" id="reading-answer" name="move" placeholder="напр. Rad1 или a1d1" autocomplete="off" spellcheck="false" required value="${esc(state.readingAnswerText || '')}">
+        </div>
+        <div class="form-group">
+          <label for="reading-plan">План (необязательно)</label>
+          <textarea id="reading-plan" name="plan" rows="3" maxlength="4000" placeholder="${esc(lesson.plan_prompt || 'Опиши план в одном-двух предложениях')}">${esc(state.readingPlanDraft || '')}</textarea>
+          ${lesson.plan_prompt ? `<div class="reading-muted" style="margin-top:4px">${esc(lesson.plan_prompt)}</div>` : ''}
+        </div>
+        ${state.readingError ? `<div class="alert alert-error" role="alert">${esc(state.readingError)}</div>` : ''}
+        <div class="games-filter">
+          <button type="submit" class="btn btn-primary" ${state.readingBusy ? 'disabled' : ''}>${state.readingBusy ? 'Проверяю…' : 'Ответить'}</button>
+          <button type="button" class="btn btn-secondary" id="reading-skip" ${state.readingBusy ? 'disabled' : ''}>Пропустить</button>
+        </div>
+      </form>
+    </div>`;
+  }
+  return `${header}
+    <div class="grid game-layout">
+      ${readingBoardCardHtml(lesson, source)}
+      <div class="game-side">${side}</div>
+    </div>`;
+}
+
+async function viewReading(app) {
+  if (!state.user) {
+    app.innerHTML = '<div class="onboarding card"><div class="empty-icon">♞</div><h1>Моя система</h1><p>Профиль не выбран — выбери его на странице Профили.</p><a href="#" class="btn btn-primary" data-view="users">Профили</a></div>';
+    bindLinks(app);
+    return;
+  }
+  state.readingError = null;
+  if (state.readingSession) {
+    if (!state.readingMeta) {
+      state.readingMeta = await api('/api/reading/meta').catch(() => null);
+    }
+    drawReading(app);
+    return;
+  }
+  if (state.readingChapterSummary) {
+    const chapterId = ((state.readingChapterSummary.chapter || {}).chapter_id) || '';
+    if (chapterId) {
+      try {
+        state.readingChapterSummary = await api('/api/reading/chapters/' + encodeURIComponent(chapterId) + '/summary');
+      } catch (err) {
+        if (isSessionError(err)) { handleSessionExpired(); return; }
+        state.readingError = err.message;
+      }
+    }
+    if (!state.readingMeta) {
+      state.readingMeta = await api('/api/reading/meta').catch(() => null);
+    }
+    drawReading(app);
+    return;
+  }
+  app.innerHTML = '<div class="card"><p>Загружаю курс...</p></div>';
+  try {
+    const [meta, review] = await Promise.all([
+      api('/api/reading/meta'),
+      api('/api/reading/review').catch(() => null),
+    ]);
+    state.readingMeta = meta;
+    state.readingReview = review;
+    drawReading(app);
+  } catch (err) {
+    if (isSessionError(err)) { handleSessionExpired(); return; }
+    app.innerHTML = `<div class="card-header"><h1>Моя система</h1></div><div class="alert alert-error">${esc(err.message)}</div><button class="btn btn-secondary" id="reading-retry">Повторить</button>`;
+    const retry = document.getElementById('reading-retry');
+    if (retry) retry.addEventListener('click', () => viewReading(app));
+  }
+}
+
+function drawReading(app) {
+  if (state.currentView !== 'reading') return;
+  const source = (state.readingMeta && state.readingMeta.source) || null;
+  if (state.readingSession) {
+    app.innerHTML = readingSessionHtml(state.readingSession, source);
+  } else if (state.readingChapterSummary) {
+    app.innerHTML = readingChapterHtml(state.readingChapterSummary, source) +
+      (state.readingError ? `<div class="alert alert-error">${esc(state.readingError)}</div>` : '');
+  } else {
+    app.innerHTML = readingCatalogHtml(state.readingMeta, state.readingReview) +
+      (state.readingError ? `<div class="alert alert-error">${esc(state.readingError)}</div>` : '');
+  }
+  bindReading(app);
+  const verdict = document.getElementById('reading-verdict');
+  if (verdict && state.readingSession && state.readingSession.status !== 'active') verdict.focus();
+}
+
+function resetReadingSessionState() {
+  state.readingSession = null;
+  state.readingResult = null;
+  state.readingAnswerText = '';
+  state.readingPlanDraft = '';
+  state.readingBoardShown = false;
+  state.readingBusy = false;
+  state.readingError = null;
+}
+
+async function openReadingChapter(app, chapterId) {
+  if (!chapterId || state.readingBusy) return;
+  state.readingBusy = true;
+  state.readingError = null;
+  app.innerHTML = '<div class="card"><p>Загружаю главу...</p></div>';
+  try {
+    state.readingChapterSummary = await api('/api/reading/chapters/' + encodeURIComponent(chapterId) + '/summary');
+    state.readingBusy = false;
+    drawReading(app);
+  } catch (err) {
+    state.readingBusy = false;
+    if (isSessionError(err)) { handleSessionExpired(); return; }
+    state.readingChapterSummary = null;
+    state.readingError = err.message;
+    showToast(err.message, 'error');
+    drawReading(app);
+  }
+}
+
+async function startReadingSession(app, chapterId, lessonId) {
+  if (!chapterId || state.readingBusy) return;
+  state.readingBusy = true;
+  state.readingError = null;
+  try {
+    const form = new FormData();
+    form.append('chapter_id', chapterId);
+    if (lessonId) form.append('lesson_id', lessonId);
+    const session = await apiPost('/api/reading/session', form);
+    resetReadingSessionState();
+    state.readingSession = session;
+    state.readingBusy = false;
+    drawReading(app);
+    window.scrollTo(0, 0);
+  } catch (err) {
+    state.readingBusy = false;
+    if (isSessionError(err)) { handleSessionExpired(); return; }
+    state.readingError = err.message;
+    showToast(err.message, 'error');
+    drawReading(app);
+  }
+}
+
+async function readingBackToChapter(app) {
+  const chapterId = (state.readingSession && state.readingSession.chapter_id) ||
+    ((state.readingChapterSummary && state.readingChapterSummary.chapter && state.readingChapterSummary.chapter.chapter_id) || '');
+  resetReadingSessionState();
+  if (!chapterId) {
+    state.readingChapterSummary = null;
+    viewReading(app);
+    return;
+  }
+  await openReadingChapter(app, chapterId);
+}
+
+async function readingBackToCatalog(app) {
+  resetReadingSessionState();
+  state.readingChapterSummary = null;
+  state.readingReview = null;
+  viewReading(app);
+}
+
+async function submitReadingAnswer(app) {
+  const session = state.readingSession;
+  if (!session || state.readingBusy) return;
+  const moveInput = document.getElementById('reading-answer');
+  const planInput = document.getElementById('reading-plan');
+  const move = (moveInput ? moveInput.value : state.readingAnswerText || '').trim();
+  state.readingAnswerText = move;
+  if (planInput) state.readingPlanDraft = planInput.value;
+  if (!move) {
+    state.readingError = 'Введите ход (SAN или UCI)';
+    drawReading(app);
+    const input = document.getElementById('reading-answer');
+    if (input) input.focus();
+    return;
+  }
+  state.readingBusy = true;
+  state.readingError = null;
+  try {
+    const form = new FormData();
+    form.append('move', move);
+    form.append('plan', (state.readingPlanDraft || '').trim());
+    const result = await apiPost('/api/reading/session/' + encodeURIComponent(session.session_id) + '/answer', form);
+    state.readingResult = result;
+    state.readingSession = Object.assign({}, session, {
+      status: 'answered',
+      attempts: (Number(session.attempts) || 0) + 1,
+    });
+    state.readingBusy = false;
+    drawReading(app);
+  } catch (err) {
+    state.readingBusy = false;
+    if (isSessionError(err)) { handleSessionExpired(); return; }
+    if (err.status === 409) {
+      showToast('Ответ уже отправлен', 'error');
+      try {
+        state.readingSession = await api('/api/reading/session/' + encodeURIComponent(session.session_id));
+      } catch { /* сессию не восстановили — оставляем локальную копию */ }
+      drawReading(app);
+      return;
+    }
+    state.readingError = err.message;
+    drawReading(app);
+  }
+}
+
+async function skipReadingLesson(app) {
+  const session = state.readingSession;
+  if (!session || state.readingBusy) return;
+  state.readingBusy = true;
+  state.readingError = null;
+  try {
+    const form = new FormData();
+    form.append('reason', 'Пропущено в тренажёре');
+    await apiPost('/api/reading/session/' + encodeURIComponent(session.session_id) + '/skip', form);
+    state.readingSession = Object.assign({}, session, { status: 'skipped' });
+    state.readingResult = null;
+    state.readingBusy = false;
+    drawReading(app);
+  } catch (err) {
+    state.readingBusy = false;
+    if (isSessionError(err)) { handleSessionExpired(); return; }
+    if (err.status === 409) {
+      showToast('Ответ уже отправлен', 'error');
+      try {
+        state.readingSession = await api('/api/reading/session/' + encodeURIComponent(session.session_id));
+      } catch { /* сессию не восстановили — оставляем локальную копию */ }
+      drawReading(app);
+      return;
+    }
+    state.readingError = err.message;
+    drawReading(app);
+  }
+}
+
+function bindReading(app) {
+  app.querySelectorAll('[data-reading-chapter]').forEach(btn => {
+    btn.addEventListener('click', () => openReadingChapter(app, btn.getAttribute('data-reading-chapter')));
+  });
+  app.querySelectorAll('[data-reading-lesson]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const chapterId = (state.readingChapterSummary && state.readingChapterSummary.chapter && state.readingChapterSummary.chapter.chapter_id) || '';
+      startReadingSession(app, chapterId, btn.getAttribute('data-reading-lesson'));
+    });
+  });
+  app.querySelectorAll('[data-reading-retry-chapter]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      startReadingSession(app, btn.getAttribute('data-reading-retry-chapter'), btn.getAttribute('data-reading-retry-lesson'));
+    });
+  });
+  const startChapter = document.getElementById('reading-start-chapter');
+  if (startChapter) {
+    startChapter.addEventListener('click', () => {
+      const chapterId = (state.readingChapterSummary && state.readingChapterSummary.chapter && state.readingChapterSummary.chapter.chapter_id) || '';
+      startReadingSession(app, chapterId, null);
+    });
+  }
+  const backCatalog = document.getElementById('reading-back-catalog');
+  if (backCatalog) backCatalog.addEventListener('click', () => readingBackToCatalog(app));
+  const showBoard = document.getElementById('reading-show-board');
+  if (showBoard) {
+    showBoard.addEventListener('click', () => {
+      state.readingBoardShown = true;
+      drawReading(app);
+      const input = document.getElementById('reading-answer');
+      if (input) input.focus();
+    });
+  }
+  app.querySelectorAll('#reading-back-chapter').forEach(btn => {
+    btn.addEventListener('click', () => readingBackToChapter(app));
+  });
+  const form = document.getElementById('reading-answer-form');
+  if (form) {
+    form.addEventListener('submit', e => {
+      e.preventDefault();
+      submitReadingAnswer(app);
+    });
+    const moveInput = document.getElementById('reading-answer');
+    if (moveInput) moveInput.addEventListener('input', () => { state.readingAnswerText = moveInput.value; });
+    const planInput = document.getElementById('reading-plan');
+    if (planInput) planInput.addEventListener('input', () => { state.readingPlanDraft = planInput.value; });
+  }
+  const skip = document.getElementById('reading-skip');
+  if (skip) skip.addEventListener('click', () => skipReadingLesson(app));
+  const next = document.getElementById('reading-next');
+  if (next) {
+    next.addEventListener('click', () => {
+      const chapterId = (state.readingSession && state.readingSession.chapter_id) || '';
+      resetReadingSessionState();
+      startReadingSession(app, chapterId, null);
+    });
+  }
+  const retryLesson = document.getElementById('reading-retry-lesson');
+  if (retryLesson) {
+    retryLesson.addEventListener('click', () => {
+      const chapterId = (state.readingSession && state.readingSession.chapter_id) || '';
+      const lessonId = (state.readingSession && state.readingSession.lesson_id) || '';
+      resetReadingSessionState();
+      startReadingSession(app, chapterId, lessonId);
+    });
+  }
+  const board = app.querySelector('.board');
+  if (board) bindBoard(board);
 }
 
 // --- Utilities ---

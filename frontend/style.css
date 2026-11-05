@@ -950,3 +950,47 @@ td.center { text-align: center; }
 .endgame-task-meta, .endgame-detail { color: var(--c-text-muted); font-size: 12px; line-height: 1.4; }
 .endgame-detail { margin-top: 4px; }
 @media (max-width: 960px) { .endgame-layout { grid-template-columns: 1fr; } }
+
+/* Тренажёр чтения «Моя система» */
+.reading-source {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--c-border);
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--c-text-muted);
+}
+.reading-text { line-height: 1.65; }
+.reading-question {
+  margin-top: 12px;
+  padding: 10px 12px;
+  background: var(--c-bg-box-alt);
+  border: 1px solid var(--c-border);
+  border-radius: 8px;
+  line-height: 1.5;
+}
+.reading-muted { color: var(--c-text-muted); font-size: 13px; line-height: 1.45; }
+.reading-lesson-row {
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  align-items: center;
+  border: 1px solid var(--c-border);
+  border-radius: 12px;
+  padding: 10px 12px;
+}
+.reading-lesson-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.reading-review-item {
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--c-border);
+}
+.reading-review-item:last-child { border-bottom: none; padding-bottom: 0; }
+.reading-verdict:focus { outline: 2px solid var(--c-link); outline-offset: 2px; }
+@media (max-width: 640px) {
+  .reading-lesson-row, .reading-review-item { flex-direction: column; align-items: flex-start; }
+  .reading-lesson-actions { flex-wrap: wrap; }
+}
