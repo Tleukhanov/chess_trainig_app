@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.16 — 2026-11-05
+
+- New “Моя система” reading trainer in the nav: 6 original chapters based on
+  public-domain My System ideas, validated FEN/answer moves, no text copied,
+  and integrated lesson/answer flow with progress and review.
+- Add backend reading APIs, attempts storage, and full frontend catalog/board
+  UI; reset stale-cache behavior via version bump after ship.
+- 1032 tests pass.
+
 ## 0.9.15 — 2026-11-04
 
 - New “Эндшпиль” trainer in the web app: choose between master endgame positions and endgame mistakes from your own analyzed games. Master tasks are curated theory (Lucena, Philidor, opposition, triangulation, key squares, active king, fortress, pawn race, rook exchange, mate net). Own tasks are derived only from cached analysis (blunder/mistake, phase=endgame) and show the game/ply with an “Открыть партию” button.
