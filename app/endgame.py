@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import dataclasses
 from typing import Any, Callable
 
 import chess
@@ -102,6 +103,9 @@ class MasterTask:
     alt_moves: tuple[str, ...]
     best_line: tuple[str, ...]
     why: str
+    # Движок не "исправляет" идею автора, а показывает свой вариант отдельно.
+    engine_best_move_san: str | None = None
+    engine_best_line: tuple[str, ...] = ()
 
 
 # --- эталонные (master) позиции --------------------------------------------
@@ -243,6 +247,48 @@ MASTER_TASKS: tuple[MasterTask, ...] = (
     ),
 )
 
+def _engine_best_for_task(fen: str) -> tuple[str | None, tuple[str, ...]]:
+    """Лучший ход Stockfish для master-позиции, если движок доступен.
+
+    Возвращает (None, ()) при отсутствии бинаря или ошибке. Для чтения
+    это не критично: идея автора остаётся главной, а движок только
+    показывает свой вариант.
+    """
+    try:
+        with Engine(depth=14, multipv=1, time_ms=800) as engine:
+            lines = engine.analyze_position(chess.Board(fen))
+    except Exception:
+        return None, ()
+    if not lines or not lines[0].get("pv"):
+        return None, ()
+    board = chess.Board(fen)
+    move_san = lines[0]["pv"][0]
+    try:
+        move = board.parse_san(str(move_san))
+        best = board.san(move)
+    except (ValueError, TypeError):
+        return None, ()
+    line: list[str] = []
+    try:
+        board.push_san(best)
+        for next_san in lines[0]["pv"][1:7]:
+            move = board.parse_san(str(next_san))
+            line.append(board.san(move))
+            board.push(move)
+    except (ValueError, TypeError):
+        line = []
+    return best, tuple(line)
+
+
+MASTER_TASKS = tuple(
+    dataclasses.replace(
+        task,
+        engine_best_move_san=engine_best,
+        engine_best_line=engine_line,
+    )
+    for task in MASTER_TASKS
+    for engine_best, engine_line in [_engine_best_for_task(task.fen)]
+)
 MASTER_TASK_BY_KEY: dict[str, MasterTask] = {task.key: task for task in MASTER_TASKS}
 
 
@@ -273,12 +319,14 @@ def master_payload(task: MasterTask, *, with_solution: bool = False) -> dict[str
 
 
 def master_solution(task: MasterTask) -> dict[str, Any]:
-    """Решение master-позиции: ход, равные альтернативы, линия и «почему»."""
+    """Решение master-позиции: идея автора, альтернативы и вариант компьютера."""
     return {
         "best_move_san": task.best_move_san,
         "alt_moves_san": list(task.alt_moves),
         "best_line": list(task.best_line),
         "why": task.why,
+        "engine_best_move_san": task.engine_best_move_san,
+        "engine_best_line": list(task.engine_best_line or ()),
     }
 
 

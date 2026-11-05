@@ -1,6 +1,6 @@
 // Chess Trainer Frontend — SPA на vanilla JS, потребляет /api/* эндпоинты.
 
-import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.9.17';
+import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.9.19';
 
 const state = {
   user: null,
@@ -3318,7 +3318,12 @@ function endgameResultHtml(result, task) {
     <div class="card">
       <div class="card-header"><span class="card-title">Результат</span><span class="badge ${ok ? 'badge-good' : 'badge-bad'}">${ok ? 'верно ✓' : 'неверно'}</span></div>
       ${t.why ? `<div class="mentor-reply" style="margin-bottom:8px">${esc(t.why)}</div>` : ''}
-      ${t.best_move_san ? `<div><strong>Лучший ход:</strong> <span class="drill-best">${esc(t.best_move_san)}</span>${Array.isArray(t.alt_moves_san) && t.alt_moves_san.length ? `, также: ${esc(t.alt_moves_san.join(' / '))}` : ''}</div>` : ''}
+      ${task.source === 'master' ? `
+        ${t.best_move_san ? `<div><strong>Идея автора:</strong> <span class="drill-best">${esc(t.best_move_san)}</span>${Array.isArray(t.alt_moves_san) && t.alt_moves_san.length ? `, также: ${esc(t.alt_moves_san.join(' / '))}` : ''}</div>` : ''}
+        ${t.engine_best_move_san ? `<div><strong>Компьютер:</strong> <span class="drill-best">${esc(t.engine_best_move_san)}</span>${Array.isArray(t.engine_best_line) && t.engine_best_line.length ? ` · ${esc(t.engine_best_line.join(' '))}` : ''}</div>` : ''}
+      ` : `
+        ${t.best_move_san ? `<div><strong>Лучший ход:</strong> <span class="drill-best">${esc(t.best_move_san)}</span>${Array.isArray(t.alt_moves_san) && t.alt_moves_san.length ? `, также: ${esc(t.alt_moves_san.join(' / '))}` : ''}</div>` : ''}
+      `}
       ${line ? `<div><strong>Линия:</strong> ${esc(line)}</div>` : ''}
       ${task.source === 'own' && t.classification ? `<div><strong>Класс:</strong> ${esc(TASK_CLASS_RU[t.classification] || t.classification)}${t.drop != null ? `, потеря −${fmt(Math.abs(Number(t.drop)))}%` : ''}</div>` : ''}
       ${judge && judge.kind ? `<div class="endgame-detail">Судья: ${esc(judge.kind)}</div>` : ''}

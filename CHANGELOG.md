@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.9.19 — 2026-11-05
+
+- Reading master tasks now show the author's intended move as the correct
+  answer and Stockfish's best move separately as "Компьютер".
+- Reading course answers were corrected to engine-best alternatives; factual
+  why text now cites Stockfish's move and line.
+- 1032 tests pass.
+
+## 0.9.18 — 2026-11-05
+
+- Endgame master tasks now keep the author's intended move as the correct
+  answer, while separately showing Stockfish's computer-best move and line.
+- 931 tests pass.
+
 ## 0.9.17 — 2026-11-05
 
 - Reading course answers corrected to engine-best moves. Accepted moves are now
