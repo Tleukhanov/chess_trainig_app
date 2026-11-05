@@ -36,6 +36,7 @@ from pydantic import BaseModel, Field
 from . import data as shared_data
 from . import endgame as eg
 from . import middlegame as mg
+from . import reading
 from . import theory
 from . import timeutil
 from .analyzer import Engine, win_percent
@@ -5578,6 +5579,287 @@ def create_api(
         if session is None:
             raise HTTPException(404, "Сессия не найдена")
         return {"session": _middlegame_payload(session)}
+
+    # --- Тренер чтения: «Моя система» (Нимцович) ---
+
+    _READING_GOAL = "Найдите лучший ход и кратко опишите план."
+    _READING_WRONG_VERDICTS = ("incorrect", "invalid")
+
+    def _reading_session_rows(
+        db: Database, nick: str, session_id: str
+    ) -> list[dict[str, Any]]:
+        return db.get_reading_attempts(nick, session_id=session_id, limit=100)
+
+    def _reading_session_lesson(
+        db: Database, nick: str, session_id: str
+    ) -> tuple[reading.ReadingLesson | None, list[dict[str, Any]]]:
+        """Урок и все строки сессии; чужой/битый session_id → (None, [])."""
+        rows = _reading_session_rows(db, nick, session_id)
+        if not rows:
+            return None, []
+        anchor = rows[0]
+        try:
+            lesson = reading.find_lesson(
+                reading.COURSE,
+                str(anchor.get("chapter_id") or ""),
+                str(anchor.get("lesson_id") or ""),
+            )
+        except KeyError:
+            return None, rows
+        return lesson, rows
+
+    def _reading_answered(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [r for r in rows
+                if str(r.get("verdict") or "").strip().lower() in reading.VERDICTS]
+
+    def _reading_session_payload(
+        lesson: reading.ReadingLesson,
+        session_id: str,
+        rows: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        answered = _reading_answered(rows)
+        return {
+            "session_id": session_id,
+            "course_id": reading.COURSE.id,
+            "course_version": reading.COURSE.version,
+            "chapter_id": lesson.chapter_id,
+            "lesson_id": lesson.id,
+            "goal": _READING_GOAL,
+            "status": "answered" if answered else "active",
+            "attempts": len(answered),
+            "lesson": reading.lesson_payload(lesson),
+        }
+
+    def _reading_progress(db: Database, nick: str) -> reading.Progress:
+        attempts = db.get_reading_attempts(nick, course_id=reading.COURSE.id)
+        return reading.build_progress(attempts)
+
+    @app.get("/api/reading/meta")
+    def api_reading_meta(request: Request):
+        user = _require_user(request)
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            progress = _reading_progress(db, user["nick"])
+        meta = reading.get_course_meta(reading.COURSE)
+        meta["chapters"] = [
+            {
+                "id": entry["chapter_id"],
+                "title": entry["title"],
+                "summary": entry["summary"],
+                "order": entry["order"],
+                "lessons_total": entry["lessons_total"],
+                "completed": entry["completed"],
+                "correct_first_attempt": entry["correct_first_attempt"],
+                "accuracy": entry["accuracy"],
+                "status": entry["status"],
+            }
+            for entry in reading.list_chapters(reading.COURSE, progress)
+        ]
+        return meta
+
+    @app.post("/api/reading/session")
+    def api_reading_session_create(
+        request: Request,
+        chapter_id: str = Form(...),
+        lesson_id: str = Form(""),
+    ):
+        user = _require_user(request)
+        nick = user["nick"]
+        chapter_key = (chapter_id or "").strip()
+        if not chapter_key:
+            raise HTTPException(400, "Нужен chapter_id")
+        lesson_key = (lesson_id or "").strip() or None
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            progress = _reading_progress(db, nick)
+            try:
+                session = reading.create_session(
+                    reading.COURSE, nick, chapter_key, lesson_key, progress
+                )
+            except KeyError:
+                raise HTTPException(404, "Глава или урок не найдены") from None
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
+            db.create_reading_attempt(
+                session_id=session["session_id"],
+                player=nick,
+                course_id=session["course_id"],
+                chapter_id=session["chapter_id"],
+                lesson_id=session["lesson_id"],
+                verdict="started",
+                course_version=session["course_version"],
+            )
+        lesson = reading.find_lesson(
+            reading.COURSE, session["chapter_id"], session["lesson_id"]
+        )
+        return _reading_session_payload(lesson, session["session_id"], [])
+
+    @app.get("/api/reading/session/{session_id}")
+    def api_reading_session_get(session_id: str, request: Request):
+        user = _require_user(request)
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            lesson, rows = _reading_session_lesson(db, user["nick"], session_id)
+        if not rows:
+            raise HTTPException(404, "Сессия не найдена")
+        if lesson is None:
+            raise HTTPException(404, "Урок не найден в текущей версии курса")
+        return _reading_session_payload(lesson, session_id, rows)
+
+    @app.post("/api/reading/session/{session_id}/answer")
+    def api_reading_answer(
+        session_id: str,
+        request: Request,
+        move: str = Form(...),
+        plan: str = Form(""),
+    ):
+        user = _require_user(request)
+        nick = user["nick"]
+        move_clean = (move or "").strip()
+        if not move_clean:
+            raise HTTPException(400, "Нужен ход (SAN или UCI)")
+        try:
+            plan_clean = reading.validate_plan(plan)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            lesson, rows = _reading_session_lesson(db, nick, session_id)
+            if not rows:
+                raise HTTPException(404, "Сессия не найдена")
+            if lesson is None:
+                raise HTTPException(404, "Урок не найден в текущей версии курса")
+            if _reading_answered(rows):
+                raise HTTPException(409, "Ответ уже отправлен")
+            result = reading.judge_answer(reading.COURSE, lesson, move_clean, plan_clean)
+            if result["verdict"] == "invalid":
+                # Ход не разобран — 400, попытку не сохраняем.
+                raise HTTPException(
+                    400, result.get("message") or "Ход не разобран"
+                )
+            db.create_reading_attempt(
+                session_id=session_id,
+                player=nick,
+                course_id=reading.COURSE.id,
+                chapter_id=lesson.chapter_id,
+                lesson_id=lesson.id,
+                verdict=result["verdict"],
+                answer_move=(result.get("move") or {}).get("played_san"),
+                plan=plan_clean or None,
+                judge_kind=result.get("judge_kind"),
+                engine_depth=lesson.engine.depth,
+                course_version=reading.COURSE.version,
+            )
+        return {
+            "session_id": session_id,
+            "chapter_id": lesson.chapter_id,
+            "lesson_id": lesson.id,
+            "verdict": result["verdict"],
+            "judge_kind": result.get("judge_kind"),
+            "move": result.get("move"),
+            "plan": result.get("plan"),
+            "accepted_moves": result.get("accepted_moves"),
+            "revealed": reading.revealed_payload(lesson),
+        }
+
+    @app.post("/api/reading/session/{session_id}/skip")
+    def api_reading_skip(
+        session_id: str,
+        request: Request,
+        reason: str = Form(""),
+    ):
+        user = _require_user(request)
+        nick = user["nick"]
+        reason_clean = (reason or "").strip()[:200]
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            lesson, rows = _reading_session_lesson(db, nick, session_id)
+            if not rows:
+                raise HTTPException(404, "Сессия не найдена")
+            if lesson is None:
+                raise HTTPException(404, "Урок не найден в текущей версии курса")
+            if _reading_answered(rows):
+                raise HTTPException(409, "Ответ уже отправлен")
+            already_skipped = any(
+                str(r.get("verdict") or "").strip().lower() == "skipped"
+                for r in rows
+            )
+            if not already_skipped:
+                db.create_reading_attempt(
+                    session_id=session_id,
+                    player=nick,
+                    course_id=reading.COURSE.id,
+                    chapter_id=lesson.chapter_id,
+                    lesson_id=lesson.id,
+                    verdict="skipped",
+                    plan=reason_clean or None,
+                    course_version=reading.COURSE.version,
+                )
+        return {"session_id": session_id, "status": "skipped"}
+
+    @app.get("/api/reading/chapters/{chapter_id}/summary")
+    def api_reading_chapter_summary(chapter_id: str, request: Request):
+        user = _require_user(request)
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            progress = _reading_progress(db, user["nick"])
+        try:
+            return reading.get_chapter_meta(reading.COURSE, progress, chapter_id)
+        except KeyError:
+            raise HTTPException(404, "Глава не найдена") from None
+
+    @app.get("/api/reading/review")
+    def api_reading_review(
+        request: Request,
+        chapter_id: str = "",
+        limit: int = 20,
+    ):
+        user = _require_user(request)
+        nick = user["nick"]
+        chapter_key = (chapter_id or "").strip()
+        if chapter_key:
+            try:
+                reading.find_chapter(reading.COURSE, chapter_key)
+            except KeyError:
+                raise HTTPException(404, "Глава не найдена") from None
+        cap = max(1, min(limit, 100))
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            rows = db.get_reading_attempts(
+                nick,
+                course_id=reading.COURSE.id,
+                chapter_id=chapter_key or None,
+                limit=500,
+            )
+        wrong = [
+            r for r in rows
+            if str(r.get("verdict") or "").strip().lower() in _READING_WRONG_VERDICTS
+        ][:cap]
+        items: list[dict[str, Any]] = []
+        for row in wrong:
+            lesson_title: str | None = None
+            try:
+                lesson = reading.find_lesson(
+                    reading.COURSE,
+                    str(row.get("chapter_id") or ""),
+                    str(row.get("lesson_id") or ""),
+                )
+                lesson_title = lesson.title
+            except KeyError:
+                pass
+            items.append(
+                {
+                    "attempt_id": row.get("id"),
+                    "session_id": row.get("session_id"),
+                    "chapter_id": row.get("chapter_id"),
+                    "lesson_id": row.get("lesson_id"),
+                    "lesson_title": lesson_title,
+                    "verdict": row.get("verdict"),
+                    "move": row.get("answer_move"),
+                    "created_at": row.get("created_at"),
+                }
+            )
+        return {"items": items, "count": len(items)}
 
     # --- Тренер эндшпиля: задачи из своих партий + эталонные позиции ---
 

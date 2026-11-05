@@ -69,6 +69,7 @@ __all__ = [
     "MAX_PLAN_CHARS",
     "PASSING_VERDICTS",
     "VERDICTS",
+    "IGNORED_VERDICTS",
     "STATUS_NOT_STARTED",
     "STATUS_IN_PROGRESS",
     "STATUS_COMPLETED",
@@ -483,12 +484,24 @@ def build_progress(attempts: Iterable[Mapping[str, Any]] | None) -> Progress:
     return Progress(tuple(row for row in attempts if isinstance(row, Mapping)))
 
 
+#: Вердикты-заглушки (сессия создана / урок пропущен): не считаются
+#: ответами в статистике прогресса и не портят accuracy.
+IGNORED_VERDICTS = frozenset({"started", "skipped"})
+
 def _attempts_of(progress: Progress | Iterable[Mapping[str, Any]] | None) -> tuple[Mapping[str, Any], ...]:
     if progress is None:
         return ()
     if isinstance(progress, Progress):
-        return progress.attempts
-    return tuple(row for row in progress if isinstance(row, Mapping))
+        rows = progress.attempts
+        return tuple(
+            row for row in rows
+            if str(row.get("verdict") or "").strip().lower() not in IGNORED_VERDICTS
+        )
+    return tuple(
+        row for row in progress
+        if isinstance(row, Mapping)
+        and str(row.get("verdict") or "").strip().lower() not in IGNORED_VERDICTS
+    )
 
 
 def _timestamp(row: Mapping[str, Any]) -> int:
