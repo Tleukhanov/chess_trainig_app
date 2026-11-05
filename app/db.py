@@ -16,6 +16,7 @@ import json
 import os
 import sqlite3
 import time
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -206,6 +207,29 @@ CREATE TABLE IF NOT EXISTS {table}(
 )
 """
 
+# Попытки в «Тренере чтения»: одна строка на ответ. История не перезаписывается
+# (по ней строится повторение и аналитика). Эталон/решение из контента сюда
+# не пишется — только то, что прислал игрок, и вердикт судьи. ``course_version``
+# хранит версию контента на момент попытки, чтобы обновление курса не ломало
+# старые записи. Колонка ``player``, а не ``user`` (см. move_notes).
+_READING_ATTEMPTS_DDL = """
+CREATE TABLE IF NOT EXISTS {table}(
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    player TEXT NOT NULL,
+    course_id TEXT NOT NULL,
+    chapter_id TEXT NOT NULL,
+    lesson_id TEXT NOT NULL,
+    answer_move TEXT,
+    plan TEXT,
+    verdict TEXT NOT NULL,
+    judge_kind TEXT,
+    engine_depth INTEGER,
+    course_version INTEGER,
+    created_at BIGINT NOT NULL
+)
+"""
+
 _GAME_COLUMNS = (
     "id, player, rated, speed, created_at, status, winner, white, black, "
     "opening, eco, user_color, opponent, user_rating, user_rating_diff, "
@@ -241,6 +265,7 @@ _BIGINT_COLUMNS = (
     ("middlegame_sessions", "updated_at"),
     ("move_notes", "updated_at"),
     ("theory_cache", "fetched_at"),
+    ("reading_attempts", "created_at"),
 )
 
 
@@ -272,6 +297,7 @@ _SCHEMA = f"""
 {_DAILY_PLAN_DDL.format(table="daily_plan")};
 {_DAILY_LOG_DDL.format(table="daily_log")};
 {_RATING_SNAPSHOTS_DDL.format(table="rating_snapshots")};
+{_READING_ATTEMPTS_DDL.format(table="reading_attempts")};
 CREATE TABLE IF NOT EXISTS sessions(
     token TEXT PRIMARY KEY,
     nick TEXT,
@@ -285,6 +311,8 @@ CREATE INDEX IF NOT EXISTS idx_middlegame_sessions_player ON middlegame_sessions
 CREATE INDEX IF NOT EXISTS idx_sessions_nick ON sessions(nick);
 CREATE INDEX IF NOT EXISTS idx_daily_log_date ON daily_log(date);
 CREATE INDEX IF NOT EXISTS idx_rating_snapshots_date ON rating_snapshots(date);
+CREATE INDEX IF NOT EXISTS idx_reading_attempts_player_lesson ON reading_attempts(player, lesson_id);
+CREATE INDEX IF NOT EXISTS idx_reading_attempts_session ON reading_attempts(session_id);
 """
 
 # Новые колонки users (миграция без потери данных — см. init_db).
@@ -564,6 +592,7 @@ def _migrate_v3(path: Path | str) -> None:
         # что init_db потом выполнит весь _SCHEMA.
         conn.execute(_MOVE_NOTES_DDL.format(table="move_notes"))
         conn.execute(_THEORY_CACHE_DDL.format(table="theory_cache"))
+        conn.execute(_READING_ATTEMPTS_DDL.format(table="reading_attempts"))
 
         # analyses раньше игр: пока в нём есть FK на games, пересборка games
         # оставила бы висячую ссылку.
@@ -719,6 +748,7 @@ class Database:
             _ensure_bigint(conn)
             conn.execute(_MOVE_NOTES_DDL.format(table="move_notes"))
             conn.execute(_THEORY_CACHE_DDL.format(table="theory_cache"))
+            conn.execute(_READING_ATTEMPTS_DDL.format(table="reading_attempts"))
             existing = {
                 row["column_name"]
                 for row in conn.execute(
@@ -1942,6 +1972,201 @@ class Database:
             ).fetchall()
         return [str(row["position_key"]) for row in rows]
 
+    # --- попытки «Тренера чтения» --------------------------------------
+
+    @staticmethod
+    def _required_text(value: Any, name: str) -> str:
+        """Нормализует обязательную строку или поднимает ``ValueError``."""
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError(f"{name} не должен быть пустым")
+        return text
+
+    @staticmethod
+    def _opt_text(value: Any) -> str | None:
+        """Необязательная строка: пустая/только пробелы → None."""
+        text = str(value or "").strip()
+        return text or None
+
+    @staticmethod
+    def _opt_int(value: Any, name: str) -> int | None:
+        """Необязательное целое: None → None, мусор → ``ValueError``."""
+        if value is None or value == "":
+            return None
+        try:
+            return int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            raise ValueError(f"{name} должен быть целым числом") from None
+
+    def create_reading_attempt(
+        self,
+        *,
+        session_id: str,
+        player: str,
+        course_id: str,
+        chapter_id: str,
+        lesson_id: str,
+        verdict: str,
+        attempt_id: str | None = None,
+        answer_move: str | None = None,
+        plan: str | None = None,
+        judge_kind: str | None = None,
+        engine_depth: int | None = None,
+        course_version: int | None = None,
+        created_at: int | None = None,
+    ) -> dict[str, Any]:
+        """Создаёт попытку чтения и возвращает её строку как dict.
+
+        ``attempt_id`` генерируется (uuid4 hex), если не передан. Эталон
+        (решение из контента) не сохраняется — только ответ игрока и вердикт.
+        ``created_at`` — миллисекунды эпохи; по умолчанию берётся текущее
+        время. Обязательные поля пустыми не принимаются.
+        """
+        row = {
+            "id": self._required_text(attempt_id, "attempt_id")
+            if attempt_id is not None
+            else uuid.uuid4().hex,
+            "session_id": self._required_text(session_id, "session_id"),
+            "player": self._required_text(player, "player"),
+            "course_id": self._required_text(course_id, "course_id"),
+            "chapter_id": self._required_text(chapter_id, "chapter_id"),
+            "lesson_id": self._required_text(lesson_id, "lesson_id"),
+            "answer_move": self._opt_text(answer_move),
+            "plan": self._opt_text(plan),
+            "verdict": self._required_text(verdict, "verdict"),
+            "judge_kind": self._opt_text(judge_kind),
+            "engine_depth": self._opt_int(engine_depth, "engine_depth"),
+            "course_version": self._opt_int(course_version, "course_version"),
+            "created_at": self._opt_int(created_at, "created_at")
+            if created_at is not None
+            else int(time.time() * 1000),
+        }
+        with self._connection() as conn:
+            conn.execute(
+                "INSERT INTO reading_attempts"
+                "(id, session_id, player, course_id, chapter_id, lesson_id, "
+                "answer_move, plan, verdict, judge_kind, engine_depth, "
+                "course_version, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    row["id"],
+                    row["session_id"],
+                    row["player"],
+                    row["course_id"],
+                    row["chapter_id"],
+                    row["lesson_id"],
+                    row["answer_move"],
+                    row["plan"],
+                    row["verdict"],
+                    row["judge_kind"],
+                    row["engine_depth"],
+                    row["course_version"],
+                    row["created_at"],
+                ),
+            )
+        return row
+
+    def get_reading_attempt(
+        self, attempt_id: str, player: str
+    ) -> dict[str, Any] | None:
+        """Попытка по id, но только своя: чужой id → None (как games/sessions)."""
+        attempt = (attempt_id or "").strip()
+        if not attempt:
+            return None
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM reading_attempts "
+                "WHERE id = ? AND LOWER(player) = LOWER(?)",
+                (attempt, player),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_reading_attempts(
+        self,
+        player: str,
+        course_id: str | None = None,
+        *,
+        chapter_id: str | None = None,
+        lesson_id: str | None = None,
+        session_id: str | None = None,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Попытки игрока, самые новые первыми (по created_at DESC, id DESC).
+
+        Фильтры необязательны и комбинируются через AND. ``limit=None`` —
+        без ограничения; ``limit <= 0`` — пустой список. Негативные/битые
+        ``offset`` трактуются как 0.
+        """
+        key = (player or "").strip()
+        if not key:
+            return []
+        where = ["LOWER(player) = LOWER(?)"]
+        params: list[Any] = [key]
+        for column, value in (
+            ("course_id", course_id),
+            ("chapter_id", chapter_id),
+            ("lesson_id", lesson_id),
+            ("session_id", session_id),
+        ):
+            text = (value or "").strip() if isinstance(value, str) else value
+            if text:
+                where.append(f"{column} = ?")
+                params.append(text)
+        sql = "SELECT * FROM reading_attempts WHERE " + " AND ".join(where)
+        sql += " ORDER BY created_at DESC, id DESC"
+        try:
+            resolved_offset = max(0, int(offset))
+        except (TypeError, ValueError):
+            resolved_offset = 0
+        if limit is not None:
+            try:
+                resolved_limit = int(limit)
+            except (TypeError, ValueError):
+                resolved_limit = 0
+            if resolved_limit <= 0:
+                return []
+            sql += " LIMIT ? OFFSET ?"
+            params.extend([resolved_limit, resolved_offset])
+        elif resolved_offset:
+            sql += " OFFSET ?"
+            params.append(resolved_offset)
+        with self._connection() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def count_reading_attempts(
+        self,
+        player: str,
+        course_id: str | None = None,
+        *,
+        chapter_id: str | None = None,
+        lesson_id: str | None = None,
+        session_id: str | None = None,
+    ) -> int:
+        """Число попыток игрока с теми же фильтрами, что и у выборки."""
+        key = (player or "").strip()
+        if not key:
+            return 0
+        where = ["LOWER(player) = LOWER(?)"]
+        params: list[Any] = [key]
+        for column, value in (
+            ("course_id", course_id),
+            ("chapter_id", chapter_id),
+            ("lesson_id", lesson_id),
+            ("session_id", session_id),
+        ):
+            text = (value or "").strip() if isinstance(value, str) else value
+            if text:
+                where.append(f"{column} = ?")
+                params.append(text)
+        sql = "SELECT COUNT(*) AS n FROM reading_attempts WHERE " + " AND ".join(
+            where
+        )
+        with self._connection() as conn:
+            row = conn.execute(sql, params).fetchone()
+        return int(row["n"] or 0) if row else 0
+
     def set_user_fide(self, nick: str, fide_id: str | None) -> None:
         """Записывает FIDE ID в профиль игрока; None — очищает поле.
 
@@ -1960,13 +2185,15 @@ class Database:
             )
 
     def delete_user(self, nick: str) -> bool:
-        """Удаляет профиль, его партии, анализ этих партий и заметки к ходам.
+        """Удаляет профиль, его партии, анализ этих партий, заметки к ходам
+        и reading-попытки.
 
         True — профиль был. Порядок: сначала analyses (ссылок на games не
         нарушаем), затем games и move_notes, затем users. ``analyses`` привязан
         только к ``game_id`` (без user) и общий для всех: удаляются лишь записи,
         чьи партии принадлежат исключительно этому игроку — общий кеш партий
-        между двумя профилями остаётся.
+        между двумя профилями остаётся. ``reading_attempts`` удаляются по
+        ``player`` (LOWER-сравнение, одинаково в SQLite и PostgreSQL).
 
         Файлы на диске (data/<ник>/) не трогаются — только строки БД.
         Если удалялся закреплённый игрок — он сбрасывается.
@@ -1987,6 +2214,7 @@ class Database:
             )
             conn.execute("DELETE FROM games WHERE LOWER(player) = LOWER(?)", (key,))
             conn.execute("DELETE FROM sessions WHERE LOWER(nick) = LOWER(?)", (key,))
+            conn.execute("DELETE FROM reading_attempts WHERE LOWER(player) = LOWER(?)", (key,))
             conn.execute("DELETE FROM opening_sessions WHERE LOWER(player) = LOWER(?)", (key,))
             conn.execute("DELETE FROM middlegame_sessions WHERE LOWER(player) = LOWER(?)", (key,))
             conn.execute("DELETE FROM task_explanations WHERE LOWER(player) = LOWER(?)", (key,))

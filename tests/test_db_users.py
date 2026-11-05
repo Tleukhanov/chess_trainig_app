@@ -286,5 +286,93 @@ class UsersCrudTests(unittest.TestCase):
             self.assertEqual(conn.execute("SELECT count(*) FROM users").fetchone()[0], 1)
 
 
+class ReadingAttemptsTests(unittest.TestCase):
+    """Попытки «Тренера чтения»: roundtrip, фильтры, очистка при удалении."""
+
+    def setUp(self) -> None:
+        self.tmpdir = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, self.tmpdir, True)
+        self.db = Database(self.tmpdir / "reading.db")
+        self.db.init_db()
+        self.addCleanup(self.db.close)
+
+    def _attempt(self, **overrides):
+        params = {
+            "session_id": "s1",
+            "player": "Ada",
+            "course_id": "my_system",
+            "chapter_id": "ch1",
+            "lesson_id": "l1",
+            "verdict": "correct",
+        }
+        params.update(overrides)
+        return self.db.create_reading_attempt(**params)
+
+    def test_create_and_get_roundtrip(self) -> None:
+        created = self._attempt(
+            answer_move="e4",
+            plan="центр",
+            judge_kind="engine",
+            engine_depth=14,
+            course_version=3,
+        )
+        self.assertTrue(created["id"])
+        fetched = self.db.get_reading_attempt(created["id"], "ada")
+        self.assertIsNotNone(fetched)
+        self.assertEqual(fetched["course_version"], 3)
+        self.assertEqual(fetched["engine_depth"], 14)
+        self.assertEqual(fetched["answer_move"], "e4")
+        # чужая попытка по id не возвращается
+        self.db.upsert_user("bob")
+        self.assertIsNone(self.db.get_reading_attempt(created["id"], "bob"))
+
+    def test_filters_and_count(self) -> None:
+        self._attempt(lesson_id="l1", course_version=1)
+        self._attempt(lesson_id="l2", verdict="wrong")
+        self._attempt(course_id="other", lesson_id="l1")
+        self.assertEqual(self.db.count_reading_attempts("ADA"), 3)
+        self.assertEqual(self.db.count_reading_attempts("ada", "my_system"), 2)
+        self.assertEqual(
+            self.db.count_reading_attempts("ada", "my_system", lesson_id="l1"), 1
+        )
+        mine = self.db.get_reading_attempts("ada", "my_system", lesson_id="l1")
+        self.assertEqual([row["lesson_id"] for row in mine], ["l1"])
+        self.assertEqual(len(self.db.get_reading_attempts("ada", limit=2)), 2)
+        self.assertEqual(self.db.get_reading_attempts("ada", limit=0), [])
+
+    def test_create_validates_required_fields(self) -> None:
+        with self.assertRaises(ValueError):
+            self._attempt(verdict="")
+        with self.assertRaises(ValueError):
+            self._attempt(player="   ")
+
+    def test_delete_user_removes_reading_attempts(self) -> None:
+        self.db.upsert_user("ada")
+        self.db.upsert_user("bob")
+        self._attempt(player="ada")
+        self._attempt(player="BOB")
+        self.assertTrue(self.db.delete_user("ada"))
+        self.assertEqual(self.db.count_reading_attempts("ada"), 0)
+        self.assertEqual(self.db.count_reading_attempts("bob"), 1)
+
+    def test_fresh_db_has_reading_attempts(self) -> None:
+        with self.db._connection() as conn:
+            names = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            indexes = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index'"
+                ).fetchall()
+            }
+        self.assertIn("reading_attempts", names)
+        self.assertIn("idx_reading_attempts_player_lesson", indexes)
+        self.assertIn("idx_reading_attempts_session", indexes)
+
+
 if __name__ == "__main__":
     unittest.main()
