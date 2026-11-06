@@ -15,6 +15,7 @@ from typing import Any
 from .games import Game
 from .metrics import METRIC_LABELS, metric
 from .patterns import PHASE_LABELS, weakness_stats
+from .themes import MIN_THEME_SAMPLE, THEMES, THEME_LABELS
 
 __all__ = ["build_report", "format_report"]
 
@@ -40,6 +41,99 @@ def _plural(num: int, one: str, few: str, many: str) -> str:
 def _resolved(move: dict[str, Any]) -> dict[str, Any]:
     """Нормализует запись хода, защищаясь от отсутствующих ключей."""
     return move if move is not None else {}
+
+
+def _theme_stats(pairs: list[tuple[Game, dict]]) -> dict[str, Any]:
+    """Агрегат по темам ходов (tactics/positional/attack).
+
+    Считаются только ходы пользователя с полем ``themes`` (старые кеши без
+    разметки пропускаются). Записи с ``confidence=low`` не попадают в
+    opportunity-метрики, а считаются как ``unknown``. Если возможностей
+    меньше ``MIN_THEME_SAMPLE`` — ``insufficient=True``: отчёт обязан
+    показать «недостаточно данных», а не 0%.
+    """
+    per_theme: dict[str, dict[str, Any]] = {
+        theme: {
+            "opportunities": 0,
+            "executed": 0,
+            "missed": 0,
+            "errors": 0,
+            "unknown": 0,
+            "drop_sum": 0.0,
+            "drop_n": 0,
+            "examples": [],
+        }
+        for theme in THEMES
+    }
+    annotated = 0
+
+    for game, analysis in pairs:
+        user_is_white = (analysis.get("user_color") or "white") == "white"
+        moves = analysis.get("moves") or []
+        for ply, move in enumerate(moves):
+            if not isinstance(move, dict):
+                continue
+            if (ply % 2 == 0) != user_is_white:
+                continue
+            themes = move.get("themes")
+            if not isinstance(themes, dict):
+                continue
+            annotated += 1
+            opportunities = themes.get("theme_opportunities") or []
+            used = themes.get("theme_used") or []
+            confidence = themes.get("confidence") or {}
+            drop = themes.get("drop")
+            if not isinstance(drop, (int, float)):
+                drop = move.get("drop")
+            if not isinstance(drop, (int, float)):
+                drop = None
+            drop = float(drop) if drop is not None else None
+            classification = move.get("classification")
+            for theme in THEMES:
+                slot = per_theme[theme]
+                if theme in opportunities:
+                    slot["opportunities"] += 1
+                    if theme in used:
+                        slot["executed"] += 1
+                    else:
+                        slot["missed"] += 1
+                        if drop is not None and drop >= 5.0:
+                            slot["examples"].append(
+                                {
+                                    "game_id": game.id,
+                                    "ply": ply,
+                                    "san": move.get("san"),
+                                    "drop": round(drop, 2),
+                                    "classification": classification,
+                                    "best_move_san": move.get("best_move_san"),
+                                }
+                            )
+                    if classification in ("mistake", "blunder"):
+                        slot["errors"] += 1
+                    if drop is not None:
+                        slot["drop_sum"] += drop
+                        slot["drop_n"] += 1
+                elif confidence.get(theme) == "low":
+                    slot["unknown"] += 1
+
+    result: dict[str, Any] = {"moves_annotated": annotated, "min_sample": MIN_THEME_SAMPLE}
+    for theme in THEMES:
+        slot = per_theme[theme]
+        examples = sorted(slot["examples"], key=lambda e: -e["drop"])[:3]
+        result[theme] = {
+            "label": THEME_LABELS[theme],
+            "opportunities": slot["opportunities"],
+            "executed": slot["executed"],
+            "missed": slot["missed"],
+            "errors": slot["errors"],
+            "avg_win_loss": (
+                round(slot["drop_sum"] / slot["drop_n"], 2) if slot["drop_n"] else None
+            ),
+            "unknown": slot["unknown"],
+            "insufficient": slot["opportunities"] < MIN_THEME_SAMPLE,
+            "examples": examples,
+        }
+    return result
 
 
 def build_report(pairs: list[tuple[Game, dict]], user: str) -> dict[str, Any]:
@@ -154,6 +248,7 @@ def build_report(pairs: list[tuple[Game, dict]], user: str) -> dict[str, Any]:
     opening_rows.sort(key=lambda item: (-item["games"], item["name"]))
 
     weakness = weakness_stats(pairs)
+    themes = _theme_stats(pairs)
 
     blunders_per_game = blunders_total / total_games if total_games else 0.0
     tp_blunder_rate = (tp_blunders_total / tp_moves_total * 100.0) if tp_moves_total else 0.0
@@ -199,6 +294,7 @@ def build_report(pairs: list[tuple[Game, dict]], user: str) -> dict[str, Any]:
         "phases": weakness["phases"],
         "motifs": weakness["motifs"],
         "total_bad": weakness["total_bad"],
+        "themes": themes,
     }
 
 
@@ -292,6 +388,31 @@ def format_report(report: dict[str, Any]) -> str:
             )
     else:
         lines.append("Дебюты: нет данных.")
+
+    themes = report.get("themes") or {}
+    if themes.get("moves_annotated"):
+        annotated = themes["moves_annotated"]
+        lines.append(f"Темы ходов (размечено ходов: {annotated}):")
+        for theme in THEMES:
+            slot = themes.get(theme) or {}
+            label = slot.get("label") or THEME_LABELS[theme]
+            if slot.get("insufficient", True):
+                lines.append(
+                    f"  {label}: недостаточно данных "
+                    f"(возможностей {slot.get('opportunities', 0)}, нужно ≥ {themes.get('min_sample', MIN_THEME_SAMPLE)}), "
+                    f"неоднозначных позиций пропущено: {slot.get('unknown', 0)}"
+                )
+                continue
+            avg = slot.get("avg_win_loss")
+            avg_txt = f"{avg:.1f}%" if avg is not None else "—"
+            lines.append(
+                f"  {label}: возможностей {slot['opportunities']}, "
+                f"сыграно {slot['executed']}, не сыграно {slot['missed']}, "
+                f"ошибок {slot['errors']}, ср. потеря {avg_txt} "
+                f"(неоднозначных пропущено: {slot['unknown']})"
+            )
+    else:
+        lines.append("Темы ходов: нет размеченных анализов (пересохрани анализ).")
 
     total_bad = report.get("total_bad", 0)
     phases = report.get("phases") or {}

@@ -297,9 +297,17 @@ def _validate_lesson(
         raise _fail(where, f"best_move {best_move!r} is not in accepted_moves")
 
     best_line = raw["best_line"]
-    if not isinstance(best_line, list) or not best_line:
-        raise _fail(where, "best_line must be a non-empty list of SAN strings")
-    line_board = board.copy()
+    if not isinstance(best_line, list):
+        raise _fail(where, "best_line must be a list of SAN strings")
+    # best_line — продолжение после best_move (согласовано с app/analyzer и
+    # app/endgame). Пустой список допустим только для мата в один ход.
+    if not best_line and "#" not in best_move:
+        raise _fail(where, "best_line must be non-empty unless best_move is mate")
+    line_board = chess.Board(fen)
+    try:
+        line_board.push_san(best_move)
+    except ValueError:
+        raise _fail(where, f"best_move {best_move!r} is not legal")
     for index, san in enumerate(best_line, start=1):
         if not isinstance(san, str) or not san.strip():
             raise _fail(where, f"best_line move #{index} must be a non-empty string")

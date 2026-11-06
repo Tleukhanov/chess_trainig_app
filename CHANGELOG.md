@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.20 — 2026-11-07
+
+- New deterministic move themes in the coach report: `tactics`, `positional`
+  and `attack` are classified from Stockfish multipv/PV, position facts and
+  the played move, not from an LLM.
+- Reports now show opportunity/outcome counts, missed examples, average
+  win% loss and excluded ambiguous positions; insufficient samples are shown
+  as “недостаточно данных”, not fake 0% accuracy.
+- Old cached analyses without theme annotations remain readable.
+- 1046 tests pass.
+
 ## 0.9.19 — 2026-11-05
 
 - Reading master tasks now show the author's intended move as the correct

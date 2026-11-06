@@ -17,6 +17,7 @@ import chess.engine
 
 from .config import settings
 from .games import Game
+from .themes import classify_move_themes
 
 __all__ = ["Eval", "win_percent", "classify_move", "MoveAnalysis", "GameAnalysis", "Engine"]
 
@@ -123,6 +124,8 @@ class MoveAnalysis:
     time_pressure: bool | None = None
     best_line: list[str] = field(default_factory=list)
     played_line: list[str] = field(default_factory=list)
+    # Детерминированные метки тем хода (app.themes); None для старых кешей.
+    themes: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -140,6 +143,7 @@ class MoveAnalysis:
             "time_pressure": self.time_pressure,
             "best_line": self.best_line,
             "played_line": self.played_line,
+            **({"themes": self.themes} if self.themes is not None else {}),
         }
 
 
@@ -369,21 +373,23 @@ class Engine:
         lines.sort(key=lambda line: line["multipv"])
         return lines
 
-    def _analyze_sequence(self, moves: list[str]) -> list[tuple[Eval, str | None, list[str]]]:
+    def _analyze_sequence(
+        self, moves: list[str]
+    ) -> list[tuple[Eval, str | None, list[str], list[dict[str, Any]]]]:
         """Оценки всех позиций партии подряд (одно исследование на позицию).
 
         Возвращает список (оценка в перспективе стороны, чей ход, лучший ход SAN,
-        полный top-pv SAN) длиной |moves| + 1 (включая позицию после последнего хода).
-        Для гейм-овер-позиций классификация и pv пустые.
+        полный top-pv SAN, multipv-линии) длиной |moves| + 1 (включая позицию после
+        последнего хода). Для гейм-овер-позиций классификация и pv пустые, линии — [].
         """
         board = chess.Board()
-        entries: list[tuple[Eval, str | None, list[str]]] = []
+        entries: list[tuple[Eval, str | None, list[str], list[dict[str, Any]]]] = []
         for ply in range(len(moves) + 1):
             if board.is_game_over():
                 if board.is_checkmate():
-                    entries.append((Eval(cp=None, mate=-1), None, []))  # сторона, чей ход, получает мат
+                    entries.append((Eval(cp=None, mate=-1), None, [], []))  # сторона, чей ход, получает мат
                 else:
-                    entries.append((Eval(cp=0.0, mate=None), None, []))  # пат/ничья
+                    entries.append((Eval(cp=0.0, mate=None), None, [], []))  # пат/ничья
                 # Партия уже завершена: дальше анализировать бессмысленно (и ходы
                 # после мата нелегальны), поэтому останавливаемся.
                 if ply < len(moves):
@@ -399,6 +405,7 @@ class Engine:
                     _eval_for_side(eval_white, board.turn == chess.WHITE),
                     top["pv"][0] if top["pv"] else None,
                     top["pv"],
+                    lines,
                 )
             )
             if ply < len(moves):
@@ -419,6 +426,9 @@ class Engine:
         moves = game.moves[:MAX_ANALYZE_PLIES]
         entries = self._analyze_sequence(moves)
         analyses: list[MoveAnalysis] = []
+        # Реплей партии для классификации тем: позиция ДО каждого полухода.
+        replay = chess.Board()
+        replay_ok = True
 
         for ply, san in enumerate(moves):
             if ply + 1 >= len(entries):
@@ -426,8 +436,8 @@ class Engine:
             mover_is_white = ply % 2 == 0
             mover = "white" if mover_is_white else "black"
 
-            before_side, best_move_san, full_pv = entries[ply]
-            after_next_side, _, _ = entries[ply + 1]
+            before_side, best_move_san, full_pv, top_lines = entries[ply]
+            after_next_side, _, _, _ = entries[ply + 1]
             win_before = _finite(_side_win(before_side))
             # win_after для стороны, СДЕЛАВШЕЙ ход: обратная величина к win% стороны,
             # которой теперь ходить.
@@ -436,6 +446,16 @@ class Engine:
             drop = win_before - win_after
             is_best = best_move_san is not None and _san_key(best_move_san) == _san_key(san)
             classification = classify_move(win_before, win_after, is_best=is_best)
+            if replay_ok:
+                try:
+                    themes = classify_move_themes(
+                        replay, san, top_lines,
+                        drop=round(drop, 2),
+                    )
+                except Exception:  # noqa: BLE001 — темы не должны ронять анализ
+                    themes = None
+            else:
+                themes = None
 
             clock_used: float | None = None
             time_pressure: bool | None = None
@@ -464,8 +484,14 @@ class Engine:
                     time_pressure=time_pressure,
                     best_line=full_pv[1:7] if full_pv else [],
                     played_line=moves[ply + 1 : ply + 1 + 5],
+                    themes=themes,
                 )
             )
+            if replay_ok:
+                try:
+                    replay.push_san(san)
+                except ValueError:
+                    replay_ok = False
 
         user_indices = [i for i in range(len(analyses)) if (i % 2 == 0) == user_is_white]
 

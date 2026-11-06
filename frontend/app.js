@@ -1,6 +1,6 @@
 // Chess Trainer Frontend — SPA на vanilla JS, потребляет /api/* эндпоинты.
 
-import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.9.19';
+import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.9.20';
 
 const state = {
   user: null,
@@ -5575,6 +5575,7 @@ async function viewCoach(app) {
       </div>
       ${report.worst_games.length ? `<div class="card" style="margin-top:12px"><h3 style="font-size:14px;margin-bottom:8px">Худшие партии</h3><div class="table-wrap"><table style="font-size:12px"><thead><tr><th>Партия</th><th>Соперник</th><th>Результат</th><th>Ср. потеря</th><th>Win% до</th><th>Грубых</th></tr></thead><tbody>${report.worst_games.slice(0, 5).map(g => `<tr><td>${esc(g.game_id.slice(0, 8))}</td><td>${esc(g.opponent)}</td><td>${esc(g.result)}</td><td class="num">${fmt(g.avg_win_loss)}%</td><td class="num">${fmt(g.avg_win_before)}%</td><td class="num">${g.blunders}</td></tr>`).join('')}</tbody></table></div></div>` : ''}
       ${report.missed_wins.length ? `<div class="card" style="margin-top:12px"><h3 style="font-size:14px;margin-bottom:8px">Упущенные выигрыши (топ-5)</h3><div class="table-wrap"><table style="font-size:12px"><thead><tr><th>Партия</th><th>Ход</th><th>SAN</th><th>Win% до</th><th>Win% после</th><th>Лучший ход</th></tr></thead><tbody>${report.missed_wins.slice(0, 5).map(m => `<tr><td>${esc(m.game_id.slice(0, 8))}</td><td>${m.ply}</td><td class="drill-san">${esc(m.san)}</td><td class="num">${fmt(m.win_before)}%</td><td class="num">${fmt(m.win_after)}%</td><td class="drill-best">${esc(m.best_move_san)}</td></tr>`).join('')}</tbody></table></div></div>` : ''}
+      ${report.themes && report.themes.moves_annotated ? `<div class="card theme-report" style="margin-top:12px"><h3 style="font-size:14px;margin-bottom:8px">Темы ходов</h3><div class="table-wrap"><table style="font-size:12px"><thead><tr><th>Тема</th><th>Возможностей</th><th>Сыграно</th><th>Не сыграно</th><th>Ошибок</th><th>Ср. потеря</th><th>Неоднозначных</th></tr></thead><tbody>${['tactics','positional','attack'].map(t => { const slot = report.themes[t] || {}; const examples = (slot.examples || []).map(e => `<button type="button" class="btn btn-link" data-theme-game="${esc(e.game_id)}" data-theme-ply="${esc(String(e.ply))}">${esc(e.san || '')} · −${fmt(e.drop)}%</button>`).join(' '); return `<tr><td><strong>${esc(slot.label || t)}</strong>${examples ? `<div style="display:block;margin-top:4px;max-width:220px">${examples}</div><div style="color:var(--c-text-muted);font-size:11px">нажми, чтобы открыть позицию</div>` : ''}</td><td class="num">${slot.opportunities ?? 0}</td><td class="num">${slot.executed ?? 0}</td><td class="num">${slot.missed ?? 0}</td><td class="num">${slot.errors ?? 0}</td><td class="num">${slot.avg_win_loss != null ? fmt(slot.avg_win_loss) + '%' : '—'}</td><td class="num">${slot.unknown ?? 0}</td></tr>`; }).join('')}</tbody></table></div><div style="color:var(--c-text-muted);font-size:12px;margin-top:8px">Классификация детерминированная (Stockfish/PV и правила), не LLM. Неоднозначные позиции не усредняются в процент.</div></div>` : ''}
       <div class="card" style="margin-top:12px"><h3 style="font-size:14px;margin-bottom:8px">Тайм-тробль</h3><div class="grid grid-3"><div class="stat"><div class="stat-value">${report.time_pressure.moves_count}</div><div class="stat-label">Ходов в ТТ</div></div><div class="stat"><div class="stat-value">${report.time_pressure.blunders_in_tp}</div><div class="stat-label">Грубых в ТТ</div></div><div class="stat"><div class="stat-value">${fmt(report.time_pressure.tp_blunder_rate_pct)}%</div><div class="stat-label">% грубых в ТТ</div></div></div></div>`;
   } else {
     reportHtml = '<p style="color:var(--c-text-muted)">Пока нет отчёта. Запусти анализ выше.</p>';
@@ -5616,6 +5617,16 @@ async function viewCoach(app) {
       <div class="card"><h3>Последний отчёт</h3>${reportHtml}</div>
     </div>
     <div id="job-container"></div>`;
+
+  app.querySelectorAll('[data-theme-game]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const ply = Number(btn.dataset.themePly);
+      navigate('games', {
+        gameId: btn.dataset.themeGame,
+        ply: Number.isFinite(ply) ? ply : null,
+      });
+    });
+  });
 
   document.getElementById('coach-form').addEventListener('submit', async e => {
     e.preventDefault();
