@@ -1,0 +1,154 @@
+"""Тесты агрегата «темы ходов» в отчёте (app.report._theme_stats).
+
+Синтетические партии/анализы; реальные партии игроков не используются.
+"""
+
+from __future__ import annotations
+
+import unittest
+
+from app.games import Game
+from app.report import _theme_stats, build_report, format_report
+
+_SANS = ["e4", "e5", "Nf3", "Nc6"] * 3
+
+
+def _game(game_id: str) -> Game:
+    return Game(
+        id=game_id,
+        rated=True,
+        speed="rapid",
+        created_at=0,
+        status="win",
+        winner="white",
+        white={"name": "me"},
+        black={"name": "opponent"},
+        opening="Synthetic Opening",
+        eco="A00",
+        moves=list(_SANS[:6]),
+        clocks=[],
+        user_color="white",
+        opponent="opponent",
+        result_for_user="win",
+    )
+
+
+def _move(san: str, themes: dict | None, drop: float = 0.0,
+          classification: str = "good", best: str | None = "Nf3") -> dict:
+    move = {
+        "san": san,
+        "classification": classification,
+        "drop": drop,
+        "win_before": 60.0,
+        "win_after": 60.0 - drop,
+        "best_move_san": best,
+        "best_line": [],
+        "played_line": [],
+    }
+    if themes is not None:
+        move["themes"] = themes
+    return move
+
+
+def _themed(opportunities, used, confidence, drop=0.0):
+    return {
+        "theme_opportunities": list(opportunities),
+        "theme_used": list(used),
+        "confidence": dict(confidence),
+        "drop": drop,
+        "evidence": {theme: ["synthetic"] for theme in set(opportunities) | set(used)},
+        "note": None,
+    }
+
+
+def _analysis(moves):
+    return {
+        "game_id": "g1",
+        "user_color": "white",
+        "result_for_user": "win",
+        "opponent": "opponent",
+        "avg_win_loss": 5.0,
+        "avg_win_before": 55.0,
+        "blunders": [],
+        "mistakes": [],
+        "inaccuracies": [],
+        "missed_wins": [],
+        "time_pressure_blunders": [],
+        "moves": moves,
+    }
+
+
+class ThemeStatsTests(unittest.TestCase):
+    def test_counts_opportunities_executed_errors(self) -> None:
+        moves = []
+        for ply, san in enumerate(_SANS[:6]):
+            if ply % 2 == 0:  # ходы пользователя (белые)
+                if ply == 0:
+                    moves.append(_move(san, _themed(
+                        ["tactics"], ["tactics"], {"tactics": "high"}, drop=0.0)))
+                elif ply == 2:
+                    moves.append(_move(san, _themed(
+                        ["tactics"], [], {"tactics": "medium"}, drop=25.0),
+                        drop=25.0, classification="blunder"))
+                else:
+                    moves.append(_move(san, _themed(
+                        ["positional"], ["positional"], {"positional": "medium"})))
+            else:
+                moves.append(_move(san, None))
+        stats = _theme_stats([(_game("g1"), _analysis(moves))])
+        tactics = stats["tactics"]
+        self.assertEqual(tactics["opportunities"], 2)
+        self.assertEqual(tactics["executed"], 1)
+        self.assertEqual(tactics["missed"], 1)
+        self.assertEqual(tactics["errors"], 1)
+        self.assertEqual(tactics["avg_win_loss"], 12.5)
+        self.assertTrue(tactics["insufficient"])  # 2 < MIN_THEME_SAMPLE
+        self.assertEqual(len(tactics["examples"]), 1)
+        self.assertEqual(tactics["examples"][0]["ply"], 2)
+
+    def test_low_confidence_goes_to_unknown_not_opportunities(self) -> None:
+        moves = [
+            _move(san, _themed([], [], {"attack": "low"})) if ply == 0 else _move(san, None)
+            for ply, san in enumerate(_SANS[:2])
+        ]
+        # ply 0 — пользователь, ply 1 — соперник; добавим ещё низкоуверенный ход
+        moves.append(_move("Nf3", _themed([], [], {"attack": "low"})))
+        stats = _theme_stats([(_game("g1"), _analysis(moves))])
+        self.assertEqual(stats["attack"]["opportunities"], 0)
+        self.assertEqual(stats["attack"]["unknown"], 2)
+        self.assertTrue(stats["attack"]["insufficient"])
+
+    def test_old_cached_analysis_without_themes_is_skipped(self) -> None:
+        moves = [_move(san, None) for san in _SANS[:6]]
+        stats = _theme_stats([(_game("g1"), _analysis(moves))])
+        self.assertEqual(stats["moves_annotated"], 0)
+        for theme in ("tactics", "positional", "attack"):
+            self.assertEqual(stats[theme]["opportunities"], 0)
+            self.assertTrue(stats[theme]["insufficient"])
+
+    def test_opponent_moves_are_not_counted(self) -> None:
+        moves = [
+            _move(san, _themed(["tactics"], ["tactics"], {"tactics": "high"}))
+            if ply % 2 == 1 else _move(san, None)
+            for ply, san in enumerate(_SANS[:4])
+        ]
+        stats = _theme_stats([(_game("g1"), _analysis(moves))])
+        self.assertEqual(stats["tactics"]["opportunities"], 0)
+
+    def test_build_report_exposes_themes(self) -> None:
+        moves = [
+            _move(san, _themed(["positional"], ["positional"], {"positional": "medium"}))
+            if ply % 2 == 0 else _move(san, None)
+            for ply, san in enumerate(_SANS[:6])
+        ]
+        report = build_report([(_game("g1"), _analysis(moves))], "me")
+        self.assertIn("themes", report)
+        self.assertEqual(report["themes"]["moves_annotated"], 3)
+        text = format_report(report)
+        self.assertIn("Темы ходов", text)
+        # недостаточно данных — честно об этом сказано, процентов нет
+        self.assertIn("недостаточно данных", text)
+
+
+if __name__ == "__main__":
+    unittest.main()
