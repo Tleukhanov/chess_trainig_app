@@ -179,6 +179,9 @@ function navigate(view, options = {}) {
   if (view === 'games') {
     state.gameId = options.gameId || null;
     state.gameData = null;
+    // options.ply — индекс позиции ПОСЛЕ хода (fens[ply], gamePly), а не
+    // индекс хода: для хода с индексом i вызывающие передают i + 1,
+    // как обработчики .move-cell/.err-jump внутри экрана партии.
     state.pendingGamePly = Number.isFinite(options.ply) ? options.ply : null;
   }
   document.querySelectorAll('#nav a').forEach(a => {
@@ -1241,9 +1244,10 @@ async function viewPlan(app) {
   app.querySelectorAll('[data-evidence-game]').forEach(btn => {
     btn.addEventListener('click', () => {
       const ply = Number(btn.dataset.evidencePly);
+      // data-evidence-ply — индекс хода (0-based): открываем позицию ПОСЛЕ хода.
       navigate('games', {
         gameId: btn.dataset.evidenceGame,
-        ply: Number.isFinite(ply) ? ply : null,
+        ply: Number.isFinite(ply) ? ply + 1 : null,
       });
     });
   });
@@ -1252,9 +1256,10 @@ async function viewPlan(app) {
     link.addEventListener('click', e => {
       e.preventDefault();
       const ply = Number(link.dataset.commentPly);
+      // data-comment-ply — индекс хода (0-based): открываем позицию ПОСЛЕ хода.
       navigate('games', {
         gameId: link.dataset.commentGame,
-        ply: Number.isFinite(ply) ? ply : null,
+        ply: Number.isFinite(ply) ? ply + 1 : null,
       });
     });
   });
@@ -3460,7 +3465,9 @@ function drawEndgame(app) {
   if (openGame) openGame.addEventListener('click', () => {
     const t = task;
     if (!t || !t.game_id) return;
-    navigate('games', { gameId: t.game_id, ply: Number(t.ply) });
+    // t.ply — индекс хода (0-based): открываем позицию ПОСЛЕ хода.
+    const ply = Number(t.ply);
+    navigate('games', { gameId: t.game_id, ply: Number.isFinite(ply) ? ply + 1 : null });
   });
   const board = app.querySelector('.board');
   if (board && task) {
@@ -5564,6 +5571,14 @@ async function viewCoach(app) {
   let report = null;
   try { report = await api('/api/report'); } catch { /* no report yet */ }
 
+  // Карточка тем не прячется при moves_annotated == 0: старый кеш без
+  // разметки показывает подсказку про refresh, а не пустое место.
+  const themes = report && report.themes ? report.themes : null;
+  const themesMinSample = themes && themes.min_sample ? themes.min_sample : 5;
+  const themesNeedsRefresh = !!(themes && (themes.needs_refresh || report.needs_refresh));
+  const themesRefreshHint = `<p style="color:var(--c-text-muted);font-size:12px;margin-top:8px">Нет размеченных ходов: перезапусти анализ с обновлением (refresh), чтобы заполнить темы.</p>`;
+  const themesCardHtml = themes ? `<div class="card theme-report" style="margin-top:12px"><h3 style="font-size:14px;margin-bottom:8px">Темы ходов</h3>${themesNeedsRefresh && themes.moves_annotated ? themesRefreshHint : ''}${themes.moves_annotated ? `<div class="table-wrap"><table style="font-size:12px"><thead><tr><th>Тема</th><th>Возможностей</th><th>Сыграно</th><th>Не сыграно</th><th>Ошибок*</th><th>Ср. потеря</th><th>Неоднозначных</th></tr></thead><tbody>${['tactics','positional','attack'].map(t => { const slot = themes[t] || {}; const insufficient = !!slot.insufficient; const examples = (slot.examples || []).map(e => `<button type="button" class="btn btn-link" data-theme-game="${esc(e.game_id)}" data-theme-ply="${esc(String(e.ply))}">${esc(e.san || '')} · −${fmt(e.drop)}%</button>`).join(' '); return `<tr><td><strong>${esc(slot.label || t)}</strong>${insufficient ? `<div style="color:var(--c-text-muted);font-size:11px">недостаточно данных (нужно ≥${themesMinSample})</div>` : ''}${examples ? `<div style="display:block;margin-top:4px;max-width:220px">${examples}</div><div style="color:var(--c-text-muted);font-size:11px">нажми, чтобы открыть позицию</div>` : ''}</td><td class="num">${slot.opportunities ?? 0}</td><td class="num">${slot.executed ?? 0}</td><td class="num">${slot.missed ?? 0}</td><td class="num">${slot.errors ?? 0}</td><td class="num"${insufficient ? ' style="opacity:.55"' : ''}>${insufficient ? '—' : (slot.avg_win_loss != null ? fmt(slot.avg_win_loss) + '%' : '—')}</td><td class="num">${slot.unknown ?? 0}</td></tr>`; }).join('')}</tbody></table></div><div style="color:var(--c-text-muted);font-size:12px;margin-top:8px">Классификация детерминированная (Stockfish/PV и правила), не LLM. Неоднозначные позиции не усредняются в процент. * Ошибки — только mistake/blunder (inaccuracy не считается).</div>` : themesRefreshHint}</div>` : '';
+
   let reportHtml = '';
   if (report) {
     reportHtml = `
@@ -5575,7 +5590,7 @@ async function viewCoach(app) {
       </div>
       ${report.worst_games.length ? `<div class="card" style="margin-top:12px"><h3 style="font-size:14px;margin-bottom:8px">Худшие партии</h3><div class="table-wrap"><table style="font-size:12px"><thead><tr><th>Партия</th><th>Соперник</th><th>Результат</th><th>Ср. потеря</th><th>Win% до</th><th>Грубых</th></tr></thead><tbody>${report.worst_games.slice(0, 5).map(g => `<tr><td>${esc(g.game_id.slice(0, 8))}</td><td>${esc(g.opponent)}</td><td>${esc(g.result)}</td><td class="num">${fmt(g.avg_win_loss)}%</td><td class="num">${fmt(g.avg_win_before)}%</td><td class="num">${g.blunders}</td></tr>`).join('')}</tbody></table></div></div>` : ''}
       ${report.missed_wins.length ? `<div class="card" style="margin-top:12px"><h3 style="font-size:14px;margin-bottom:8px">Упущенные выигрыши (топ-5)</h3><div class="table-wrap"><table style="font-size:12px"><thead><tr><th>Партия</th><th>Ход</th><th>SAN</th><th>Win% до</th><th>Win% после</th><th>Лучший ход</th></tr></thead><tbody>${report.missed_wins.slice(0, 5).map(m => `<tr><td>${esc(m.game_id.slice(0, 8))}</td><td>${m.ply}</td><td class="drill-san">${esc(m.san)}</td><td class="num">${fmt(m.win_before)}%</td><td class="num">${fmt(m.win_after)}%</td><td class="drill-best">${esc(m.best_move_san)}</td></tr>`).join('')}</tbody></table></div></div>` : ''}
-      ${report.themes && report.themes.moves_annotated ? `<div class="card theme-report" style="margin-top:12px"><h3 style="font-size:14px;margin-bottom:8px">Темы ходов</h3><div class="table-wrap"><table style="font-size:12px"><thead><tr><th>Тема</th><th>Возможностей</th><th>Сыграно</th><th>Не сыграно</th><th>Ошибок</th><th>Ср. потеря</th><th>Неоднозначных</th></tr></thead><tbody>${['tactics','positional','attack'].map(t => { const slot = report.themes[t] || {}; const examples = (slot.examples || []).map(e => `<button type="button" class="btn btn-link" data-theme-game="${esc(e.game_id)}" data-theme-ply="${esc(String(e.ply))}">${esc(e.san || '')} · −${fmt(e.drop)}%</button>`).join(' '); return `<tr><td><strong>${esc(slot.label || t)}</strong>${examples ? `<div style="display:block;margin-top:4px;max-width:220px">${examples}</div><div style="color:var(--c-text-muted);font-size:11px">нажми, чтобы открыть позицию</div>` : ''}</td><td class="num">${slot.opportunities ?? 0}</td><td class="num">${slot.executed ?? 0}</td><td class="num">${slot.missed ?? 0}</td><td class="num">${slot.errors ?? 0}</td><td class="num">${slot.avg_win_loss != null ? fmt(slot.avg_win_loss) + '%' : '—'}</td><td class="num">${slot.unknown ?? 0}</td></tr>`; }).join('')}</tbody></table></div><div style="color:var(--c-text-muted);font-size:12px;margin-top:8px">Классификация детерминированная (Stockfish/PV и правила), не LLM. Неоднозначные позиции не усредняются в процент.</div></div>` : ''}
+      ${themesCardHtml}
       <div class="card" style="margin-top:12px"><h3 style="font-size:14px;margin-bottom:8px">Тайм-тробль</h3><div class="grid grid-3"><div class="stat"><div class="stat-value">${report.time_pressure.moves_count}</div><div class="stat-label">Ходов в ТТ</div></div><div class="stat"><div class="stat-value">${report.time_pressure.blunders_in_tp}</div><div class="stat-label">Грубых в ТТ</div></div><div class="stat"><div class="stat-value">${fmt(report.time_pressure.tp_blunder_rate_pct)}%</div><div class="stat-label">% грубых в ТТ</div></div></div></div>`;
   } else {
     reportHtml = '<p style="color:var(--c-text-muted)">Пока нет отчёта. Запусти анализ выше.</p>';
@@ -5621,9 +5636,10 @@ async function viewCoach(app) {
   app.querySelectorAll('[data-theme-game]').forEach(btn => {
     btn.addEventListener('click', () => {
       const ply = Number(btn.dataset.themePly);
+      // data-theme-ply — индекс хода (0-based): открываем позицию ПОСЛЕ хода.
       navigate('games', {
         gameId: btn.dataset.themeGame,
-        ply: Number.isFinite(ply) ? ply : null,
+        ply: Number.isFinite(ply) ? ply + 1 : null,
       });
     });
   });
