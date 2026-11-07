@@ -8,8 +8,10 @@
 - Reports now show opportunity/outcome counts, missed examples, average
   win% loss and excluded ambiguous positions; insufficient samples are shown
   as “недостаточно данных”, not fake 0% accuracy.
-- Old cached analyses without theme annotations remain readable.
-- 1046 tests pass.
+- Old cached analyses without theme annotations remain readable. Re-run the
+  analysis (refresh) for a game to see theme stats for it; no DB migration
+  is needed, as themes are stored inside the existing analysis JSON.
+- 1072 passed, 4 skipped (with LLM_API_KEY set).
 
 ## 0.9.19 — 2026-11-05
 
