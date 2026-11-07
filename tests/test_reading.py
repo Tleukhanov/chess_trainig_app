@@ -209,6 +209,69 @@ class LoadCourseTests(unittest.TestCase):
             self.assertIn("engine.depth", str(ctx.exception))
 
 
+class BestLineValidationTests(unittest.TestCase):
+    """Валидация ``best_line`` из 4445f0b: линия — после best_move."""
+
+    def test_empty_best_line_only_for_mate_in_one(self) -> None:
+        # rank_02: мат в один ход, пустая линия допустима.
+        lesson = _lesson("rank_02")
+        self.assertEqual(lesson.best_line, ())
+        board = chess.Board(lesson.fen)
+        board.push_san(lesson.best_move)
+        self.assertTrue(board.is_checkmate(), "rank_02 должен быть матом в один ход")
+        # Сам бандл уже проверен при импорте: пустая линия мата не отвергнута.
+        course = load_course()
+        self.assertEqual(course, COURSE)
+
+    def test_non_mate_empty_best_line_rejected(self) -> None:
+        bundle = _bundle_dict()
+        # center_01: best_move Rad1 не мат — пустая линия недопустима.
+        lesson = next(
+            item
+            for chapter in bundle["chapters"]
+            for item in chapter["lessons"]
+            if item["id"] == "center_01"
+        )
+        board = chess.Board(lesson["fen"])
+        board.push_san(lesson["best_move"])
+        self.assertFalse(board.is_checkmate())
+        lesson["best_line"] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_bundle(tmp, bundle)
+            with self.assertRaises(RuntimeError) as ctx:
+                load_course(path)
+            self.assertIn("best_line must be non-empty unless best_move is mate", str(ctx.exception))
+
+    def test_illegal_continuation_after_push_rejected(self) -> None:
+        # Rfd1 легальна ДО Rad1, но нелегальна ПОСЛЕ (ход чёрных) —
+        # именно это отличает проверку продолжения после push.
+        bundle = _bundle_dict()
+        lesson = next(
+            item
+            for chapter in bundle["chapters"]
+            for item in chapter["lessons"]
+            if item["id"] == "center_01"
+        )
+        before = chess.Board(lesson["fen"])
+        before.parse_san("Rfd1")  # легальна до best_move
+        lesson["best_line"] = ["Rfd1"]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_bundle(tmp, bundle)
+            with self.assertRaises(RuntimeError) as ctx:
+                load_course(path)
+            self.assertIn("best_line move #1", str(ctx.exception))
+            self.assertIn("is not legal", str(ctx.exception))
+
+    def test_first_continuation_move_checked_in_position_after_best_move(self) -> None:
+        # Ne4 — первый ход существующей линии center_01: он легален
+        # именно после Rad1 (чёрные), и бандл с ним валиден по построению.
+        lesson = _lesson("center_01")
+        self.assertEqual(lesson.best_line[0], "Ne4")
+        board = chess.Board(lesson.fen)
+        board.push_san(lesson.best_move)
+        board.parse_san(lesson.best_line[0])  # не бросает
+
+
 class CourseIntegrityTests(unittest.TestCase):
     def test_ids_unique_everywhere(self) -> None:
         lesson_ids = [lesson.id for ch in COURSE.chapters for lesson in ch.lessons]

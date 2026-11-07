@@ -139,6 +139,105 @@ class AttackTests(unittest.TestCase):
         self.assertIn("mate_in_pv", rec["evidence"]["attack"])
 
 
+class BlackToMoveTests(unittest.TestCase):
+    """Класификатор симметричен: вторая сторона тоже получает метки."""
+
+    def test_black_central_push_is_positional(self) -> None:
+        board = chess.Board()
+        board.push_san("e4")
+        self.assertEqual(board.turn, chess.BLACK)
+        lines = [
+            _line(["e5", "Nc3"], 35.0, multipv=1),
+            _line(["c5"], 45.0, multipv=2),
+        ]
+        rec = classify_move_themes(board, "e5", lines, drop=0.0)
+        self.assertIn("positional", rec["theme_opportunities"])
+        self.assertIn("center_control", rec["evidence"]["positional"])
+        self.assertIn("positional", rec["theme_used"])
+
+    def test_black_mate_in_one_is_tactics_and_attack(self) -> None:
+        # Зеркало BACK_RANK для чёрных: win%_WHITE первой линии — 0 (мат),
+        # значит для чёрных это win% 100 и классический mate.
+        fen = "r6k/8/8/8/8/8/5PPP/6K1 b - - 0 1"
+        board = chess.Board(fen)
+        board.push_san("Ra1#")
+        self.assertTrue(board.is_checkmate())
+        lines = [
+            _line(["Ra1#"], 0.0, mate=-1, multipv=1),
+            _line(["Rf8"], 30.0, multipv=2),
+        ]
+        rec = _classify(fen, "Ra1#", lines, drop=0.0)
+        self.assertIn("tactics", rec["theme_opportunities"])
+        self.assertIn("attack", rec["theme_opportunities"])
+        self.assertEqual(rec["confidence"]["tactics"], "high")
+        self.assertIn("tactics", rec["theme_used"])
+        self.assertIn("mate_in_1", rec["evidence"]["tactics"])
+
+    def test_black_quiet_move_without_forcing_lines_is_not_tactical(self) -> None:
+        board = chess.Board()
+        board.push_san("e4")
+        # Скромный ход без шахов/взятий — не тактика и для чёрных.
+        lines = [
+            _line(["d6"], 48.0, multipv=1),
+            _line(["c6"], 47.5, multipv=2),
+        ]
+        rec = classify_move_themes(board, "d6", lines, drop=0.5)
+        self.assertNotIn("tactics", rec["theme_opportunities"])
+
+
+class MalformedLinesTests(unittest.TestCase):
+    """Мусор в multipv-линиях не должен ронять классификатор.
+
+    Порядок линий — ответственность звонящего: классификатор берёт
+    первую линию за лучшую без пересортировки по ``multipv``. Здесь
+    фиксируем это поведение, а не исправляем сортировку (см. задачи
+    ядра классификатора).
+    """
+
+    def test_non_dict_lines_are_ignored(self) -> None:
+        rec = _classify(QUIET_FEN, "d4", [
+            None,
+            "not a line",
+            42,
+            _line(["d4"], 55.0, multipv=1),
+            _line(["c3"], 48.0, multipv=2),
+        ], drop=0.0)
+        self.assertIn("positional", rec["theme_opportunities"])
+        self.assertIn("positional", rec["theme_used"])
+
+    def test_malformed_win_and_pv_do_not_crash(self) -> None:
+        rec = _classify(QUIET_FEN, "d4", [
+            {"pv": "notalist", "win": "bad", "eval": {"cp": None, "mate": None}},
+            {"pv": [123, None], "win": None, "eval": {}},
+            _line(["d4"], 55.0, multipv=1),
+        ], drop=None)
+        self.assertIn("positional", rec["theme_opportunities"])
+        self.assertIsNone(rec["drop"])
+
+    def test_empty_and_none_lines_still_use_local_signals(self) -> None:
+        for lines in ([], None):
+            with self.subTest(lines=lines):
+                rec = _classify(QUIET_FEN, "d4", lines, drop=None)
+                self.assertIn("positional", rec["theme_opportunities"])
+                self.assertIn("positional", rec["theme_used"])
+
+    def test_unsorted_lines_are_taken_in_given_order_without_crash(self) -> None:
+        # multipv спутан: вторая линия фактически сильнее первой для белых,
+        # поэтому разрыв win% отрицателен и тему уходит в low (но без падения).
+        rec = _classify(QUIET_FEN, "d4", [
+            _line(["c3"], 48.0, multipv=2),
+            _line(["d4"], 55.0, multipv=1),
+        ], drop=0.0)
+        self.assertIn("positional", rec["evidence"])
+        self.assertEqual(rec["confidence"]["positional"], "low")
+        # Отсортированный вариант даёт medium: разница именно в порядке.
+        rec_sorted = _classify(QUIET_FEN, "d4", [
+            _line(["d4"], 55.0, multipv=1),
+            _line(["c3"], 48.0, multipv=2),
+        ], drop=0.0)
+        self.assertIn("positional", rec_sorted["theme_opportunities"])
+
+
 class RecordShapeTests(unittest.TestCase):
     def test_record_has_stable_shape(self) -> None:
         rec = _classify(QUIET_FEN, "d4", [
