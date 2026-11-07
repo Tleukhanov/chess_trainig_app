@@ -516,6 +516,98 @@ class DataApiTests(ApiTestBase):
         self.assertIn("score", data)
         self.assertIn("total", data)
 
+    def test_report_includes_themes_shape(self) -> None:
+        """Регрессия: GET /api/report отдаёт блок themes и для старого кеша,
+        и для анализа с размеченными ходами. Движок не нужен — анализ seeded."""
+        # t1 из setUp — старый анализ без themes: блок всё равно в форме.
+        resp = self.client.get("/api/report")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertIn("themes", data)
+        self.assertIn("moves_annotated", data["themes"])
+        self.assertIn("min_sample", data["themes"])
+        for theme in ("tactics", "positional", "attack"):
+            self.assertIn(theme, data["themes"])
+            for key in (
+                "label",
+                "opportunities",
+                "executed",
+                "missed",
+                "errors",
+                "avg_win_loss",
+                "unknown",
+                "insufficient",
+                "examples",
+            ):
+                self.assertIn(key, data["themes"][theme])
+
+    def test_report_themes_count_seeded_annotated_moves(self) -> None:
+        """Размеченный анализ в бэкенде виден в /api/report без запуска движка."""
+        moves = [
+            {
+                "san": san,
+                "classification": "good",
+                "drop": 0.0,
+                "win_before": 55.0,
+                "win_after": 55.0,
+                "best_move_san": "Nf3",
+                "best_line": [],
+                "played_line": [],
+                "themes": {
+                    "theme_opportunities": ["positional"],
+                    "theme_used": ["positional"],
+                    "confidence": {"positional": "medium"},
+                    "drop": 0.0,
+                    "evidence": {"positional": ["synthetic"]},
+                    "note": None,
+                },
+            }
+            if ply % 2 == 0
+            else {
+                "san": san,
+                "classification": "good",
+                "drop": 0.0,
+                "win_before": 55.0,
+                "win_after": 55.0,
+                "best_move_san": "e5",
+                "best_line": [],
+                "played_line": [],
+            }
+            for ply, san in enumerate(["e4", "e5", "Nf3", "Nc6"])
+        ]
+        with Database(self.db_path) as db:
+            db.init_db()
+            db.save_games(
+                [mkgame_moves("theme1", ["e4", "e5", "Nf3", "Nc6"], user_color="white", result_for_user="win")],
+                "tester",
+            )
+            db.save_analysis(
+                "theme1",
+                {
+                    "user_color": "white",
+                    "result_for_user": "win",
+                    "opponent": "B",
+                    "avg_win_loss": 0.0,
+                    "avg_win_before": 55.0,
+                    "blunders": [],
+                    "mistakes": [],
+                    "inaccuracies": [],
+                    "missed_wins": [],
+                    "time_pressure_blunders": [],
+                    "moves": moves,
+                },
+                depth=8,
+            )
+        resp = self.client.get("/api/report")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertIn("themes", data)
+        self.assertGreaterEqual(data["themes"]["moves_annotated"], 2)
+        self.assertGreaterEqual(data["themes"]["positional"]["opportunities"], 2)
+        self.assertEqual(data["themes"]["positional"]["executed"], 2)
+        # 2 < MIN_THEME_SAMPLE=5 — отчёт честно маркирует недостаточность.
+        self.assertTrue(data["themes"]["positional"]["insufficient"])
+
     def test_no_user_404(self):
         self._clear_auth()
         resp = self.client.get("/api/overview")
