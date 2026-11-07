@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from collections import defaultdict
 from datetime import datetime
@@ -43,14 +44,69 @@ def _resolved(move: dict[str, Any]) -> dict[str, Any]:
     return move if move is not None else {}
 
 
+def _clean_drop(value: Any) -> float | None:
+    """Возвращает ``float(value)`` только для пригодного ``drop``.
+
+    ``bool`` (подкласс ``int``), NaN и бесконечности отвергаются:
+    иначе они попадали бы в суммы и примеры, и ``avg_win_loss``
+    мог стать NaN/inf/bool вместо честного ``None``.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def _theme_list(value: Any) -> list[str]:
+    """Проверяет ``theme_opportunities``/``theme_used`` как список тем.
+
+    Не список/кортеж/множество (например, строка, число или словарь)
+    считается пустым, а не проверяется через ``in``: для строки это дало
+    бы ложные подстроки, для числа — ``TypeError``, роняющий отчёт.
+    """
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        return []
+    return [item for item in value if isinstance(item, str)]
+
+
+def _theme_confidence(value: Any) -> dict[str, Any]:
+    """Проверяет ``confidence`` как словарь; мусор — пустой словарь."""
+    return value if isinstance(value, dict) else {}
+
+
+def _safe_avg(drop_sum: float, drop_n: int) -> float | None:
+    """Среднее по очищенным потерям; нефинитное среднее — ``None``."""
+    if not drop_n:
+        return None
+    avg = drop_sum / drop_n
+    return round(avg, 2) if math.isfinite(avg) else None
+
+
 def _theme_stats(pairs: list[tuple[Game, dict]]) -> dict[str, Any]:
     """Агрегат по темам ходов (tactics/positional/attack).
 
+    Цвет пользователя берётся из ``Game.user_color`` (источник правды
+    на стороне партии), а не из ``analysis["user_color"]``: кеш анализа
+    мог быть записан с другим/устаревшим цветом.
+
     Считаются только ходы пользователя с полем ``themes`` (старые кеши без
     разметки пропускаются). Записи с ``confidence=low`` не попадают в
-    opportunity-метрики, а считаются как ``unknown``. Если возможностей
-    меньше ``MIN_THEME_SAMPLE`` — ``insufficient=True``: отчёт обязан
-    показать «недостаточно данных», а не 0%.
+    opportunity-метрики, а считаются как ``unknown``. Мусор в
+    ``theme_opportunities``/``theme_used``/``confidence`` считается
+    пустым/unknown, а не роняет ``build_report``. ``drop`` очищается через
+    :func:`_clean_drop` (``bool``/NaN/inf отбрасываются), поэтому
+    ``avg_win_loss`` не бывает NaN/bool/inf.
+
+    ``errors`` считает только ``mistake``/``blunder`` — ``inaccuracy``
+    в ошибки не входит. Партии дедуплицируются по ``game.id`` (первое
+    вхождение побеждает), примеры — по ``(game_id, ply)`` на тему.
+
+    Если возможностей меньше ``MIN_THEME_SAMPLE`` — ``insufficient=True``:
+    отчёт обязан показать «недостаточно данных», а не 0%.
+    ``needs_refresh=True``, когда есть проанализированные партии с ходами
+    пользователя, но без единой разметки ``themes`` (старый кеш):
+    пользователю нужно перезапустить анализ с обновлением (refresh).
+    Миграций БД не требуется — сигнал отдаётся в самом отчёте.
     """
     per_theme: dict[str, dict[str, Any]] = {
         theme: {
@@ -62,32 +118,44 @@ def _theme_stats(pairs: list[tuple[Game, dict]]) -> dict[str, Any]:
             "drop_sum": 0.0,
             "drop_n": 0,
             "examples": [],
+            "examples_seen": set(),
         }
         for theme in THEMES
     }
     annotated = 0
+    seen_game_ids: set[Any] = set()
+    games_without_themes = 0
 
     for game, analysis in pairs:
-        user_is_white = (analysis.get("user_color") or "white") == "white"
-        moves = analysis.get("moves") or []
+        game_id = getattr(game, "id", None)
+        if game_id:
+            if game_id in seen_game_ids:
+                continue
+            seen_game_ids.add(game_id)
+        if not isinstance(analysis, dict):
+            analysis = {}
+        user_is_white = getattr(game, "user_color", "white") == "white"
+        raw_moves = analysis.get("moves")
+        moves = raw_moves if isinstance(raw_moves, list) else []
+        annotated_in_game = 0
+        user_moves_in_game = 0
         for ply, move in enumerate(moves):
             if not isinstance(move, dict):
                 continue
             if (ply % 2 == 0) != user_is_white:
                 continue
+            user_moves_in_game += 1
             themes = move.get("themes")
             if not isinstance(themes, dict):
                 continue
             annotated += 1
-            opportunities = themes.get("theme_opportunities") or []
-            used = themes.get("theme_used") or []
-            confidence = themes.get("confidence") or {}
-            drop = themes.get("drop")
-            if not isinstance(drop, (int, float)):
-                drop = move.get("drop")
-            if not isinstance(drop, (int, float)):
-                drop = None
-            drop = float(drop) if drop is not None else None
+            annotated_in_game += 1
+            opportunities = _theme_list(themes.get("theme_opportunities"))
+            used = _theme_list(themes.get("theme_used"))
+            confidence = _theme_confidence(themes.get("confidence"))
+            drop = _clean_drop(themes.get("drop"))
+            if drop is None:
+                drop = _clean_drop(move.get("drop"))
             classification = move.get("classification")
             for theme in THEMES:
                 slot = per_theme[theme]
@@ -98,16 +166,20 @@ def _theme_stats(pairs: list[tuple[Game, dict]]) -> dict[str, Any]:
                     else:
                         slot["missed"] += 1
                         if drop is not None and drop >= 5.0:
-                            slot["examples"].append(
-                                {
-                                    "game_id": game.id,
-                                    "ply": ply,
-                                    "san": move.get("san"),
-                                    "drop": round(drop, 2),
-                                    "classification": classification,
-                                    "best_move_san": move.get("best_move_san"),
-                                }
-                            )
+                            example_key = (game_id, ply)
+                            if example_key not in slot["examples_seen"]:
+                                slot["examples_seen"].add(example_key)
+                                slot["examples"].append(
+                                    {
+                                        "game_id": game_id,
+                                        "ply": ply,
+                                        "san": move.get("san"),
+                                        "drop": round(drop, 2),
+                                        "classification": classification,
+                                        "best_move_san": move.get("best_move_san"),
+                                    }
+                                )
+                    # errors — только mistake/blunder; inaccuracy не считается.
                     if classification in ("mistake", "blunder"):
                         slot["errors"] += 1
                     if drop is not None:
@@ -115,8 +187,15 @@ def _theme_stats(pairs: list[tuple[Game, dict]]) -> dict[str, Any]:
                         slot["drop_n"] += 1
                 elif confidence.get(theme) == "low":
                     slot["unknown"] += 1
+        if user_moves_in_game and not annotated_in_game:
+            games_without_themes += 1
 
-    result: dict[str, Any] = {"moves_annotated": annotated, "min_sample": MIN_THEME_SAMPLE}
+    result: dict[str, Any] = {
+        "moves_annotated": annotated,
+        "min_sample": MIN_THEME_SAMPLE,
+        "needs_refresh": games_without_themes > 0,
+        "games_without_themes": games_without_themes,
+    }
     for theme in THEMES:
         slot = per_theme[theme]
         examples = sorted(slot["examples"], key=lambda e: -e["drop"])[:3]
@@ -126,9 +205,7 @@ def _theme_stats(pairs: list[tuple[Game, dict]]) -> dict[str, Any]:
             "executed": slot["executed"],
             "missed": slot["missed"],
             "errors": slot["errors"],
-            "avg_win_loss": (
-                round(slot["drop_sum"] / slot["drop_n"], 2) if slot["drop_n"] else None
-            ),
+            "avg_win_loss": _safe_avg(slot["drop_sum"], slot["drop_n"]),
             "unknown": slot["unknown"],
             "insufficient": slot["opportunities"] < MIN_THEME_SAMPLE,
             "examples": examples,
@@ -295,6 +372,9 @@ def build_report(pairs: list[tuple[Game, dict]], user: str) -> dict[str, Any]:
         "motifs": weakness["motifs"],
         "total_bad": weakness["total_bad"],
         "themes": themes,
+        # Явный сигнал старого кеша без разметки тем (см. _theme_stats):
+        # /api/report отдаёт этот словарь как есть, миграций не нужно.
+        "needs_refresh": bool(themes.get("needs_refresh")),
     }
 
 
@@ -408,11 +488,19 @@ def format_report(report: dict[str, Any]) -> str:
             lines.append(
                 f"  {label}: возможностей {slot['opportunities']}, "
                 f"сыграно {slot['executed']}, не сыграно {slot['missed']}, "
-                f"ошибок {slot['errors']}, ср. потеря {avg_txt} "
+                f"ошибок (mistake/blunder) {slot['errors']}, ср. потеря {avg_txt} "
                 f"(неоднозначных пропущено: {slot['unknown']})"
             )
+        if themes.get("needs_refresh"):
+            lines.append(
+                "  Темы ходов: часть анализов без разметки (старый кеш) — "
+                "перезапусти анализ с обновлением (refresh), чтобы заполнить темы."
+            )
     else:
-        lines.append("Темы ходов: нет размеченных анализов (пересохрани анализ).")
+        lines.append(
+            "Темы ходов: нет размеченных анализов (старый кеш) — "
+            "перезапусти анализ с обновлением (refresh), чтобы заполнить темы."
+        )
 
     total_bad = report.get("total_bad", 0)
     phases = report.get("phases") or {}
