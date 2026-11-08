@@ -1003,6 +1003,9 @@ class ToolsApiTests(ApiTestBase):
         self.assertIn("openings", data)
         self.assertIn("weak", data)
         self.assertEqual(data["weak"]["white"], 0)
+        self.assertIn("opening_book", data)
+        self.assertIn("white", data["opening_book"])
+        self.assertEqual(data["opening_book"]["white"]["games"], 1)
         line = data["lines"][0]
         self.assertEqual(line["moves"], ["e4"])
         self.assertEqual(line["count"], 1)
@@ -2721,12 +2724,12 @@ class FrontendTests(ApiTestBase):
         html = resp.text
         self.assertIn("app.js?v=", html)
         self.assertIn("style.css?v=", html)
-        self.assertIn("v0.9.20", html)
+        self.assertIn("v0.9.21", html)
         self.assertIn('id="nav-toggle"', html)
         self.assertIn('aria-controls="nav"', html)
 
     def test_api_version(self):
-        self.assertEqual(self.app.version, "0.9.20")
+        self.assertEqual(self.app.version, "0.9.21")
 
 
 class AuthApiTests(ApiTestBase):

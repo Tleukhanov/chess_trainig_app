@@ -1,6 +1,6 @@
 // Chess Trainer Frontend — SPA на vanilla JS, потребляет /api/* эндпоинты.
 
-import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.9.20';
+import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.9.21';
 
 const state = {
   user: null,
@@ -6139,6 +6139,15 @@ function renderRepertoire(d) {
           <td class="num">${l.path_ok_rate != null ? Math.round(l.path_ok_rate * 100) + '%' : '—'}</td>
         </tr>`).join('')}</tbody></table></div>`
         : '<p style="color:var(--c-text-muted);padding:8px">Нет данных: запусти анализ партий.</p>'}
+      ${d.opening_book ? ['white','black'].map(c => { const book = d.opening_book[c]; if (!book || !book.games) return ''; return `
+        <h3 style="font-size:14px;margin:14px 0 8px">Ваш дебютный репертуар · ${TOOL_COLOR_RU[c] || esc(c)} · партий ${book.games}</h3>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Главный ход</th><th class="num">Партий</th><th class="num">Доля</th><th>Главная линия</th><th>Твой ответ на частые ходы соперника</th></tr></thead>
+          <tbody>${(book.first_moves || []).slice(0, 5).map(fm => {
+            const firstReply = (fm.replies || []).slice(0, 3).map(r => `<div style="margin:3px 0"><code>${esc(r.move)}</code> — ${r.count} (${fmt(r.share_pct)}%) → ${(r.responses || []).map(resp => `<code>${esc(resp.move)}</code> (${resp.count})`).join(' / ')}</div>`).join('');
+            return `<tr><td><code>${esc(fm.move)}</code></td><td class="num">${fm.count}</td><td class="num">${fmt(fm.share_pct, 1)}%</td><td><code>${esc((fm.main_line || []).join(' '))}</code></td><td>${firstReply || 'нет данных'}</td></tr>`;
+          }).join('')}</tbody></table></div>
+      `; }).join('') : ''}
       ${openings.length ? `
         <h3 style="font-size:14px;margin:16px 0 8px">Дебюты — ошибки по названиям</h3>
         <div class="table-wrap"><table><thead><tr><th>Дебют</th><th>ECO</th><th class="num">Партий</th><th class="num">Очков %</th><th class="num">Ошибок/партию</th><th class="num">Ср. потеря</th></tr></thead>

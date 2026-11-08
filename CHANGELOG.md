@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.21 — 2026-11-08
+
+- Added a real opening repertoire built from your own games: first move,
+  most frequent opponent reply, your response and the main full line.
+  Example: 1. e4 e6 2. d4 d5 3. Nd2 is now shown as a real played line.
+- No LLM is used to invent repertoire moves; counts come from cached games.
+- 1049 tests pass.
+
 ## 0.9.20 — 2026-11-07
 
 - New deterministic move themes in the coach report: `tactics`, `positional`
