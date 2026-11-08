@@ -12,6 +12,7 @@ from typing import Any
 from .games import Game
 from .metrics import metric
 from .patterns import PHASE_LABELS, weakness_stats
+from .opening_book import build_opening_book
 from .repertoire import Repertoire, _plural_games, opening_stats
 
 __all__ = ["build_plan", "format_plan"]
@@ -115,6 +116,10 @@ def build_plan(
         "repertoire": {
             "white": _top_branches(repertoire, "white"),
             "black": _top_branches(repertoire, "black"),
+            "opening_book": {
+                "white": build_opening_book(pairs, "white", max_depth=max_depth),
+                "black": build_opening_book(pairs, "black", max_depth=max_depth),
+            },
             "weak_openings": weak_openings[:6],
         },
         "patterns": {

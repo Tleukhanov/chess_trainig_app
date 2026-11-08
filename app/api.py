@@ -86,6 +86,7 @@ from .review_moves import badge_for, badge_label, detect_sacrifice
 from .pgn_import import MAX_PGN_BYTES, parse_pgn_games
 from .plan import build_plan
 from .progress import build_progress
+from .opening_book import build_opening_book
 from .repertoire import Repertoire, opening_stats
 from .report import build_report
 
@@ -4602,6 +4603,10 @@ def create_api(
             found = sorted(rep.lines(c, min_count=1), key=lambda line: -line.count)[:60]
             lines.extend({"color": c, **shared_data.line_to_dict(line)} for line in found)
             weak[c] = len(rep.weak_lines(c, min_count=1))
+        opening_book = {
+            c: build_opening_book(pairs, c, max_depth=max_depth)
+            for c in colors
+        }
         return {
             "color": color,
             "games": len(pairs),
@@ -4609,6 +4614,7 @@ def create_api(
             "lines": lines,
             "weak": weak,
             "openings": opening_stats(pairs, user=user),
+            "opening_book": opening_book,
         }
 
     @app.get("/api/repertoire")

@@ -1003,6 +1003,9 @@ class ToolsApiTests(ApiTestBase):
         self.assertIn("openings", data)
         self.assertIn("weak", data)
         self.assertEqual(data["weak"]["white"], 0)
+        self.assertIn("opening_book", data)
+        self.assertIn("white", data["opening_book"])
+        self.assertEqual(data["opening_book"]["white"]["games"], 1)
         line = data["lines"][0]
         self.assertEqual(line["moves"], ["e4"])
         self.assertEqual(line["count"], 1)
