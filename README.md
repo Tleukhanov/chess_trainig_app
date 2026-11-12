@@ -276,3 +276,10 @@ tests/          pytest
 tools/          fetch_maia_onnx.py
 __main__.py     CLI `python -m trainer`
 ```
+
+
+---
+
+**Build. Learn. Understand.**
+© Ералы Тлеуханов · [tleukhanov.me](https://tleukhanov.me)
+
