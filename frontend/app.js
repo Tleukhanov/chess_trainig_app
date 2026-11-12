@@ -781,6 +781,7 @@ async function viewDashboard(app) {
       <div class="onboarding card">
         <div class="empty-icon">🏁</div>
         <h1>Добро пожаловать в Chess Trainer</h1>
+        <p>Разбор твоих партий с Lichess, Stockfish-факты по ходам, план и задачи из твоих ошибок.<br>Не обещает рост рейтинга и не заменяет тренера, Chess.com или Lichess — закрытая бета.</p>
         <p>Проанализированных партий пока нет.<br>Нажми «Запустить анализ», чтобы загрузить партии с Lichess и пройти их Stockfish.</p>
         <a href="#" class="btn btn-primary" data-view="coach">Запустить анализ</a>
       </div>`;
@@ -803,6 +804,7 @@ async function viewDashboard(app) {
         <div class="empty-icon">🏁</div>
         <h1>Пока нет данных</h1>
         <p>Зарегистрировался — запусти анализ: партии с Lichess пройдут через Stockfish, и здесь появится план тренировки.</p>
+        <p style="color:var(--c-text-muted);font-size:12px">План строится из твоих ошибок без гарантии роста рейтинга — это дополнение к тренеру и Lichess/Chess.com, а не замена.</p>
         <a href="#" class="btn btn-primary" data-view="coach">Запустить анализ</a>
       </div>`;
     bindLinks(app);
