@@ -145,6 +145,25 @@ class BuildPlanTests(unittest.TestCase):
         plan = build_plan(fixture_pairs())
         self.assertIsNone(plan["humanity"])
 
+    def test_window_context_reflects_input_pairs(self) -> None:
+        from dataclasses import replace
+
+        pairs = fixture_pairs()
+        dated = [
+            (replace(game, created_at=ts), analysis)
+            for (game, analysis), ts in zip(pairs, (1_700_000_000_000, 1_700_100_000_000))
+        ]
+        plan = build_plan(dated)
+        window = plan["window"]
+        self.assertEqual(window["games"], 2)
+        self.assertIsNotNone(window["from"])
+        self.assertIsNotNone(window["to"])
+        self.assertLessEqual(window["from"], window["to"])
+
+    def test_window_context_empty_pairs(self) -> None:
+        plan = build_plan([])
+        self.assertEqual(plan["window"], {"games": 0, "from": None, "to": None})
+
     def test_empty_pairs(self) -> None:
         plan = build_plan([])
         self.assertEqual(plan["games"], 0)

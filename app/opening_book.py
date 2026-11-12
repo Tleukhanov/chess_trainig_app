@@ -87,7 +87,7 @@ def _to_node(
     *,
     max_depth: int,
     parent_count: int,
-    top_children: int,
+    top_n: int,
 ) -> dict[str, Any]:
     """Пакет узла дерева: статистика + children."""
     count = len(games)
@@ -102,10 +102,11 @@ def _to_node(
             }
         )
     child_rows.sort(key=lambda row: (-row["count"], row["move"]))
-    child_rows = child_rows[: max(top_children, 1)]
+    child_rows = child_rows[: max(top_n, 1)]
 
     children_payload = []
-    if prefix and len(prefix) < max_depth:
+    # Корень (prefix=()) тоже обязан пройти guard: иначе дерево обрывалось.
+    if len(prefix) < max_depth:
         for row in child_rows:
             child_prefix = prefix + (row["move"],)
             child_games = [game for game in games if list(game.moves[: len(child_prefix)]) == list(child_prefix)]
@@ -113,10 +114,10 @@ def _to_node(
                 _to_node(
                     child_prefix,
                     child_games,
-                    _children_of(child_games, child_prefix, max_depth + 1),
+                    _children_of(child_games, child_prefix, max_depth),
                     max_depth=max_depth,
                     parent_count=count,
-                    top_children=top_n,
+                    top_n=top_n,
                 )
             )
 
@@ -200,7 +201,7 @@ def build_opening_book(
         _children_of(games, (), max_depth),
         max_depth=max_depth,
         parent_count=len(games),
-        top_children=top_n,
+        top_n=top_n,
     )
 
     # Главной линией считаем путь максимальных частот: жадно идём по самым

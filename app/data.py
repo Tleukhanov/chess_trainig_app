@@ -242,7 +242,7 @@ def drills(
 
 
 def report(db: Database, user: str | None) -> dict | None:
-    """Отчёт ``build_report`` по всем проанализированным партиям или None."""
+    """Отчёт ``build_report`` по последним 200 проанализированным партиям или None."""
     if not user:
         return None
     pairs = db.get_analyzed_games(user, limit=200)

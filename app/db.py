@@ -934,19 +934,51 @@ class Database:
                 analyzed.update(row["game_id"] for row in rows)
         return [game_id for game_id in game_ids if game_id not in analyzed]
 
-    def get_analyzed_games(self, user: str, limit: int = 200, offset: int = 0) -> list[tuple[Game, dict]]:
-        """Пары (Game, analysis_json) только для партий с сохранённым анализом."""
+    def get_analyzed_games(
+        self,
+        user: str,
+        limit: int = 200,
+        offset: int = 0,
+        *,
+        since_ms: int | None = None,
+        until_ms: int | None = None,
+    ) -> list[tuple[Game, dict]]:
+        """Пары (Game, analysis_json) только для партий с сохранённым анализом.
+
+        Отбор — последние ``limit`` партий по ``created_at`` (новейшие
+        первыми; tie-break по ``id DESC`` для детерминизма при равных
+        timestamps). В возвращаемом списке партии идут по возрастанию
+        ``created_at``/``id``, как и раньше, чтобы потребители не видели
+        обратный порядок. ``since_ms``/``until_ms`` — необязательные границы
+        по ``created_at`` в миллисекундах (включительно), для внутреннего
+        контекста; публичный контракт не меняется.
+        """
+        try:
+            resolved_limit = max(0, int(limit))
+        except (TypeError, ValueError):
+            resolved_limit = 200
         try:
             resolved_offset = max(0, int(offset))
         except (TypeError, ValueError):
             resolved_offset = 0
+        clauses = ["LOWER(g.player) = LOWER(?)"]
+        params: list[Any] = [user]
+        if since_ms is not None:
+            clauses.append("g.created_at >= ?")
+            params.append(int(since_ms))
+        if until_ms is not None:
+            clauses.append("g.created_at <= ?")
+            params.append(int(until_ms))
+        where = " AND ".join(clauses)
+        params.extend([resolved_limit, resolved_offset])
         with self._connection() as conn:
             rows = conn.execute(
-                "SELECT g.*, a.analysis_json AS analysis_json "
-                "FROM games g JOIN analyses a ON a.game_id = g.id "
-                "WHERE LOWER(g.player) = LOWER(?) ORDER BY g.created_at ASC, g.id ASC LIMIT ? OFFSET ?",
-                (user, limit, resolved_offset),
+                f"SELECT g.*, a.analysis_json AS analysis_json "
+                f"FROM games g JOIN analyses a ON a.game_id = g.id "
+                f"WHERE {where} ORDER BY g.created_at DESC, g.id DESC LIMIT ? OFFSET ?",
+                params,
             ).fetchall()
+        rows = list(reversed(rows))
         result: list[tuple[Game, dict]] = []
         for row in rows:
             game = _row_to_game(row)

@@ -14,6 +14,7 @@ from .metrics import metric
 from .patterns import PHASE_LABELS, weakness_stats
 from .opening_book import build_opening_book
 from .repertoire import Repertoire, _plural_games, opening_stats
+from .timeutil import date_of_ms
 
 __all__ = ["build_plan", "format_plan"]
 
@@ -108,9 +109,17 @@ def build_plan(
 
     weak_openings = opening_stats(pairs, user=user)
 
+    timestamps = [g.created_at for g, _ in pairs if getattr(g, "created_at", 0)]
+    window = {
+        "games": len(pairs),
+        "from": date_of_ms(min(timestamps)) if timestamps else None,
+        "to": date_of_ms(max(timestamps)) if timestamps else None,
+    }
+
     plan: dict[str, Any] = {
         "user": user,
         "games": len(pairs),
+        "window": window,
         "score_pct": score_pct,
         "avg_win_loss": avg_win_loss,
         "repertoire": {
