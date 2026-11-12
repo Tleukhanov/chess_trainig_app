@@ -36,8 +36,10 @@ MIN_PLAN_CHARS = 20
 MAX_PLAN_CHARS = 4000
 
 #: Схема ответа LLM. Строкой, чтобы её можно было целиком вставить в промпт.
+#: ``verdict`` намеренно отсутствует: его определяет движок по потерям win%,
+#: модель может дать только прозу. Отчёт без вердикта дополняется движком
+#: на стороне сервера (см. ``engine_verdict``).
 REPORT_SCHEMA = """{
-  "verdict": "good" | "partial" | "wrong",
   "summary": "2–3 предложения: тип позиции и у кого перевес (в чём), потом — доказал ли план",
   "plan_comment": "по пунктам: что верно/неверно и почему — с полями, фигурами и пешками",
   "moments": [
@@ -53,6 +55,9 @@ REPORT_SCHEMA = """{
   ],
   "lesson": "одно конкретное правило для этого типа позиций"
 }"""
+
+#: Профиль ответа «тренера» из фактов без LLM (см. ``build_facts_report``).
+FACTS_REPORT_VERDICT_SOURCE = "engine"
 
 __all__ = [
     "POSITIONS",
@@ -74,6 +79,10 @@ __all__ = [
     "apply_opponent_move",
     "opponent_side",
     "build_report_prompt",
+    "build_report_facts",
+    "build_facts_report",
+    "engine_verdict",
+    "facts_plan_comment",
     "describe_position",
     "ground_report",
     "normalize_report",
@@ -818,9 +827,8 @@ def build_report_prompt(
         "или после него.",
         "- Схема ответа:",
         REPORT_SCHEMA,
-        '- verdict: "good" — план был верным и игрок его доказал; '
-        '"partial" — идея верна, но порядок/детали требуют правки; '
-        '"wrong" — план не соответствовал позиции.',
+        '- Поле "verdict" НЕ возвращай: вердикт выставляет движок по потерям '
+        "win%, твоя задача — только проза по фактам.",
         "- Пиши как сильный тренер-стратег: конкретно, с названиями полей, "
         "фигур, пешек и линий.",
         "- КАЖДЫЙ момент (comment) — 2–4 предложения и три части: "
@@ -862,22 +870,10 @@ def build_report_prompt(
         "оценки. Например: «Да, план хорош, но сначала создай форточку, "
         "иначе ферзь не успевает подключиться».",
         "- Если план был верным, но первый ход оказался неточным — это "
-        "verdict \"partial\", а не \"wrong\".",
+        "не повод утверждать, что план неверен: движок решит вердикт по "
+        "потерям win%, ты только опиши, что происходило.",
     ]
     return "\n".join(line for line in lines if line is not None)
-
-
-_VERDICT_ALIASES = {
-    "good": "good",
-    "partial": "partial",
-    "wrong": "wrong",
-    "ok": "partial",
-    "mixed": "partial",
-    "bad": "wrong",
-    "хорошо": "good",
-    "частично": "partial",
-    "плохо": "wrong",
-}
 
 
 def _clean_text(value: Any, default: str = "") -> str:
@@ -989,13 +985,11 @@ def normalize_report(raw: dict[str, Any]) -> dict[str, Any]:
     """Приводит ответ LLM к схеме отчёта, подставляя безопасные значения.
 
     Не падает на неполном/мусорном JSON: отсутствующие поля заполняются,
-    ``verdict`` приводится к одному из ``good``/``partial``/``wrong``,
-    невалидные моменты отбрасываются.
+    невалидные моменты отбрасываются. ``verdict`` моделью не задаётся:
+    поле присутствует со значением ``None`` и выставляется движком
+    (см. :func:`engine_verdict`) на стороне сервера.
     """
     data = raw if isinstance(raw, dict) else {}
-
-    verdict_raw = _clean_text(data.get("verdict")).lower()
-    verdict = _VERDICT_ALIASES.get(verdict_raw, "partial")
 
     raw_moments = data.get("moments")
     moments: list[dict[str, Any]] = []
@@ -1016,7 +1010,7 @@ def normalize_report(raw: dict[str, Any]) -> dict[str, Any]:
             )
 
     return {
-        "verdict": verdict,
+        "verdict": None,
         "summary": _clean_text(data.get("summary"), "Итог не сформирован."),
         "plan_comment": _plan_comment_text(data.get("plan_comment")),
         "moments": moments,
@@ -1095,8 +1089,283 @@ def ground_report(
         moment["alt_san"] = alt
         moments.append(moment)
     grounded = dict(data)
+    # Вердикт — только от движка: значение от LLM в отчёт не попадает.
+    grounded.pop("verdict", None)
     grounded["moments"] = moments
     return grounded
+
+
+# Пороговые потери win.% (для сделавшего ход) для вердикта движка.
+_VERDICT_WRONG_WORST = 15.0
+_VERDICT_WRONG_AVG = 10.0
+_VERDICT_PARTIAL_WORST = 6.0
+_VERDICT_PARTIAL_AVG = 4.0
+
+
+def _user_deltas(
+    engine_facts: list[dict[str, Any]], user_is_white: bool
+) -> list[float]:
+    """Потери win.% по полуходам игрока (1-based: белые — нечётные)."""
+    deltas: list[float] = []
+    for index, fact in enumerate(engine_facts or [], start=1):
+        if not isinstance(fact, dict):
+            continue
+        try:
+            ply = int(fact.get("ply", index))
+        except (TypeError, ValueError):
+            ply = index
+        if (ply % 2 == 1) != user_is_white:
+            continue
+        delta = fact.get("delta", fact.get("drop"))
+        try:
+            deltas.append(max(0.0, float(delta)))
+        except (TypeError, ValueError):
+            continue
+    return deltas
+
+
+def engine_verdict(
+    engine_facts: list[dict[str, Any]], user_is_white: bool
+) -> str:
+    """Вердикт по движку — единственный источник вердикта в отчёте.
+
+    ``good`` — нет ходов с потерей ≥6% win и средняя потеря <4%;
+    ``partial`` — худший ход <15% и средняя <10%; иначе ``wrong``.
+    Пустые факты — ``partial`` (судить нечем).
+    """
+    deltas = _user_deltas(engine_facts, user_is_white)
+    if not deltas:
+        return "partial"
+    worst = max(deltas)
+    avg = sum(deltas) / len(deltas)
+    if worst >= _VERDICT_WRONG_WORST or avg >= _VERDICT_WRONG_AVG:
+        return "wrong"
+    if worst >= _VERDICT_PARTIAL_WORST or avg >= _VERDICT_PARTIAL_AVG:
+        return "partial"
+    return "good"
+
+
+def build_report_facts(
+    session: MiddlegameSession,
+    engine_facts: list[dict[str, Any]],
+    position: Position | None,
+) -> dict[str, Any]:
+    """Нормализованный facts-объект отчёта для ``facttext.assert_facts``.
+
+    Опоры: SAN всех сыгранных ходов и линий движка, позиции engine
+    (deltas, знаковые оценки в пешках, маты), номера полуходов,
+    источник позиции (название/авторы) и текст плана игрока (его числа —
+    тоже дозволенные). Названий дебютов в facts нет: отчёт миттельшпиля
+    не имеет права называть дебют.
+    """
+    moves = _moves_with_san(session)
+    sans = [san for _, _, san in moves if san and san != "?"]
+    ucis = list(session.moves)
+    numbers: list[float] = []
+    signed: list[float] = []
+    mates: list[int] = []
+
+    def _eval_numbers(raw: Any) -> None:
+        if not isinstance(raw, dict):
+            return
+        mate = raw.get("mate")
+        if mate is not None:
+            try:
+                mates.append(abs(int(mate)))
+            except (TypeError, ValueError):
+                pass
+            return
+        cp = raw.get("cp")
+        if cp is not None:
+            try:
+                signed.append(float(cp) / 100.0)
+            except (TypeError, ValueError):
+                pass
+
+    for fact in engine_facts or []:
+        if not isinstance(fact, dict):
+            continue
+        for key in ("best_san", "best_move_san", "second_san", "san"):
+            value = fact.get(key)
+            if value:
+                sans.append(str(value))
+        for key in ("pv", "pv_after"):
+            line = fact.get(key)
+            if isinstance(line, (list, tuple)):
+                sans.extend(str(item) for item in line)
+        delta = fact.get("delta", fact.get("drop"))
+        if delta is not None:
+            try:
+                numbers.append(abs(float(delta)))
+            except (TypeError, ValueError):
+                pass
+        for key in ("eval_before", "eval_after", "before", "after"):
+            _eval_numbers(fact.get(key))
+
+    resolved = position if position is not None else POSITION_BY_KEY.get(session.position_key)
+    strings = []
+    if resolved is not None:
+        strings.extend(
+            [resolved.source_title, resolved.white, resolved.black, resolved.source_url]
+        )
+    if session.plan:
+        strings.append(session.plan)
+    return facttext.new_facts(
+        sans=sans,
+        ucis=ucis,
+        numbers=numbers,
+        signed=signed,
+        mates=mates,
+        strings=strings,
+        max_ply=max(len(session.moves), 1),
+    )
+
+
+def facts_plan_comment(
+    engine_facts: list[dict[str, Any]], user_is_white: bool
+) -> tuple[str, str]:
+    """``(plan_comment, lesson)`` только из фактов движка, без LLM."""
+    deltas = _user_deltas(engine_facts, user_is_white)
+    errors: list[dict[str, Any]] = []
+    for index, fact in enumerate(engine_facts or [], start=1):
+        if not isinstance(fact, dict):
+            continue
+        try:
+            ply = int(fact.get("ply", index))
+        except (TypeError, ValueError):
+            ply = index
+        if (ply % 2 == 1) != user_is_white:
+            continue
+        delta = fact.get("delta", fact.get("drop"))
+        try:
+            delta_value = float(delta) if delta is not None else 0.0
+        except (TypeError, ValueError):
+            delta_value = 0.0
+        if delta_value >= 5:
+            errors.append((ply, delta_value, fact))
+    if not errors:
+        return (
+            "Ошибок с потерей ≥5% win по движку нет.",
+            "Движок не видит потерь в этой партии.",
+        )
+    errors.sort(key=lambda item: item[0])
+    parts = []
+    for ply, delta_value, fact in errors[:4]:
+        line = " ".join(str(move) for move in (fact.get("pv") or [])[:4])
+        parts.append(
+            f"{fact.get('san')} — потеря {delta_value:.1f}%, "
+            f"лучше {fact.get('best_san') or fact.get('best_move_san') or '—'}"
+            + (f" ({line})" if line else "")
+        )
+    worst = max(errors, key=lambda item: item[1])
+    worst_line = " ".join(str(move) for move in (worst[2].get("pv") or [])[:4])
+    lesson = (
+        f"Главный ресурс по движку — {worst[2].get('best_san') or worst[2].get('best_move_san') or '—'}"
+        + (f": {worst_line}" if worst_line else "")
+        + "."
+    )
+    return "; ".join(parts) + ".", lesson
+
+
+def _facts_summary_text(
+    engine_facts: list[dict[str, Any]], user_is_white: bool
+) -> str:
+    """Summary только из фактов движка (замена невалидного/пустого LLM)."""
+    deltas = _user_deltas(engine_facts, user_is_white)
+    if not deltas:
+        return (
+            "Движок не оценил позицию: факторов недостаточно. "
+            "Разбор собран без LLM."
+        )
+    error_plies = []
+    worst: tuple[int, float, str] | None = None
+    for index, fact in enumerate(engine_facts or [], start=1):
+        if not isinstance(fact, dict):
+            continue
+        try:
+            ply = int(fact.get("ply", index))
+        except (TypeError, ValueError):
+            ply = index
+        if (ply % 2 == 1) != user_is_white:
+            continue
+        delta = fact.get("delta", fact.get("drop"))
+        try:
+            delta_value = float(delta) if delta is not None else 0.0
+        except (TypeError, ValueError):
+            delta_value = 0.0
+        if delta_value >= 5:
+            error_plies.append(ply)
+            if worst is None or delta_value > worst[1]:
+                worst = (ply, delta_value, str(fact.get("san") or "?"))
+    if worst is None:
+        return (
+            f"По данным Stockfish, ходов с потерей win% ≥5 нет "
+            f"(оценено {len(deltas)} ходов). Разбор собран без LLM."
+        )
+    return (
+        f"По данным Stockfish: ходов с потерей win% ≥5 — {len(error_plies)} из {len(deltas)}. "
+        f"Худший — {worst[2]} (полуход {worst[0]}, потеря {worst[1]:.1f}% win). "
+        "Разбор собран без LLM."
+    )
+
+
+def build_facts_report(
+    session: MiddlegameSession,
+    engine_facts: list[dict[str, Any]],
+    position: Position | None = None,
+) -> dict[str, Any]:
+    """Отчёт только из фактов движка (без LLM).
+
+    ``verdict`` — из :func:`engine_verdict`; ``moments`` — из оценок
+    Stockfish; ``summary_kind='engine_facts'`` помечает, что текста модели
+    в отчёте нет. Используется, когда LLM недоступен или его ответ не
+    прошёл проверку фактов.
+    """
+    resolved = position if position is not None else POSITION_BY_KEY.get(session.position_key)
+    user_is_white = session.side == "white"
+    report: dict[str, Any] = {
+        "verdict": engine_verdict(engine_facts, user_is_white),
+        "summary": _facts_summary_text(engine_facts, user_is_white),
+        "plan_comment": "",
+        "moments": [],
+        "lesson": "",
+        "facts_only": True,
+        "summary_kind": "engine_facts",
+        "verdict_source": FACTS_REPORT_VERDICT_SOURCE,
+    }
+    plan_comment, lesson = facts_plan_comment(engine_facts, user_is_white)
+    report["plan_comment"] = plan_comment
+    report["lesson"] = lesson
+
+    entries: list[tuple[int, dict[str, Any]]] = []
+    for index, fact in enumerate(engine_facts or [], start=1):
+        if not isinstance(fact, dict):
+            continue
+        try:
+            ply = int(fact.get("ply", index))
+        except (TypeError, ValueError):
+            ply = index
+        if (ply % 2 == 1) != user_is_white:
+            continue
+        delta = fact.get("delta", fact.get("drop"))
+        try:
+            delta_value = float(delta) if delta is not None else 0.0
+        except (TypeError, ValueError):
+            delta_value = 0.0
+        if delta_value >= 5:
+            entries.append((ply, delta_value, fact))
+    entries.sort(key=lambda item: item[1], reverse=True)
+    for ply, _delta_value, fact in entries[:5]:
+        grounded_fact = dict(fact)
+        grounded_fact["ply"] = ply
+        report["moments"].append(
+            _fact_moment(
+                grounded_fact,
+                _fen_before(session.fen, list(session.moves), ply),
+            )
+        )
+    report["moments"].sort(key=lambda item: int(item.get("ply") or 0))
+    return report
 
 
 def new_session_id() -> str:

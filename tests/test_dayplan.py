@@ -129,6 +129,65 @@ class BuildTasksTests(unittest.TestCase):
             {task["id"] for task in other_day},
         )
 
+    def test_unknown_opening_and_generic_motif_are_not_cta(self) -> None:
+        plan = {
+            "repertoire": {
+                "weak_openings": [
+                    {"opening": "Без названия", "eco": None, "games": 30,
+                     "points_pct": 10.0, "errors_per_game": 3.0,
+                     "errors_per_game_shrunk": 2.6},
+                ],
+            },
+            "patterns": {
+                "motifs": [["прочее", {"count": 40, "avg_drop": 15.0}]],
+                "phases": [],
+                "total_bad": 40,
+            },
+            "humanity": {"unnatural": 0, "total": 40},
+        }
+        tasks = build_tasks(plan, _TASK, "2026-10-26")
+        kinds = {t["kind"] for t in tasks}
+        self.assertNotIn("opening", kinds)
+        self.assertNotIn("middlegame", kinds)
+        titles = " ".join(t["title"] for t in tasks)
+        self.assertNotIn("Без названия", titles)
+        self.assertNotIn("прочее", titles)
+
+    def test_low_sample_opening_not_weak_even_if_losing(self) -> None:
+        plan = {
+            "repertoire": {
+                "weak_openings": [
+                    {"opening": "English Opening", "eco": "A10", "games": 2,
+                     "points_pct": 0.0, "errors_per_game": 4.0,
+                     "errors_per_game_shrunk": 1.14},
+                ],
+            },
+            "patterns": {"motifs": [], "phases": [], "total_bad": 8},
+            "humanity": {"unnatural": 0, "total": 8},
+        }
+        tasks = build_tasks(plan, _TASK, "2026-10-26")
+        self.assertNotIn("opening", {t["kind"] for t in tasks})
+
+    def test_shrunk_opening_rows_still_become_cta_with_enough_games(self) -> None:
+        plan = {
+            "repertoire": {
+                "weak_openings": [
+                    {"opening": "Sicilian Defense", "eco": "B20", "games": 12,
+                     "points_pct": 41.7, "errors_per_game": 1.5,
+                     "errors_per_game_shrunk": 1.06},
+                    {"opening": "French Defense", "eco": "C00", "games": 5,
+                     "points_pct": 50.0, "errors_per_game": 1.0,
+                     "errors_per_game_shrunk": 0.5},
+                ],
+            },
+            "patterns": {"motifs": [], "phases": [], "total_bad": 20},
+            "humanity": {"unnatural": 0, "total": 20},
+        }
+        tasks = build_tasks(plan, _TASK, "2026-10-26")
+        opening_tasks = [t for t in tasks if t["kind"] == "opening"]
+        self.assertEqual(len(opening_tasks), 1)
+        self.assertEqual(opening_tasks[0]["action"]["opening"], "Sicilian Defense")
+
     def test_garbage_plan_does_not_crash(self) -> None:
         garbage = {
             "repertoire": {"weak_openings": "oops"},

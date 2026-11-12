@@ -1,6 +1,6 @@
 // Chess Trainer Frontend — SPA на vanilla JS, потребляет /api/* эндпоинты.
 
-import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.9.21';
+import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.9.22';
 
 const state = {
   user: null,
@@ -38,7 +38,8 @@ const state = {
   taskExploreBusy: false,
   taskExploreError: null,
   taskExploreToken: 0,
-  taskExplanation: null,
+  taskLlmExplanation: null,
+  taskLlmNote: null,
   taskExplaining: false,
   taskJobId: null,
   taskError: null,
@@ -71,6 +72,7 @@ const state = {
   openingTheoryIdeasDone: false,
   openingTheoryIdeasCached: false,
   openingTheoryIdeasError: null,
+  openingTheoryIdeasRejected: false,
   middlegameSession: null,
   middlegameMeta: null,
   middlegameStrength: 'equal',
@@ -93,7 +95,6 @@ const state = {
   readingReview: null,
   readingBoardShown: false,
   authMode: 'login',
-  trackStarted: false,
 };
 
 // --- API helpers ---
@@ -268,16 +269,18 @@ function viewAuth(app) {
       <div class="form-group"><label>Логин <input type="text" name="login" required autocomplete="username"></label></div>
       <div class="form-group"><label>Пароль <input type="password" name="password" required autocomplete="current-password"></label></div>
       <button class="btn btn-primary" style="width:100%">Войти</button>
-    </form>`;
+    </form>
+    <p style="color:var(--c-text-muted);font-size:12px;margin-top:10px"><a href="/privacy.html">Приватность и условия</a></p>`;
   const regForm = `
     <form id="auth-register-form">
       <div class="form-group"><label>Логин <input type="text" name="login" required autocomplete="username"></label></div>
-      <div class="form-group"><label>Пароль (мин. 4 символа) <input type="password" name="password" required autocomplete="new-password"></label></div>
+      <div class="form-group"><label>Пароль (мин. 8 символов) <input type="password" name="password" required minlength="8" autocomplete="new-password"></label></div>
       <div class="form-group"><label>Ник на Lichess (обяз.) <input type="text" name="lichess" required placeholder="GarryKasparov" autocomplete="username"></label></div>
       <div class="form-group"><label>FIDE ID (необяз.) <input type="text" name="fide" placeholder="4130005"></label></div>
       <button class="btn btn-primary" style="width:100%">Зарегистрироваться</button>
     </form>
-    <p style="color:var(--c-text-muted);font-size:12px;margin-top:8px">Если твой ник уже есть в базе без пароля (старые данные и партии), регистрация закрепит его за тобой — партии сохранятся.</p>`;
+    <p style="color:var(--c-text-muted);font-size:12px;margin-top:8px">Если твой ник уже есть в базе без пароля (старые данные и партии), регистрация закрепит его за тобой — партии сохранятся.</p>
+    <p style="color:var(--c-text-muted);font-size:12px;margin-top:4px">Регистрируясь, ты соглашаешься с <a href="/privacy.html">Приватностью и условиями</a>: хранится логин, Lichess-ник и хеш пароля; партии используются для разбора; скрытой аналитики нет; аккаунт можно удалить в Профилях.</p>`;
   app.innerHTML = `
     <div class="card" style="max-width:420px;margin:40px auto">
       <div class="card-header"><span class="card-title">Вход / Регистрация</span></div>
@@ -357,7 +360,7 @@ function renderUserbox() {
       syncAdminNav();
       Object.assign(state, {
         gameId: null, gameData: null, task: null, taskKey: null, taskResult: null,
-        taskRevealed: false, taskExplanation: null, planLlmJobId: null,
+        taskRevealed: false, taskLlmExplanation: null, taskLlmNote: null, planLlmJobId: null,
         planLlmGenerating: false, tool: 'repertoire', gamesFilter: 'all',
         openingSession: null, openingFens: null, openingLastReply: null, openingJobId: null,
         middlegameSession: null, middlegameMeta: null, middlegameJobId: null,
@@ -753,13 +756,23 @@ function onboardingStepsHtml(plan, dayplan) {
     </div>`;
 }
 
+// Зеркало backend-предиката is_weak_opening (app/repertoire.py, audit M4):
+// известное название; >= 4 партий; счёт < 50% или сжатая оценка ошибок
+// на партию >= 1.0 (bad_moves / (games + 5), приор k=5). «Без названия» — никогда.
 function isWeakOpening(o) {
+  const name = String((o && o.opening) || '').trim().toLowerCase();
+  if (!name || name === 'без названия' || name === 'unknown') return false;
   const games = Number(o && o.games) || 0;
+  if (games < 4) return false;
   const points = Number(o && o.points_pct);
-  const errors = Number(o && o.errors_per_game) || 0;
-  if (games >= 2) return true;
-  if (Number.isFinite(points) && points < 70) return true;
-  return errors >= 1.5;
+  const shrunkRaw = o && o.errors_per_game_shrunk;
+  let shrunk = Number(shrunkRaw);
+  if (!Number.isFinite(shrunk)) {
+    const epg = Number(o && o.errors_per_game) || 0;
+    shrunk = epg * games / (games + 5);
+  }
+  if (Number.isFinite(points) && points < 50) return true;
+  return shrunk >= 1.0;
 }
 
 async function viewDashboard(app) {
@@ -768,6 +781,7 @@ async function viewDashboard(app) {
       <div class="onboarding card">
         <div class="empty-icon">🏁</div>
         <h1>Добро пожаловать в Chess Trainer</h1>
+        <p>Разбор твоих партий с Lichess, Stockfish-факты по ходам, план и задачи из твоих ошибок.<br>Не обещает рост рейтинга и не заменяет тренера, Chess.com или Lichess — закрытая бета.</p>
         <p>Проанализированных партий пока нет.<br>Нажми «Запустить анализ», чтобы загрузить партии с Lichess и пройти их Stockfish.</p>
         <a href="#" class="btn btn-primary" data-view="coach">Запустить анализ</a>
       </div>`;
@@ -790,6 +804,7 @@ async function viewDashboard(app) {
         <div class="empty-icon">🏁</div>
         <h1>Пока нет данных</h1>
         <p>Зарегистрировался — запусти анализ: партии с Lichess пройдут через Stockfish, и здесь появится план тренировки.</p>
+        <p style="color:var(--c-text-muted);font-size:12px">План строится из твоих ошибок без гарантии роста рейтинга — это дополнение к тренеру и Lichess/Chess.com, а не замена.</p>
         <a href="#" class="btn btn-primary" data-view="coach">Запустить анализ</a>
       </div>`;
     bindLinks(app);
@@ -799,7 +814,7 @@ async function viewDashboard(app) {
 
   const scorePct = plan.score_pct != null ? fmt(plan.score_pct) + '%' : '—';
   const avgWinLoss = plan.avg_win_loss != null ? fmt(plan.avg_win_loss, 2) : '—';
-  const weakCount = plan.repertoire.weak_openings.length;
+  const weakCount = (plan.repertoire.weak_openings || []).filter(isWeakOpening).length;
 
   let humanityHtml = '';
   if (plan.humanity) {
@@ -819,31 +834,32 @@ async function viewDashboard(app) {
   if (weakRows.length > 0) {
     weakOpeningsHtml = `
       <div class="table-wrap"><table>
-        <thead><tr><th>Дебют</th><th>ECO</th><th>Партий</th><th>Очков %</th><th>Ошибок/партию</th><th>Ср. потеря</th><th></th></tr></thead>
+        <thead><tr><th>Дебют</th><th>ECO</th><th>Партий</th><th>Очков %</th><th>Ошибок/партию (сжато)</th><th>Ср. потеря</th><th></th></tr></thead>
         <tbody>
           ${weakRows.slice(0, 6).map(o => `
             <tr>
               <td>${esc(o.opening)}</td><td>${esc(o.eco)}</td>
               <td class="num">${o.games}</td>
               <td class="num">${fmt(o.points_pct)}%</td>
-              <td class="num">${fmt(o.errors_per_game, 2)}</td>
+              <td class="num">${fmt(o.errors_per_game_shrunk != null ? o.errors_per_game_shrunk : o.errors_per_game, 2)}</td>
               <td class="num">${fmt(o.avg_drop)}%</td>
               <td class="center"><button type="button" class="btn btn-secondary" data-train-opening="${esc(o.eco || '')}" data-train-color="${esc(o.color || 'white')}" data-train-name="${esc(o.opening || '')}" style="font-size:12px;padding:4px 10px">Тренировать</button></td>
             </tr>`).join('')}
         </tbody>
       </table></div>`;
   } else {
-    weakOpeningsHtml = '<p style="color:var(--c-text-muted)">Дебютов нет — запусти анализ.</p>';
+    weakOpeningsHtml = '<p style="color:var(--c-text-muted)">Нет дебюта с достаточной выборкой (минимум 4 партии и счёт ниже 50% либо ≥ 1.0 ошибок на партию после сжатия) — данных для рекомендации нет.</p>';
   }
+  weakOpeningsHtml += `<p style="color:var(--c-text-muted);font-size:12px;margin:6px 0 0">Окно: последние ${esc(String(plan.games || 0))} проанализированных партий из кеша · фильтр: ≥ 4 партий на дебют, «Без названия» исключено, ошибки сжаты приором k=5.</p>`;
 
   let trendHtml = '';
-  if (progress && progress.trend && Number(progress.games) >= 6) {
+  if (progress && progress.trend && progress.trend.sufficient) {
     const t = progress.trend;
     const badgeClass = t.overall === 'improving' ? 'badge-good' : t.overall === 'worsening' ? 'badge-bad' : 'badge-neutral';
     let rows = '';
     for (const [m, v] of Object.entries(t)) {
-      if (['improving', 'worsening', 'overall'].includes(m)) continue;
-      const deltaClass = v.delta > 0 ? 'badge-bad' : 'badge-good';
+      if (['improving', 'worsening', 'overall', 'sufficient', 'n_games', 'min_games', 'windows_used'].includes(m)) continue;
+      const deltaClass = v.verdict === 'better' ? 'badge-good' : v.verdict === 'worse' ? 'badge-bad' : 'badge-neutral';
       rows += `<tr>
         <td>${esc(TREND_LABELS[m] || m)}</td>
         <td class="num">${fmt(v.from, 2)}</td>
@@ -859,7 +875,8 @@ async function viewDashboard(app) {
         <tbody>${rows}</tbody>
       </table></div>`;
   } else if (progress && progress.trend) {
-    trendHtml = '<p style="color:var(--c-text-muted)">Мало данных для тренда: нужно хотя бы 6 партий.</p>';
+    const minGames = (progress.trend && progress.trend.min_games) || progress.min_games || 10;
+    trendHtml = `<p style="color:var(--c-text-muted)">Недостаточно данных для тренда: нужно хотя бы ${esc(String(minGames))} проанализированных партий (сейчас ${esc(String(progress.games))}). Стрелки не показываем.</p>`;
   } else {
     trendHtml = '<p style="color:var(--c-text-muted)">Нет данных для тренда.</p>';
   }
@@ -1056,13 +1073,14 @@ async function viewPlan(app) {
     bindLinks(app);
     return;
   }
-  const [taskToday, track, report, goalData, weekData, llmData] = await Promise.all([
+  const [taskToday, track, report, goalData, weekData, llmData, snapData] = await Promise.all([
     api('/api/task/today').catch(() => null),
     api('/api/track/today').catch(() => null),
     api('/api/report').catch(() => null),
     api('/api/plan/goal').catch(() => null),
     api('/api/plan/week').catch(() => null),
     api('/api/plan/llm').catch(() => null),
+    api('/api/plan/week/snapshot').catch(() => null),
   ]);
 
   const focusRu = { auto: 'авто', opening: 'дебют', middlegame: 'миттельшпиль', endgame: 'эндшпиль' };
@@ -1137,8 +1155,9 @@ async function viewPlan(app) {
     llmHtml = `<div class="card"><div class="card-header"><span class="card-title">Комментарий тренера</span><span class="badge badge-neutral">пояснение</span></div>
       <p style="color:var(--c-text-muted);font-size:13px;margin:0">генерирую…</p></div>`;
   } else if (llmData && llmData.text) {
-    llmHtml = `<div class="card"><div class="card-header"><span class="card-title">Комментарий тренера</span><span class="badge badge-neutral">пояснение</span></div>
-      <p style="color:var(--c-text-muted);font-size:13px;margin-top:0">Это объяснение к недельному плану, а не отдельный список задач.</p>
+    const llmFactsOnly = !!llmData.facts_only;
+    llmHtml = `<div class="card"><div class="card-header"><span class="card-title">Комментарий тренера</span><span class="badge ${llmFactsOnly ? 'badge-blue' : 'badge-neutral'}" title="${llmFactsOnly ? 'Текст собран из фактов недели, без LLM' : 'Текст LLM проверен по фактам недели'}">${llmFactsOnly ? 'факты недели' : 'пояснение'}</span></div>
+      <p style="color:var(--c-text-muted);font-size:13px;margin-top:0">${llmFactsOnly ? 'LLM недоступен или ответ не прошёл проверку фактов — ниже только проверяемые данные недели без комментария модели.' : 'Это объяснение к недельному плану, а не отдельный список задач.'}</p>
       <details class="plan-comment"><summary>Почему такой план</summary><div class="mentor-reply">${coachCommentHtml(llmData.text, weekData && weekData.evidence)}</div></details>
       ${state.planLlmError ? `<div class="alert alert-error" style="margin-top:8px">${esc(state.planLlmError)}</div>` : ''}
       <div style="margin-top:8px"><button class="btn btn-secondary" id="plan-llm-refresh" style="font-size:12px;padding:4px 10px">Обновить комментарий</button></div></div>`;
@@ -1147,6 +1166,42 @@ async function viewPlan(app) {
       <p style="color:var(--c-text-muted);font-size:13px;margin-top:0">План на неделю уже собран из твоих партий. Можно попросить тренера объяснить, почему он такой.</p>
       ${state.planLlmError ? `<div class="alert alert-error" style="margin-bottom:8px">${esc(state.planLlmError)}</div>` : ''}
       <button class="btn btn-secondary" id="plan-llm-create" style="width:fit-content">Собрать комментарий</button></div>`;
+  }
+
+  let snapshotHtml = '';
+  if (snapData) {
+    const snap = snapData.snapshot || null;
+    const caveat = esc(snapData.caveat || 'Описательная дельта — не доказательство роста рейтинга и не подтверждение причинности плана.');
+    if (!snap) {
+      snapshotHtml = `<div class="card"><div class="card-header"><span class="card-title">Снимок недели</span><span class="badge badge-neutral">описательно</span></div>
+        <p style="color:var(--c-text-muted);font-size:13px;margin:0">Снимок ещё не сохранён. Он зафиксируется при сохранении цели или генерации комментария тренера и останется базой для сверки — прошлую неделю не переписывает.</p>
+        <p style="color:var(--c-text-muted);font-size:12px;margin:8px 0 0">${caveat}</p></div>`;
+    } else {
+      const savedDate = snap.created_iso ? esc(String(snap.created_iso).slice(0, 10)) : '—';
+      const head = `<div style="color:var(--c-text-muted);font-size:13px;margin-bottom:8px">Окно на момент снимка: <strong>${esc(String(snap.window_n))} партий</strong> · неделя ${esc(snap.week_start || '—')} · сохранён ${savedDate} · фокус: ${esc(snap.focus_phase || '—')}</div>`;
+      let body = '';
+      if (snapData.status === 'pending') {
+        const left = snapData.days_remaining;
+        body = `<span class="badge badge-neutral">рано сверять</span> <span style="font-size:13px">Дельты появятся через ${left != null ? esc(String(left)) : 'несколько'} дн.: нужно ≥ ${esc(String(snapData.min_age_days || 7))} дней и ≥ ${esc(String(snapData.min_new_games || 10))} новых анализов.</span>`;
+      } else if (snapData.status === 'insufficient_data') {
+        body = `<span class="badge badge-neutral">недостаточно новых данных</span> <span style="font-size:13px">новых анализов: ${esc(String(snapData.new_games || 0))} из ${esc(String(snapData.min_new_games || 10))} — вывод не делаем, нулей не подставляем.</span>`;
+      } else if (snapData.status === 'ok' && snapData.deltas) {
+        const d = snapData.deltas;
+        const fmtD = (v) => (v == null ? '—' : (v > 0 ? '+' : '') + fmt(v, 2));
+        const cur = snapData.current || {};
+        body = `<div style="font-size:13px;margin-bottom:6px"> новых анализов: ${esc(String(snapData.new_games || 0))} · окно сейчас: ${esc(String(cur.window_n != null ? cur.window_n : '—'))} партий</div>
+        <div class="table-wrap"><table><thead><tr><th>Метрика</th><th>Снимок</th><th>Сейчас</th><th>Δ</th></tr></thead><tbody>
+          <tr><td>Счёт %</td><td class="num">${fmt(snap.score)}</td><td class="num">${fmt(cur.score_pct)}</td><td class="num">${fmtD(d.score_pct)}</td></tr>
+          <tr><td>Ср. потеря win%</td><td class="num">${fmt(snap.avg_drop, 2)}</td><td class="num">${fmt(cur.avg_drop, 2)}</td><td class="num">${fmtD(d.avg_drop)}</td></tr>
+        </tbody></table></div>`;
+      } else {
+        body = `<span style="font-size:13px;color:var(--c-text-muted)">Сверка недоступна.</span>`;
+      }
+      snapshotHtml = `<div class="card"><div class="card-header"><span class="card-title">Снимок недели</span><span class="badge badge-neutral">описательно</span></div>
+      ${head}
+      <div>${body}</div>
+      <p style="color:var(--c-text-muted);font-size:12px;margin:8px 0 0">${caveat}</p></div>`;
+    }
   }
 
   let weekHtml = '';
@@ -1177,7 +1232,9 @@ async function viewPlan(app) {
     const rows = [];
     if (taskToday) {
       const done = !!taskToday.done;
-      rows.push(`<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:6px 0"><span class="badge ${done ? 'badge-good' : 'badge-neutral'}">${done ? 'выполнено' : 'осталось'}</span><span style="flex:1;min-width:180px">Задача дня${done ? ' — решена' : ' — не решена'}</span><button class="btn btn-secondary" data-plan-act="task" style="font-size:12px;padding:4px 10px">Открыть</button></div>`);
+      const attempt = Number(taskToday.attempt) > 0 ? Number(taskToday.attempt) : null;
+      const attemptBadge = attempt ? ` · попытка ${attempt}` : '';
+      rows.push(`<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:6px 0"><span class="badge ${done ? 'badge-good' : 'badge-neutral'}">${done ? 'выполнено' : 'осталось'}</span><span style="flex:1;min-width:180px">Задача дня${attemptBadge}${done ? ' — решена' : ' — не решена'}</span><button class="btn btn-secondary" data-plan-act="task" style="font-size:12px;padding:4px 10px">Открыть</button></div>`);
     }
     if (track) {
       rows.push(`<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:6px 0"><span class="badge badge-blue">время</span><span style="flex:1;min-width:180px">Время сегодня: ${_fmtDur(track.total_sec)}</span><button class="btn btn-secondary" data-plan-act="users" style="font-size:12px;padding:4px 10px">Профили</button></div>`);
@@ -1204,6 +1261,7 @@ async function viewPlan(app) {
     <div class="card-header"><h1>План тренировки</h1><span class="badge badge-blue">${esc(state.user.nick)}</span></div>
     ${goalHtml}
     ${weekHtml}
+    ${snapshotHtml}
     ${llmHtml}
     ${todayHtml}
     <div class="grid grid-4">
@@ -1221,7 +1279,7 @@ async function viewPlan(app) {
     </div>
     <div class="card">
       <div class="card-header"><span class="card-title">Слабые дебюты</span></div>
-      ${(() => { const rows = (plan.repertoire.weak_openings || []).filter(isWeakOpening); return rows.length ? `<div class="table-wrap"><table><thead><tr><th>Дебют</th><th>ECO</th><th>Партий</th><th>Очков %</th><th>Ошибок/партию</th><th>Ср. потеря</th></tr></thead><tbody>${rows.slice(0, 6).map(o => `<tr><td>${esc(o.opening)}</td><td>${esc(o.eco)}</td><td class="num">${o.games}</td><td class="num">${fmt(o.points_pct)}%</td><td class="num">${fmt(o.errors_per_game, 2)}</td><td class="num">${fmt(o.avg_drop)}%</td></tr>`).join('')}</tbody></table></div>` : '<p style="color:var(--c-text-muted)">Мало данных: нет дебюта с достаточной выборкой или плохими очками.</p>'; })()}
+      ${(() => { const rows = (plan.repertoire.weak_openings || []).filter(isWeakOpening); return rows.length ? `<div class="table-wrap"><table><thead><tr><th>Дебют</th><th>ECO</th><th>Партий</th><th>Очков %</th><th>Ошибок/партию (сжато)</th><th>Ср. потеря</th></tr></thead><tbody>${rows.slice(0, 6).map(o => `<tr><td>${esc(o.opening)}</td><td>${esc(o.eco)}</td><td class="num">${o.games}</td><td class="num">${fmt(o.points_pct)}%</td><td class="num">${fmt(o.errors_per_game_shrunk != null ? o.errors_per_game_shrunk : o.errors_per_game, 2)}</td><td class="num">${fmt(o.avg_drop)}%</td></tr>`).join('')}</tbody></table></div><p style="color:var(--c-text-muted);font-size:12px;margin:6px 0 0">Фильтр: ≥ 4 партий на дебют, «Без названия» исключено, ошибки/партию сжаты приором k=5.</p>` : '<p style="color:var(--c-text-muted)">Нет дебюта с достаточной выборкой (минимум 4 партии и счёт ниже 50% либо ≥ 1.0 ошибок на партию после сжатия) — рекомендаций нет.</p>'; })()}
     </div>
     <div class="grid grid-2">
       <div class="card">
@@ -1452,25 +1510,27 @@ async function viewProgress(app) {
     return;
   }
 
+  const trendSufficient = !!(pr.trend && pr.trend.sufficient);
+  const minGames = (pr.trend && pr.trend.min_games) || pr.min_games || 10;
   let trendRows = '';
-  if (pr.trend && Number(pr.games) >= 6) {
+  if (trendSufficient) {
     for (const [m, v] of Object.entries(pr.trend)) {
-      if (['improving', 'worsening', 'overall'].includes(m)) continue;
-      const deltaClass = v.delta > 0 ? 'badge-bad' : 'badge-good';
+      if (['improving', 'worsening', 'overall', 'sufficient', 'n_games', 'min_games', 'windows_used'].includes(m)) continue;
+      const deltaClass = v.verdict === 'better' ? 'badge-good' : v.verdict === 'worse' ? 'badge-bad' : 'badge-neutral';
       trendRows += `<tr><td>${esc(TREND_LABELS[m] || m)}</td><td class="num">${fmt(v.from, 2)}</td><td class="num">${fmt(v.to, 2)}</td><td class="num ${deltaClass}">${v.delta >= 0 ? '+' : ''}${fmt(v.delta, 2)}</td><td><span class="badge ${v.verdict === 'better' ? 'badge-good' : v.verdict === 'worse' ? 'badge-bad' : 'badge-neutral'}">${esc(TREND_VERDICT_RU[v.verdict] || v.verdict)}</span></td></tr>`;
     }
   } else if (pr.trend) {
-    trendRows = '<tr><td colspan="5" style="color:var(--c-text-muted)">Мало данных: нужно хотя бы 6 партий.</td></tr>';
+    trendRows = `<tr><td colspan="5" style="color:var(--c-text-muted)">Недостаточно данных: нужно хотя бы ${esc(String(minGames))} проанализированных партий (сейчас ${esc(String(pr.games))}). Стрелки не показываем.</td></tr>`;
   }
 
-  const overall = pr.trend && Number(pr.games) >= 6 ? pr.trend.overall : '—';
+  const overall = trendSufficient ? pr.trend.overall : 'insufficient_data';
   const badgeClass = overall === 'improving' ? 'badge-good' : overall === 'worsening' ? 'badge-bad' : 'badge-neutral';
 
   app.innerHTML = `
     <div class="card-header"><h1>Прогресс</h1><span class="badge badge-blue">${esc(state.user.nick)}</span></div>
     ${dailyHistoryCardHtml(daily)}
     <div class="card">
-      <div class="card-header"><span class="card-title">Таблица окон (${pr.windows} окон, ${pr.games} партий)</span></div>
+      <div class="card-header"><span class="card-title">Таблица окон (${pr.windows} окон, ${pr.games} партий · n=${pr.games})</span></div>
       <div class="table-wrap"><table>
         <thead><tr><th>№</th><th>Период</th><th>Партий</th><th>Счёт %</th><th title="Средняя потеря win% на ход игрока">Ср. потеря win%</th><th title="Средний win% перед ходом игрока">Win% до хода</th><th>Ошибок/партию</th><th>Неест. %</th><th>Ср. рейтинг</th></tr></thead>
         <tbody>
@@ -1487,10 +1547,11 @@ async function viewProgress(app) {
       </table></div>
     </div>
     <div class="card">
-      <div class="card-header"><span class="card-title">Тренд метрик</span></div>
-      ${pr.trend ? `<div style="margin-bottom:8px"><span class="badge ${badgeClass}">${esc(TREND_OVERALL_RU[overall] || overall)}</span></div>
+      <div class="card-header"><span class="card-title">Тренд метрик</span><span class="badge badge-neutral">мин. n=${esc(String(minGames))} для тренда</span></div>
+      ${pr.trend ? `<div style="margin-bottom:8px"><span class="badge ${badgeClass}">${esc(TREND_OVERALL_RU[overall] || overall)}</span> <span style="font-size:12px;color:var(--c-text-muted)">n=${esc(String(pr.games))} проанализированных партий</span></div>
       <div class="table-wrap"><table><thead><tr><th>Метрика</th><th>Было</th><th>Стало</th><th>Δ</th><th>Направление</th><th>Вердикт</th></tr></thead><tbody>${trendRows}</tbody></table></div>
-      <div style="margin-top:12px;font-size:13px"><strong>Улучшается: </strong>${pr.trend.improving.length ? pr.trend.improving.join(', ') : '—'}<br><strong>Ухудшается: </strong>${pr.trend.worsening.length ? pr.trend.worsening.join(', ') : '—'}</div>` : '<p style="color:var(--c-text-muted)">Недостаточно данных для тренда.</p>'}
+      <div style="margin-top:12px;font-size:13px"><strong>Улучшается: </strong>${pr.trend.improving.length ? pr.trend.improving.join(', ') : '—'}<br><strong>Ухудшается: </strong>${pr.trend.worsening.length ? pr.trend.worsening.join(', ') : '—'}</div>
+      <p style="color:var(--c-text-muted);font-size:12px;margin:8px 0 0">Сравнение окон описательное: разница не доказывает рост рейтинга и не подтверждает причинность плана — это сигнал, а не измерение обучения.</p>` : '<p style="color:var(--c-text-muted)">Недостаточно данных для тренда.</p>'}
     </div>`;
 }
 
@@ -2623,6 +2684,10 @@ async function viewDrillsWithParams(app, params) {
 // --- Задача дня ---
 
 async function viewTask(app) {
+  return loadTask(app, false);
+}
+
+async function loadTask(app, repeat) {
   if (!state.user) {
     app.innerHTML = '<div class="onboarding card"><div class="empty-icon">♟</div><h1>Задача дня</h1><p>Профиль не выбран — выбери его на странице Профили.</p><a href="#" class="btn btn-primary" data-view="users">Профили</a></div>';
     bindLinks(app);
@@ -2631,12 +2696,15 @@ async function viewTask(app) {
 
   let task;
   try {
-    task = await api('/api/task/today');
+    task = await api('/api/task/today' + (repeat ? '?repeat=1' : ''));
   } catch (err) {
+    const suppressed = /уже решались/i.test(String(err.message || ''));
     app.innerHTML = `
       <div class="card-header"><h1>Задача дня</h1></div>
-      <div class="onboarding card"><div class="empty-icon">♟</div><h1>Задач нет</h1><p>${esc(err.message)}</p><a href="#" class="btn btn-primary" data-view="coach">Запустить анализ</a></div>`;
+      <div class="onboarding card"><div class="empty-icon">♟</div><h1>${suppressed ? 'Все позиции решались недавно' : 'Задач нет'}</h1><p>${esc(err.message)}</p>${suppressed ? '<button type="button" class="btn btn-secondary" id="task-repeat-request-empty">Повторить решённую ранее</button>' : '<a href="#" class="btn btn-primary" data-view="coach">Запустить анализ</a>'}</div>`;
     bindLinks(app);
+    const repeatEmpty = document.getElementById('task-repeat-request-empty');
+    if (repeatEmpty) repeatEmpty.addEventListener('click', () => loadTask(app, true));
     return;
   }
 
@@ -2649,14 +2717,14 @@ async function viewTask(app) {
     state.taskJobId = null;
     state.taskRevealed = !!task.done;
     // Не показываем решение и линию до ответа/«Показать решение».
-    state.taskExplanation = task.done
-      ? (task.explanation_facts || task.explanation || null)
-      : null;
+    // LLM-объяснение — только из кеша, факты движка идут отдельной карточкой.
+    state.taskLlmExplanation = task.done ? (task.explanation || null) : null;
+    state.taskLlmNote = null;
     state.taskLine = null;
     if (state.taskPlayTimer) { clearInterval(state.taskPlayTimer); state.taskPlayTimer = null; }
     resetTaskExplore();
-  } else if (!state.taskExplanation && (task.explanation_facts || task.explanation)) {
-    state.taskExplanation = task.explanation_facts || task.explanation;
+  } else if (!state.taskLlmExplanation && task.done && task.explanation) {
+    state.taskLlmExplanation = task.explanation;
   }
   state.task = task;
   drawTask(app);
@@ -2667,7 +2735,7 @@ async function viewTask(app) {
 }
 
 function taskExplainControlsHtml() {
-  if (state.taskExplanation) return '';
+  if (state.taskLlmExplanation) return '';
   if (state.taskExplaining) {
     return '<p style="color:var(--c-text-muted);font-size:13px;margin:0">Объясняю…</p>';
   }
@@ -2793,23 +2861,27 @@ function drawTask(app) {
   let panel = '';
   if (state.taskResult) {
     const ok = state.taskResult.correct;
+    const answerAttempt = Number(state.taskResult.attempt) > 0 ? `<div style="font-size:13px;color:var(--c-text-muted);margin-top:4px">попытка ${esc(String(state.taskResult.attempt))}</div>` : '';
     panel = `
       <div class="card">
         <div class="card-header"><span class="card-title">Ответ</span>
           <span class="badge ${ok ? 'badge-good' : 'badge-bad'}">${ok ? 'верно ✓' : 'неверно'}</span></div>
+        ${answerAttempt}
         ${taskExplainControlsHtml()}
       </div>`;
   } else if (task.done) {
+    const doneAttempt = Number(task.attempt) > 0 ? `<div style="font-size:13px;color:var(--c-text-muted);margin-top:4px">попытка ${esc(String(task.attempt))}</div>` : '';
     panel = `
       <div class="card">
         <div class="card-header"><span class="card-title">Ответ</span>
           <span class="badge badge-good">решено сегодня ✓</span></div>
+        ${doneAttempt}
         ${taskExplainControlsHtml()}
       </div>`;
   } else {
     panel = `
       <div class="card">
-        <div class="card-header"><span class="card-title">Твой ход</span></div>
+        <div class="card-header"><span class="card-title">Твой ход</span>${task.attempt ? `<span class="badge badge-neutral">попытка ${esc(String(task.attempt))}</span>` : ''}</div>
         <form id="task-answer-form" class="form-row" style="gap:8px;align-items:flex-end">
           <div class="form-group" style="flex:1;min-width:160px;margin-bottom:0">
             <label for="task-answer">Ход (SAN)</label>
@@ -2818,16 +2890,24 @@ function drawTask(app) {
           </div>
           <button class="btn btn-primary" style="height:38px">Ответить</button>
         </form>
-        <div style="margin-top:8px"><a href="#" id="task-show-solution" class="btn btn-link">Показать решение</a></div>
+        <div style="margin-top:8px"><a href="#" id="task-show-solution" class="btn btn-link">Показать решение</a>
+        <button type="button" id="task-repeat-request" class="btn btn-link" title="Игнорировать окно подавления решённых позиций и показать повтор по явному запросу">Повторить решённую ранее</button></div>
       </div>`;
   }
 
-  const explanationHtml = state.taskExplanation
-    ? `<div class="card"><div class="card-header"><span class="card-title">Почему так</span></div><div class="mentor-reply">${esc(state.taskExplanation)}</div></div>`
+  const taskFacts = (state.task && state.task.explanation_facts) || '';
+  const factsHtml = (state.taskRevealed && taskFacts)
+    ? `<div class="card"><div class="card-header"><span class="card-title">Почему так</span><span class="badge badge-blue" title="Текст собран из фактов движка, без LLM">факты движка</span></div><div class="mentor-reply">${esc(taskFacts)}</div></div>`
+    : '';
+  const llmExplanationHtml = state.taskLlmExplanation
+    ? `<div class="card"><div class="card-header"><span class="card-title">Объяснение LLM</span><span class="badge badge-neutral" title="Числа и ходы проверены по фактам движка">проверено по фактам</span></div><div class="mentor-reply">${esc(state.taskLlmExplanation)}</div></div>`
+    : '';
+  const llmNoteHtml = state.taskLlmNote
+    ? `<div class="alert alert-warn" style="margin-top:8px">${esc(state.taskLlmNote)}</div>`
     : '';
 
   const revealedNoAnswer = state.taskRevealed && !state.taskResult && !task.done;
-  const revealedExplainHtml = (revealedNoAnswer && !state.taskExplanation)
+  const revealedExplainHtml = (revealedNoAnswer && !state.taskLlmExplanation)
     ? `<div class="card"><div class="card-header"><span class="card-title">Объяснение LLM</span></div>${taskExplainControlsHtml()}</div>`
     : '';
 
@@ -2848,6 +2928,10 @@ function drawTask(app) {
           <span class="badge badge-blue">${esc(task.date)}</span>
           <span class="badge badge-neutral">${esc(task.opening || '—')}${task.eco ? ` ${esc(task.eco)}` : ''}</span>
           <span class="badge badge-neutral">ты: ${colorLabel}</span>
+          ${Number(task.attempt) > 0 ? `<span class="badge badge-neutral" title="Попытка ${esc(String(task.attempt))} по этой позиции">попытка ${esc(String(task.attempt))}</span>` : ''}
+          ${task.solved_before && !task.repeat_requested ? '<span class="badge badge-neutral" title="Позиция уже решалась ранее">решал ранее</span>' : ''}
+          ${task.repeat_requested ? '<span class="badge badge-blue" title="Повтор показан по явному запросу">повтор по запросу</span>' : ''}
+          ${Number(task.suppressed_count) > 0 ? `<span class="badge badge-neutral" title="Позиции, решённые за последние ${esc(String(task.repeat_window_days || 7))} дн., скрыты K-дневным окном">скрыто решённых: ${esc(String(task.suppressed_count))}</span>` : ''}
           ${explore ? '<span class="badge badge-blue">свободный разбор</span>' : ''}
           ${clsBadge}
         </div>
@@ -2860,8 +2944,10 @@ function drawTask(app) {
         ${state.taskError ? `<div class="alert alert-error">${esc(state.taskError)}</div>` : ''}
         ${panel}
         ${state.taskRevealed ? taskSolutionHtml(task) : ''}
+        ${factsHtml}
         ${revealedExplainHtml}
-        ${explanationHtml}
+        ${llmExplanationHtml}
+        ${llmNoteHtml}
       </div>
     </div>`;
 
@@ -2878,8 +2964,15 @@ function drawTask(app) {
     showSolution.addEventListener('click', e => {
       e.preventDefault();
       state.taskRevealed = true;
-      state.taskExplanation = (state.task && state.task.explanation_facts) || state.taskExplanation;
+      state.taskLlmExplanation = (state.task && state.task.explanation) || state.taskLlmExplanation;
       drawTask(app);
+    });
+  }
+  const repeatRequest = document.getElementById('task-repeat-request');
+  if (repeatRequest) {
+    repeatRequest.addEventListener('click', e => {
+      e.preventDefault();
+      loadTask(app, true);
     });
   }
   const explainBtn = document.getElementById('task-explain');
@@ -3137,7 +3230,7 @@ async function submitTaskAnswer(app, san) {
     const res = await apiPost('/api/task/answer', fd);
     state.taskResult = res;
     state.taskRevealed = true;
-    state.taskExplanation = (state.task && state.task.explanation_facts) || state.taskExplanation;
+    state.taskLlmExplanation = (state.task && state.task.explanation) || state.taskLlmExplanation;
     state.taskLine = null;
     if (state.taskPlayTimer) { clearInterval(state.taskPlayTimer); state.taskPlayTimer = null; }
     resetTaskExplore();
@@ -3174,7 +3267,8 @@ async function taskExplain(app) {
   if (res.cached) {
     state.taskExplaining = false;
     state.taskJobId = null;
-    state.taskExplanation = (state.task && state.task.explanation_facts) || res.explanation;
+    state.taskLlmExplanation = res.explanation;
+    state.taskLlmNote = null;
     drawTask(app);
     return;
   }
@@ -3195,6 +3289,7 @@ function taskPollExplanation(app, jobId) {
       state.taskExplaining = false;
       state.taskJobId = null;
       state.taskError = 'Не удалось получить объяснение';
+      state.taskLlmNote = 'LLM недоступен — показан разбор по фактам движка.';
       drawTask(app);
       return;
     }
@@ -3203,9 +3298,14 @@ function taskPollExplanation(app, jobId) {
       state.timers.task = null;
       state.taskExplaining = false;
       state.taskJobId = null;
-      state.taskExplanation = (state.task && state.task.explanation_facts)
-        || (job.result && job.result.explanation)
-        || '';
+      const res = job.result || {};
+      if (res.facts_only || !res.explanation) {
+        state.taskLlmExplanation = null;
+        state.taskLlmNote = 'LLM недоступен или ответ не прошёл проверку фактов — показан разбор по фактам движка.';
+      } else {
+        state.taskLlmExplanation = res.explanation;
+        state.taskLlmNote = null;
+      }
       drawTask(app);
     } else if (job.status === 'error') {
       clearInterval(state.timers.task);
@@ -3236,7 +3336,7 @@ const TREND_LABELS = {
   score_pct: 'Счёт',
 };
 const TREND_VERDICT_RU = { better: 'лучше', worse: 'хуже', same: 'без изменений', stable: 'без изменений' };
-const TREND_OVERALL_RU = { improving: "УЛУЧШЕНИЕ", worsening: "УХУДШЕНИЕ", stable: "БЕЗ ИЗМЕНЕНИЙ" };
+const TREND_OVERALL_RU = { improving: "УЛУЧШЕНИЕ", worsening: "УХУДШЕНИЕ", mixed: "СМЕШАННАЯ КАРТИНА", flat: "СТАБИЛЬНО", stable: "БЕЗ ИЗМЕНЕНИЙ", insufficient_data: "НЕДОСТАТОЧНО ДАННЫХ" };
 
 const ENDGAME_SOURCES = [
   { key: 'master', label: 'Мастер' },
@@ -3547,6 +3647,7 @@ function resetOpeningTheory() {
   state.openingTheoryIdeasDone = false;
   state.openingTheoryIdeasCached = false;
   state.openingTheoryIdeasError = null;
+  state.openingTheoryIdeasRejected = false;
 }
 
 function stopOpeningTheoryPlay() {
@@ -3709,6 +3810,9 @@ function openingTheoryCardHtml() {
     if (state.openingTheoryIdeasError) {
       ideasHtml += `<div class="alert alert-error" style="margin-top:8px">${esc(state.openingTheoryIdeasError)}</div>`;
     }
+    if (state.openingTheoryIdeasRejected) {
+      ideasHtml += '<p class="theory-card-note" style="margin-top:8px">Ответ LLM отклонён проверкой фактов — показаны только данные книги.</p>';
+    }
     if (state.openingTheoryIdeas) {
       ideasHtml += `<div class="theory-ideas">
         <div class="theory-ideas-source">${esc(openingTheoryIdeasNote())}</div>
@@ -3766,6 +3870,7 @@ async function loadOpeningTheory(app) {
     state.openingTheoryIdeasDone = false;
     state.openingTheoryIdeasCached = false;
     state.openingTheoryIdeasError = null;
+    state.openingTheoryIdeasRejected = false;
   } catch (err) {
     if (isSessionError(err)) { handleSessionExpired(); return; }
     state.openingTheory = null;
@@ -3787,6 +3892,7 @@ async function loadOpeningTheoryIdeas(app) {
     .filter(m => m && m.san && m.fen);
   state.openingTheoryIdeasLoading = true;
   state.openingTheoryIdeasError = null;
+  state.openingTheoryIdeasRejected = false;
   drawOpening(app);
   try {
     const data = await api('/api/theory/ideas', {
@@ -3797,6 +3903,7 @@ async function loadOpeningTheoryIdeas(app) {
     if (state.openingTheory !== t) return;
     state.openingTheoryIdeas = data && typeof data.ideas === 'string' && data.ideas ? data.ideas : null;
     state.openingTheoryIdeasCached = !!(data && data.cached);
+    state.openingTheoryIdeasRejected = !!(data && data.rejected);
     state.openingTheoryIdeasDone = true;
   } catch (err) {
     if (isSessionError(err)) { handleSessionExpired(); return; }
@@ -4605,7 +4712,7 @@ const MIDDLEGAME_MIN_PLAN = 20;
 const MIDDLEGAME_MAX_PLIES = 60;
 const MIDDLEGAME_STRENGTH_LABELS = { equal: 'равный', plus100: '+100', plus200: '+200', hybrid: 'Maia+' };
 const MIDDLEGAME_VERDICTS = {
-  good: { label: 'План доказан', badge: 'badge-good' },
+  good: { label: 'План сработал', badge: 'badge-good' },
   partial: { label: 'Частично', badge: 'badge-neutral' },
   wrong: { label: 'План не сработал', badge: 'badge-bad' },
 };
@@ -5544,7 +5651,12 @@ function middlegameReportHtml(report, source, plan) {
   }).join('') : '<p style="color:var(--c-text-muted)">Моментов нет.</p>';
   return `
     <div class="card">
-      <div class="card-header"><span class="card-title">Отчёт тренера</span><span class="badge ${verdict.badge}">${esc(verdict.label)}</span></div>
+      <div class="card-header"><span class="card-title">Отчёт тренера</span><span class="badge ${verdict.badge}" title="Вердикт рассчитан движком Stockfish по потерям win%, LLM вердикт не определяет">${esc(verdict.label)}</span></div>
+      ${report.facts_only
+        ? '<div class="alert alert-warn" style="margin-top:8px">LLM недоступен или ответ не прошёл проверку фактов — отчёт собран из данных Stockfish (без текста модели).</div>'
+        : report.summary_kind === 'engine_facts'
+          ? '<p style="color:var(--c-text-muted);font-size:12px;margin:8px 0 0">Саммари — по фактам Stockfish.</p>'
+          : '<p style="color:var(--c-text-muted);font-size:12px;margin:8px 0 0">Саммари — мнение тренера по фактам движка, не вывод движка.</p>'}
       ${report.summary ? `<div class="mentor-reply">${esc(report.summary)}</div>` : ''}
       ${report.plan_comment ? `<h3 style="font-size:14px;margin:12px 0 6px">Ошибки по движку</h3><div class="mentor-reply">${esc(report.plan_comment)}</div>` : ''}
       <h3 style="font-size:14px;margin:12px 0 8px">Ключевые моменты</h3>
@@ -5566,7 +5678,18 @@ async function viewCoach(app) {
 
   let reportHtml = '';
   if (report) {
+    const stale = report.needs_refresh || null;
+    const staleCount = stale && Number(stale.count) > 0 ? Number(stale.count) : 0;
+    const staleTotal = stale && stale.total != null ? stale.total : report.games_analyzed;
+    const staleHtml = staleCount > 0 ? `
+      <div class="alert alert-warn" style="margin-bottom:12px">
+        <b>Устаревшие анализы: ${staleCount} из ${esc(String(staleTotal))}</b><br>
+        <span style="font-size:13px">Кеш без разметки тем ходов остаётся читаемым, но отчёты неполные. Обновление партии за партией выполняет Stockfish (глубина 10, 1 линия) — время пропорционально числу партий. Старые анализы заменятся только после успешного переанализирования; при ошибке движка прежний анализ сохранится, данные не удаляются. Анализы, общие с другим игроком, пропускаются.</span>
+        <div style="margin-top:8px"><button type="button" class="btn btn-secondary" id="stale-refresh-btn">Обновить устаревшие анализы (${staleCount})</button> <span style="font-size:12px;color:var(--c-text-muted)">Stockfish, глубина 10</span></div>
+        <div id="stale-refresh-slot"></div>
+      </div>` : '';
     reportHtml = `
+      ${staleHtml}
       <div class="grid grid-4" style="margin-bottom:12px">
         <div class="card stat"><div class="stat-value">${report.games_analyzed}</div><div class="stat-label">Проанализировано</div></div>
         <div class="card stat"><div class="stat-value">${fmt(report.score.score_pct)}%</div><div class="stat-label">Счёт</div></div>
@@ -5575,7 +5698,7 @@ async function viewCoach(app) {
       </div>
       ${report.worst_games.length ? `<div class="card" style="margin-top:12px"><h3 style="font-size:14px;margin-bottom:8px">Худшие партии</h3><div class="table-wrap"><table style="font-size:12px"><thead><tr><th>Партия</th><th>Соперник</th><th>Результат</th><th>Ср. потеря</th><th>Win% до</th><th>Грубых</th></tr></thead><tbody>${report.worst_games.slice(0, 5).map(g => `<tr><td>${esc(g.game_id.slice(0, 8))}</td><td>${esc(g.opponent)}</td><td>${esc(g.result)}</td><td class="num">${fmt(g.avg_win_loss)}%</td><td class="num">${fmt(g.avg_win_before)}%</td><td class="num">${g.blunders}</td></tr>`).join('')}</tbody></table></div></div>` : ''}
       ${report.missed_wins.length ? `<div class="card" style="margin-top:12px"><h3 style="font-size:14px;margin-bottom:8px">Упущенные выигрыши (топ-5)</h3><div class="table-wrap"><table style="font-size:12px"><thead><tr><th>Партия</th><th>Ход</th><th>SAN</th><th>Win% до</th><th>Win% после</th><th>Лучший ход</th></tr></thead><tbody>${report.missed_wins.slice(0, 5).map(m => `<tr><td>${esc(m.game_id.slice(0, 8))}</td><td>${m.ply}</td><td class="drill-san">${esc(m.san)}</td><td class="num">${fmt(m.win_before)}%</td><td class="num">${fmt(m.win_after)}%</td><td class="drill-best">${esc(m.best_move_san)}</td></tr>`).join('')}</tbody></table></div></div>` : ''}
-      ${report.themes && report.themes.moves_annotated ? `<div class="card theme-report" style="margin-top:12px"><h3 style="font-size:14px;margin-bottom:8px">Темы ходов</h3><div class="table-wrap"><table style="font-size:12px"><thead><tr><th>Тема</th><th>Возможностей</th><th>Сыграно</th><th>Не сыграно</th><th>Ошибок</th><th>Ср. потеря</th><th>Неоднозначных</th></tr></thead><tbody>${['tactics','positional','attack'].map(t => { const slot = report.themes[t] || {}; const examples = (slot.examples || []).map(e => `<button type="button" class="btn btn-link" data-theme-game="${esc(e.game_id)}" data-theme-ply="${esc(String(e.ply))}">${esc(e.san || '')} · −${fmt(e.drop)}%</button>`).join(' '); return `<tr><td><strong>${esc(slot.label || t)}</strong>${examples ? `<div style="display:block;margin-top:4px;max-width:220px">${examples}</div><div style="color:var(--c-text-muted);font-size:11px">нажми, чтобы открыть позицию</div>` : ''}</td><td class="num">${slot.opportunities ?? 0}</td><td class="num">${slot.executed ?? 0}</td><td class="num">${slot.missed ?? 0}</td><td class="num">${slot.errors ?? 0}</td><td class="num">${slot.avg_win_loss != null ? fmt(slot.avg_win_loss) + '%' : '—'}</td><td class="num">${slot.unknown ?? 0}</td></tr>`; }).join('')}</tbody></table></div><div style="color:var(--c-text-muted);font-size:12px;margin-top:8px">Классификация детерминированная (Stockfish/PV и правила), не LLM. Неоднозначные позиции не усредняются в процент.</div></div>` : ''}
+      ${report.themes && report.themes.moves_annotated ? `<div class="card theme-report" style="margin-top:12px"><h3 style="font-size:14px;margin-bottom:8px">Темы ходов</h3><div class="table-wrap"><table style="font-size:12px"><thead><tr><th>Тема</th><th>Возможностей</th><th>Сыграно</th><th>Не сыграно</th><th>Ошибок</th><th>Ср. потеря</th><th>Неоднозначных</th></tr></thead><tbody>${['tactics','positional','attack'].map(t => { const slot = report.themes[t] || {}; const examples = (slot.examples || []).map(e => `<button type="button" class="btn btn-link" data-theme-game="${esc(e.game_id)}" data-theme-ply="${esc(String(e.ply))}">${esc(e.san || '')} · −${fmt(e.drop)}%</button>`).join(' '); return `<tr><td><strong>${esc(slot.label || t)}</strong>${examples ? `<div style="display:block;margin-top:4px;max-width:220px">${examples}</div><div style="color:var(--c-text-muted);font-size:11px">нажми, чтобы открыть позицию</div>` : ''}</td><td class="num">${slot.opportunities ?? 0}</td><td class="num">${slot.executed ?? 0}</td><td class="num">${slot.missed ?? 0}</td><td class="num">${slot.errors ?? 0}</td><td class="num">${slot.avg_win_loss != null ? fmt(slot.avg_win_loss) + '%' : '—'}</td><td class="num">${slot.unknown ?? 0}</td></tr>`; }).join('')}</tbody></table></div><div style="color:var(--c-text-muted);font-size:12px;margin-top:8px">Классификация детерминированная (Stockfish/PV и правила), не LLM. Неоднозначные позиции не усредняются в процент.</div></div>` : `<div class="card theme-report" style="margin-top:12px"><h3 style="font-size:14px;margin-bottom:8px">Темы ходов</h3><div style="color:var(--c-text-muted);font-size:13px">Нет размеченных анализов: старая разметка без тем ходов.${staleCount > 0 ? ` Устаревших анализов: ${staleCount} — обновление построит разметку (блок выше).` : ' Запусти анализ партии заново.'}</div></div>`}
       <div class="card" style="margin-top:12px"><h3 style="font-size:14px;margin-bottom:8px">Тайм-тробль</h3><div class="grid grid-3"><div class="stat"><div class="stat-value">${report.time_pressure.moves_count}</div><div class="stat-label">Ходов в ТТ</div></div><div class="stat"><div class="stat-value">${report.time_pressure.blunders_in_tp}</div><div class="stat-label">Грубых в ТТ</div></div><div class="stat"><div class="stat-value">${fmt(report.time_pressure.tp_blunder_rate_pct)}%</div><div class="stat-label">% грубых в ТТ</div></div></div></div>`;
   } else {
     reportHtml = '<p style="color:var(--c-text-muted)">Пока нет отчёта. Запусти анализ выше.</p>';
@@ -5627,6 +5750,70 @@ async function viewCoach(app) {
       });
     });
   });
+
+  const staleBtn = document.getElementById('stale-refresh-btn');
+  if (staleBtn && report) {
+    const stale = report.needs_refresh || {};
+    const staleCount = Math.max(0, Number(stale.count) || 0);
+    staleBtn.addEventListener('click', () => {
+      const slot = document.getElementById('stale-refresh-slot');
+      if (!slot || slot.innerHTML) return;
+      const staleWord = (n) => {
+        const d = n % 10, h = n % 100;
+        if (h > 10 && h < 20) return 'партий';
+        if (d === 1) return 'партия';
+        if (d >= 2 && d <= 4) return 'партии';
+        return 'партий';
+      };
+      slot.innerHTML = `
+        <div style="margin-top:10px;padding:10px;border:1px dashed var(--c-border);border-radius:8px">
+          <b>Подтверди обновление</b>
+          <p style="font-size:13px;margin:6px 0">Будет переанализировано: ${staleCount} ${staleWord(staleCount)}. Stockfish (глубина 10, 1 линия), время пропорционально числу партий. Старые анализы заменятся только после успешного переанализирования; при ошибке движка прежний анализ сохранится целиком. Общие с другим игроком анализы пропускаются. Исходные данные не удаляются.</p>
+          <div class="form-row" style="gap:8px"><button type="button" class="btn btn-primary" id="stale-refresh-confirm">Обновить</button><button type="button" class="btn btn-link" id="stale-refresh-cancel">Отмена</button></div>
+          <div class="alert alert-error" id="stale-refresh-err" style="display:none;margin-top:8px"></div>
+          <div class="alert alert-success" id="stale-refresh-ok" style="display:none;margin-top:8px"></div>
+        </div>`;
+      const cancel = document.getElementById('stale-refresh-cancel');
+      if (cancel) cancel.addEventListener('click', () => { slot.innerHTML = ''; });
+      const confirmBtn = document.getElementById('stale-refresh-confirm');
+      if (confirmBtn) confirmBtn.addEventListener('click', async () => {
+        const errBox = document.getElementById('stale-refresh-err');
+        const okBox = document.getElementById('stale-refresh-ok');
+        if (errBox) errBox.style.display = 'none';
+        confirmBtn.disabled = true;
+        confirmBtn.textContent = 'Обновляю…';
+        try {
+          const res = await api('/api/report/refresh', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ confirm: true, limit: Math.min(20, Math.max(1, staleCount)) }),
+          });
+          const refreshed = (res.refreshed || []).length;
+          const failed = (res.failed || []).length;
+          const skipped = (res.skipped || []).length;
+          const remaining = res.needs_refresh ? res.needs_refresh.count : '?';
+          if (okBox) {
+            okBox.textContent = `Обновлено: ${refreshed}. Ошибок: ${failed}. Пропущено общих с другим игроком: ${skipped}. Осталось устаревших: ${remaining}.${failed ? ' Старые анализы при ошибках сохранены.' : ''}`;
+            okBox.style.display = 'block';
+          }
+          confirmBtn.textContent = 'Готово';
+          const more = document.getElementById('stale-refresh-btn');
+          if (more) more.disabled = true;
+          if (failed && Array.isArray(res.failed) && errBox) {
+            errBox.innerHTML = res.failed.map(f => `${esc(String(f.game_id || '').slice(0, 8))}: ${esc(f.error || 'ошибка')}`).join('<br>');
+            errBox.style.display = 'block';
+          }
+        } catch (err) {
+          if (errBox) {
+            errBox.textContent = err.message;
+            errBox.style.display = 'block';
+          }
+          confirmBtn.disabled = false;
+          confirmBtn.textContent = 'Обновить';
+        }
+      });
+    });
+  }
 
   document.getElementById('coach-form').addEventListener('submit', async e => {
     e.preventDefault();
@@ -6338,7 +6525,9 @@ function renderReview(d) {
           <code>${esc(m.san || '—')}</code>
           <span class="badge ${cls === 'blunder' ? 'badge-bad' : cls === 'mistake' ? 'badge-neutral' : 'badge-good'}">${esc(cls)}</span>
           <span style="color:var(--c-text-muted);font-size:12px">полуход ${m.ply || '—'}${m.drop != null ? ` · потеря win% ${fmt(m.drop)}` : ''}</span>
-          <div style="margin-top:2px">${m.text ? esc(m.text) : '<span style="color:var(--c-text-muted)">(нет объяснения)</span>'}</div>
+          <div style="margin-top:2px">${m.text
+            ? esc(m.text) + (m.text_source === 'facts' ? ' <span class="badge badge-blue" title="Факты движка — текст LLM заменён проверяемым">факты</span>' : '')
+            : '<span style="color:var(--c-text-muted)">(нет объяснения)</span>'}</div>
         </div>`;
     }).join('');
     return `
@@ -6349,12 +6538,13 @@ function renderReview(d) {
         </div>
         <p style="color:var(--c-text-muted);font-size:13px;margin:0 0 8px">${esc(g.opening || '—')}${g.avg_win_loss != null ? ` · ср. потеря win% ${fmt(g.avg_win_loss)}` : ''}</p>
         ${moments || '<p style="color:var(--c-text-muted)">Ключевых моментов нет.</p>'}
-        ${g.summary ? `<p style="margin-top:8px"><strong>Итог:</strong> ${esc(g.summary)}</p>` : ''}
+        ${g.summary ? `<p style="margin-top:8px"><strong>Итог:</strong>${g.summary_source === 'facts' ? ' <span class="badge badge-blue" title="Итоги собраны из фактов движка">факты</span>' : ''} ${esc(g.summary)}</p>` : ''}
       </div>`;
   }).join('');
 
   box.innerHTML = `
     ${d.dry_run ? '<div class="alert alert-info">Режим dry-run: LLM не вызывался — ниже готовые промпты.</div>' : ''}
+    ${d.llm_error ? `<div class="alert alert-warn">LLM недоступен — показаны факты движка (${esc(d.llm_error)}).</div>` : ''}
     ${games.length ? gameCards : '<div class="card"><p style="color:var(--c-text-muted)">Разбора нет: в отобранных партиях не нашлось ключевых моментов (blunder/mistake).</p></div>'}
     ${d.dry_run && promptBlocks ? `<div class="card" style="margin-top:12px"><div class="card-header"><span class="card-title">Готовые промпты</span></div>${promptBlocks}</div>` : ''}`;
 }
@@ -6370,12 +6560,16 @@ function renderMentor(d) {
       <div class="card"><div class="card-header"><span class="card-title">Промпты тренера</span></div>${prompts || '<p style="color:var(--c-text-muted)">Промптов нет.</p>'}</div>`;
     return;
   }
+  const factsOnly = !!d.facts_only;
   box.innerHTML = `
     <div class="card">
       <div class="card-header">
         <span class="card-title">План тренера${d.user ? ` · ${esc(d.user)}` : ''}</span>
-        ${d.model ? `<span class="badge badge-blue">${esc(d.model)}</span>` : ''}
+        ${factsOnly
+          ? '<span class="badge badge-blue" title="Текст собран из фактов движка, без LLM">факты движка</span>'
+          : `<span class="badge badge-good" title="Текст LLM проверен по фактам движка">LLM${d.model ? ` · ${esc(d.model)}` : ''}</span>`}
       </div>
+      ${factsOnly ? '<div class="alert alert-warn" style="margin-top:8px">LLM недоступен или ответ не прошёл проверку фактов — ниже только проверяемые данные по твоим партиям без комментария модели.</div>' : ''}
       ${d.notes ? `<div class="alert alert-warn">Учтены заметки: ${esc(d.notes)}</div>` : ''}
       <div class="mentor-reply">${esc(d.reply || '(пустой ответ тренера)')}</div>
     </div>`;
@@ -6390,7 +6584,7 @@ function _fmtDur(sec) {
 
 function _trackLineHtml(track) {
   const lichess = (Number(track.lichess_sec) || 0) + (Number(track.manual_sec) || 0);
-  return `Сегодня: <strong style="color:var(--c-text)">${_fmtDur(track.total_sec)}</strong> · Lichess ${_fmtDur(lichess)} · тренер ${_fmtDur(track.site_sec)}`;
+  return `Сегодня: <strong style="color:var(--c-text)">${_fmtDur(track.total_sec)}</strong> · Lichess ${_fmtDur(lichess)}`;
 }
 
 async function refreshTrackLine() {
@@ -6486,7 +6680,7 @@ async function viewAdmin(app) {
     <div class="grid grid-3">
       <div class="card stat"><div class="stat-value">${s.users != null ? s.users : users.length}</div><div class="stat-label">Участников</div></div>
       <div class="card stat"><div class="stat-value">${s.active_users != null ? s.active_users : '—'}</div><div class="stat-label">Активных</div></div>
-      <div class="card stat"><div class="stat-value">${s.improved != null ? s.improved : '—'}</div><div class="stat-label">Улучшились</div></div>
+      <div class="card stat"><div class="stat-value">${s.active != null ? s.active : '—'}</div><div class="stat-label">Активны*</div></div>
       <div class="card stat"><div class="stat-value">${s.avg_rating_delta != null ? (s.avg_rating_delta > 0 ? '+' : '') + fmt(s.avg_rating_delta, 1) : '—'}</div><div class="stat-label">Ср. Δ рейтинга</div></div>
       <div class="card stat"><div class="stat-value">${s.avg_completion_pct != null ? fmt(s.avg_completion_pct, 1) + '%' : '—'}</div><div class="stat-label">Ср. план</div></div>
       <div class="card stat"><div class="stat-value">${s.avg_minutes_per_day != null ? fmt(s.avg_minutes_per_day, 1) : '—'}</div><div class="stat-label">Мин/день</div></div>
@@ -6495,9 +6689,10 @@ async function viewAdmin(app) {
   const rows = users.map(row => {
     const start = row.rating_start != null ? row.rating_start : '—';
     const end = row.rating_end != null ? row.rating_end : '—';
-    const improved = row.improved ? ' <span class="badge badge-good">рост</span>' : '';
+    const activeFlag = row.active != null ? row.active : row.improved;
+    const active = activeFlag ? ' <span class="badge badge-neutral">активен</span>' : '';
     return `<tr>
-      <td>${esc(row.nick || '—')}${improved}</td>
+      <td>${esc(row.nick || '—')}${active}</td>
       <td class="num">${row.days_active != null ? row.days_active : '—'}</td>
       <td class="num">${row.avg_minutes_per_day != null ? fmt(row.avg_minutes_per_day, 1) : '—'}</td>
       <td class="num">${row.completion_pct != null ? fmt(row.completion_pct, 1) + '%' : '—'}</td>
@@ -6510,6 +6705,7 @@ async function viewAdmin(app) {
   app.innerHTML = `
     <div class="card-header"><h1>Админ</h1><span class="badge badge-neutral">когорта за ${days} дн.</span></div>
     ${summaryHtml}
+    <p style="color:var(--c-text-muted);font-size:12px;margin:-4px 0 12px">* Активны = Δ рейтинга ≥ 30 или ≥ 60% плана при ≥ 10 активных днях. Это сигнал вовлечённости, а не доказательство обучения: завершение плана и движение рейтинга не измеряют рост навыка и не доказывают причинность плана.</p>
     <div class="card">
       <div class="card-header">
         <span class="card-title">Игроки (${users.length})</span>
@@ -6519,6 +6715,7 @@ async function viewAdmin(app) {
         <thead><tr><th>Ник</th><th>Дней</th><th>Мин/день</th><th>План %</th><th>Рейтинг</th><th>Партий</th><th>Последняя активность</th></tr></thead>
         <tbody>${rows}</tbody>
       </table></div>` : '<p style="color:var(--c-text-muted);padding:16px">Игроков пока нет.</p>'}
+      <p style="color:var(--c-text-muted);font-size:12px;margin:12px 0 0">Рейтинг и «план %» — сырые дельты за окно, не измерение обучения. CSV сохраняет колонки improved_* как устаревшие алиасы к active_*.</p>
     </div>`;
 }
 
@@ -6559,12 +6756,19 @@ async function viewUsers(app) {
       <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--c-border)">
         <form id="pw-form" class="form-row" style="gap:8px;align-items:flex-end">
           <div class="form-group" style="flex:1;min-width:140px;margin-bottom:0"><label>Старый пароль <input type="password" name="old" required autocomplete="current-password"></label></div>
-          <div class="form-group" style="flex:1;min-width:140px;margin-bottom:0"><label>Новый пароль <input type="password" name="new" required autocomplete="new-password"></label></div>
+          <div class="form-group" style="flex:1;min-width:140px;margin-bottom:0"><label>Новый пароль (мин. 8) <input type="password" name="new" required minlength="8" autocomplete="new-password"></label></div>
           <button class="btn btn-secondary" style="height:38px">Сменить пароль</button>
         </form>
         <div class="alert alert-error" id="pw-err" style="display:none;margin-top:8px"></div>
         <div class="alert alert-success" id="pw-ok" style="display:none;margin-top:8px">Пароль сменён</div>
         <div style="margin-top:8px"><button class="btn btn-secondary" id="logout-btn">Выйти</button></div>
+        <div style="margin-top:8px;font-size:12px;color:var(--c-text-muted)"><a href="/privacy.html">Приватность и условия</a> · вопрос или удаление данных: <a href="mailto:tleukhanov0409@mail.ru">tleukhanov0409@mail.ru</a></div>
+      </div>
+      <div style="margin-top:16px;padding-top:12px;border-top:1px solid var(--c-border)" id="danger-zone">
+        <div style="font-weight:600;font-size:13px;color:var(--c-alert-error-fg, #c5221f);margin-bottom:4px">Удаление аккаунта</div>
+        <p style="font-size:13px;color:var(--c-text-muted);margin:0 0 8px">Необратимо: профиль, сессии, партии, кеш разбора, заметки, планы и артефакты на диске будут удалены. Общий кеш разбора партий, который есть у другого профиля, сохраняется.</p>
+        <button class="btn btn-danger" id="delete-account-btn">Удалить аккаунт и данные</button>
+        <div id="delete-account-slot"></div>
       </div>
     </div>`;
   const rerender = async () => {
@@ -6647,7 +6851,7 @@ async function viewUsers(app) {
     state.authMode = 'login';
     Object.assign(state, {
       gameId: null, gameData: null, task: null, taskKey: null, taskResult: null,
-      taskRevealed: false, taskExplanation: null, planLlmJobId: null,
+      taskRevealed: false, taskLlmExplanation: null, taskLlmNote: null, planLlmJobId: null,
       planLlmGenerating: false, tool: 'repertoire', gamesFilter: 'all',
       openingSession: null, openingFens: null, openingLastReply: null, openingJobId: null,
       middlegameSession: null, middlegameMeta: null, middlegameJobId: null,
@@ -6659,6 +6863,59 @@ async function viewUsers(app) {
     syncAdminNav();
     renderUserbox();
     render(state.currentView);
+  });
+
+  const deleteBtn = document.getElementById('delete-account-btn');
+  if (deleteBtn) deleteBtn.addEventListener('click', () => {
+    const slot = document.getElementById('delete-account-slot');
+    if (!slot || slot.innerHTML) return;
+    slot.innerHTML = `<form id="delete-account-form" class="form-row" style="gap:8px;align-items:flex-end;margin-top:10px;flex-wrap:wrap">
+        <div class="form-group" style="flex:1;min-width:160px;margin-bottom:0"><label>Пароль (если задан) <input type="password" name="password" autocomplete="current-password"></label></div>
+        <div class="form-group" style="flex:1;min-width:160px;margin-bottom:0"><label>Введи логин «${esc(me.nick || '')}» для подтверждения <input type="text" name="confirm_nick" required autocomplete="off"></label></div>
+        <button class="btn btn-danger" style="height:38px" type="submit">Удалить навсегда</button>
+        <button class="btn btn-link" type="button" id="delete-account-cancel">Отмена</button>
+      </form><div class="alert alert-error" id="delete-account-err" style="display:none;margin-top:8px"></div>`;
+    const closeDelete = () => { slot.innerHTML = ''; };
+    slot.querySelector('#delete-account-cancel').addEventListener('click', closeDelete);
+    slot.querySelector('#delete-account-form').addEventListener('submit', async ev => {
+      ev.preventDefault();
+      const errBox = document.getElementById('delete-account-err');
+      errBox.style.display = 'none';
+      const fd = new FormData(ev.target);
+      if ((fd.get('confirm_nick') || '').trim().toLowerCase() !== String(me.nick || '').toLowerCase()) {
+        errBox.textContent = 'Логин не совпадает — удаление отменено';
+        errBox.style.display = 'block';
+        return;
+      }
+      fd.set('nick', me.nick);
+      const submitBtn = ev.target.querySelector('button[type="submit"]');
+      if (submitBtn) submitBtn.disabled = true;
+      try {
+        await apiPost('/api/user/delete', fd);
+        state.user = null;
+        state.isAdmin = false;
+        state.authMode = 'login';
+        Object.assign(state, {
+          gameId: null, gameData: null, task: null, taskKey: null, taskResult: null,
+          taskRevealed: false, taskLlmExplanation: null, taskLlmNote: null, planLlmJobId: null,
+          planLlmGenerating: false, tool: 'repertoire', gamesFilter: 'all',
+          openingSession: null, openingFens: null, openingLastReply: null, openingJobId: null,
+          middlegameSession: null, middlegameMeta: null, middlegameJobId: null,
+          middlegameThinking: false, middlegameAnalyzing: false, middlegameError: null,
+          middlegamePlanDraft: '', middlegameStrength: 'equal',
+        });
+        clearMiddlegameSessionId();
+        hideNav();
+        syncAdminNav();
+        renderUserbox();
+        showToast('Аккаунт и данные удалены');
+        render('users');
+      } catch (err) {
+        errBox.textContent = err.message;
+        errBox.style.display = 'block';
+        if (submitBtn) submitBtn.disabled = false;
+      }
+    });
   });
 
   const manualLink = app.querySelector('.track-manual-add');
@@ -7277,21 +7534,13 @@ async function loadUser() {
   renderUserbox();
 }
 
-function startTrackPing() {
-  if (state.trackStarted) return;
-  state.trackStarted = true;
-  const ping = () => {
-    if (state.user) fetch('/api/track/ping', { method: 'POST' }).catch(() => {});
-  };
-  ping();
-  setInterval(ping, 60000);
-}
+// Скрытого трекинга сессии нет: время считают часы Lichess из разобранных
+// партий и минуты, введённые пользователем вручную.
 
 async function init() {
   setupTheme();
   setupNav();
   await loadUser();
-  startTrackPing();
   navigate('dashboard');
   startGlobalJobPolling();
 }

@@ -14,6 +14,7 @@ from .metrics import metric
 from .patterns import PHASE_LABELS, weakness_stats
 from .opening_book import build_opening_book
 from .repertoire import Repertoire, _plural_games, opening_stats
+from .timeutil import date_of_ms
 
 __all__ = ["build_plan", "format_plan"]
 
@@ -39,7 +40,12 @@ def _top_branches(
         {
             "moves": list(line.moves),
             "count": line.count,
+            # Прочность ЛИНИИ (path_ok_rate), а не последнего узла. Ключ
+            # ``ok_rate`` сохранён для совместимости с API/фронтендом и
+            # всегда равен ``path_ok_rate``; новым потребителям читать
+            # явный ``path_ok_rate``.
             "ok_rate": line.path_ok_rate,
+            "path_ok_rate": line.path_ok_rate,
         }
         for line in chosen
     ]
@@ -101,16 +107,28 @@ def build_plan(
     if pairs:
         points = sum(game.user_result_points() for game, _ in pairs)
         score_pct = round(points / len(pairs) * 100.0, 1)
-        loss_values = [metric(a, "avg_win_loss") for _, a in pairs]
+        loss_values = [
+            value
+            for value in (metric(a, "avg_win_loss", None) for _, a in pairs)
+            if value is not None
+        ]
         avg_win_loss = (
-            round(sum(loss_values) / len(loss_values), 2) if loss_values else 0.0
+            round(sum(loss_values) / len(loss_values), 2) if loss_values else None
         )
 
     weak_openings = opening_stats(pairs, user=user)
 
+    timestamps = [g.created_at for g, _ in pairs if getattr(g, "created_at", 0)]
+    window = {
+        "games": len(pairs),
+        "from": date_of_ms(min(timestamps)) if timestamps else None,
+        "to": date_of_ms(max(timestamps)) if timestamps else None,
+    }
+
     plan: dict[str, Any] = {
         "user": user,
         "games": len(pairs),
+        "window": window,
         "score_pct": score_pct,
         "avg_win_loss": avg_win_loss,
         "repertoire": {
@@ -145,7 +163,7 @@ def _pct(value: float | None) -> str:
 def format_lines_once(color_ru: str, branches: list[dict[str, Any]]) -> list[str]:
     return [
         f"  {_moves_text(item['moves'])} ({item['count']} {_plural_games(item['count'])}, "
-        f"прочность {_pct(item['ok_rate'])})"
+        f"прочность {_pct(item.get('path_ok_rate', item.get('ok_rate')))})"
         for item in branches
     ]
 

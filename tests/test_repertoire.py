@@ -12,9 +12,12 @@ import chess.pgn
 from app.games import Game
 from app.repertoire import (
     LineSummary,
+    MIN_WEAK_OPENING_GAMES,
     Repertoire,
     RepertoireNode,
+    WEAK_OPENING_SHRINKAGE_K,
     format_lines,
+    is_weak_opening,
     opening_stats,
     repertoire_to_json,
     repertoire_to_pgn,
@@ -315,6 +318,110 @@ class OpeningStatsTests(unittest.TestCase):
         rows = opening_stats([(game, analysis)])
         self.assertEqual(rows[0]["opening"], "Без названия")
         self.assertEqual(rows[0]["eco"], "C20")
+
+    def test_errors_per_game_shrunk_and_sorting(self) -> None:
+        # shrinkage: bad_moves / (games + K), K = WEAK_OPENING_SHRINKAGE_K.
+        games = [
+            mkgame(f"g{i}", ["e4", "e5"], "white", "loss",
+                   opening="Test Opening", eco="C00")
+            for i in range(4)
+        ]
+        analysis = mkanalysis(
+            "white", 2, [("e4", "blunder", 20), ("e5", "best")]
+        )
+        rows = opening_stats([(g, analysis) for g in games])
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["games"], 4)
+        self.assertEqual(row["bad_moves"], 4)
+        self.assertEqual(row["errors_per_game"], 1.0)  # сырая оценка сохранена
+        self.assertEqual(
+            row["errors_per_game_shrunk"],
+            round(4 / (4 + WEAK_OPENING_SHRINKAGE_K), 2),  # 4/9 ≈ 0.44
+        )
+
+    def test_shrinkage_orders_low_sample_below_high_sample(self) -> None:
+        # 1 ошибка в 1 партии (сырое 1.0) должна стать ниже 3 ошибок в 10 партиях
+        # у другой группы по сжатой оценке.
+        noisy = [mkgame("n1", ["e4"], "white", "loss",
+                        opening="Noisy Opening", eco="A00")]
+        noisy_a = mkanalysis("white", 1, [("e4", "blunder", 20)])
+        steady = [
+            mkgame(f"s{i}", ["e4"], "white", "loss",
+                   opening="Steady Opening", eco="B00")
+            for i in range(10)
+        ]
+        steady_a = mkanalysis("white", 1, [("e4", "blunder", 20)])
+        rows = opening_stats(
+            [(g, noisy_a) for g in noisy] + [(g, steady_a) for g in steady]
+        )
+        by_name = {row["opening"]: row for row in rows}
+        self.assertEqual(rows[0]["opening"], "Steady Opening")
+        self.assertEqual(
+            by_name["Noisy Opening"]["errors_per_game_shrunk"],
+            round(1 / (1 + WEAK_OPENING_SHRINKAGE_K), 2),
+        )
+
+
+class IsWeakOpeningTests(unittest.TestCase):
+    """Единый предикат «слабый дебют» (audit M4)."""
+
+    @staticmethod
+    def _row(**overrides):
+        row = {
+            "opening": "Sicilian Defense",
+            "games": MIN_WEAK_OPENING_GAMES,
+            "points_pct": 40.0,
+            "errors_per_game": 1.0,
+            "errors_per_game_shrunk": 1.0,
+            "bad_moves": 4,
+        }
+        row.update(overrides)
+        return row
+
+    def test_min_sample_gates_everything(self) -> None:
+        for games in (0, 1, MIN_WEAK_OPENING_GAMES - 1):
+            self.assertFalse(
+                is_weak_opening(self._row(games=games, points_pct=0.0,
+                                          errors_per_game_shrunk=9.0)),
+                f"games={games} must not be weak",
+            )
+
+    def test_unknown_opening_never_weak(self) -> None:
+        for name in ("Без названия", "", None, "unknown", "  "):
+            self.assertFalse(
+                is_weak_opening(self._row(opening=name)),
+                f"opening={name!r} must not be weak",
+            )
+
+    def test_losing_score_with_enough_games_is_weak(self) -> None:
+        self.assertTrue(is_weak_opening(self._row(points_pct=49.9,
+                                                  errors_per_game_shrunk=0.1)))
+        self.assertFalse(is_weak_opening(self._row(points_pct=50.0,
+                                                   errors_per_game_shrunk=0.1)))
+
+    def test_shrunk_errors_arm(self) -> None:
+        # Ровный счёт, но стабильно ≥ 1.0 ошибок на партию после сжатия.
+        self.assertTrue(is_weak_opening(self._row(points_pct=60.0,
+                                                  errors_per_game_shrunk=1.0)))
+        self.assertFalse(is_weak_opening(self._row(points_pct=60.0,
+                                                   errors_per_game_shrunk=0.99)))
+
+    def test_shrunk_computed_from_raw_fields_when_missing(self) -> None:
+        row = self._row(points_pct=80.0, errors_per_game_shrunk=None,
+                        bad_moves=None)
+        row["errors_per_game"] = 2.0
+        row["games"] = 10
+        # shrunk = 2.0 * 10 / (10 + 5) ≈ 1.33 ≥ 1.0
+        self.assertTrue(is_weak_opening(row))
+        row["games"] = 4
+        # shrunk = 2.0 * 4 / 9 ≈ 0.89 < 1.0
+        self.assertFalse(is_weak_opening(row))
+
+    def test_garbage_row_not_weak(self) -> None:
+        self.assertFalse(is_weak_opening({}))
+        self.assertFalse(is_weak_opening({"opening": "X", "games": "oops"}))
+        self.assertFalse(is_weak_opening("not a dict"))
 
 
 class RepertoireToPgnTests(unittest.TestCase):

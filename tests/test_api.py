@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
@@ -149,7 +150,7 @@ class ApiTestBase(unittest.TestCase):
     def _register(
         self,
         nick: str,
-        password: str = "abcd",
+        password: str = "abcd12345",
         lichess: str | None = None,
         fide: str = "",
     ) -> None:
@@ -322,7 +323,10 @@ class UserApiTests(ApiTestBase):
 
     def test_delete_self_allowed(self):
         self._register("ada")
-        resp = self.client.post("/api/user/delete", data={"nick": "ada"})
+        resp = self.client.post(
+            "/api/user/delete",
+            data={"nick": "ada", "password": "abcd12345"},
+        )
         self.assertEqual(resp.status_code, 200)
         self.assertTrue(resp.json()["ok"])
         with Database(self.db_path) as db:
@@ -333,7 +337,10 @@ class UserApiTests(ApiTestBase):
     def test_delete_current_user_clears_current(self):
         self._register("ada")
         self._register("bob")
-        resp = self.client.post("/api/user/delete", data={"nick": "bob"})
+        resp = self.client.post(
+            "/api/user/delete",
+            data={"nick": "bob", "password": "abcd12345"},
+        )
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(self.client.get("/api/user/current").status_code, 404)
 
@@ -353,7 +360,10 @@ class UserApiTests(ApiTestBase):
         job = CoachJob(id="secretjob", user="ada", phase="Тест")
         job.status = "running"
         _JOBS["secretjob"] = job
-        resp = self.client.post("/api/user/delete", data={"nick": "ada"})
+        resp = self.client.post(
+            "/api/user/delete",
+            data={"nick": "ada", "password": "abcd12345"},
+        )
         self.assertEqual(resp.status_code, 200)
         with Database(self.db_path) as db:
             db.init_db()
@@ -376,7 +386,10 @@ class UserApiTests(ApiTestBase):
         private = self.data_dir / "ada"
         private.mkdir(parents=True, exist_ok=True)
         (private / "humanity.json").write_text('{"items":[{"secret":1}]}', encoding="utf-8")
-        resp = self.client.post("/api/user/delete", data={"nick": "ada"})
+        resp = self.client.post(
+            "/api/user/delete",
+            data={"nick": "ada", "password": "abcd12345"},
+        )
         self.assertEqual(resp.status_code, 200)
         self.assertFalse(private.exists())
         # Новый владелец того же ника не читает старые файлы.
@@ -445,7 +458,7 @@ class UserApiTests(ApiTestBase):
         try:
             resp = self.client.post(
                 "/api/auth/register",
-                data={"login": "reserved", "password": "abcd", "lichess": "X"},
+                data={"login": "reserved", "password": "abcd12345", "lichess": "X"},
             )
         finally:
             object.__setattr__(settings, "admin_nicks", old)
@@ -1283,7 +1296,10 @@ class LlmToolApiTests(ApiTestBase):
     def test_review_run_creates_job(self):
         with patch.dict(os.environ, {"LLM_API_KEY": "test-key"}), \
                 patch("app.api.run_coach",
-                      return_value=({3: "не увидел угрозу на f6"}, "потерял инициативу")):
+                      return_value=({3: "не увидел угрозу на f6"}, "потерял инициативу",
+                                    {"moments_source": {3: "llm"},
+                                     "summary_source": "llm",
+                                     "retries": 0, "violations": [], "error": None})):
             resp = self.client.post("/api/review/run", data={"max": "3"})
             self.assertEqual(resp.status_code, 200)
             job = self._wait_job(resp.json()["job_id"])
@@ -1330,13 +1346,19 @@ class LlmToolApiTests(ApiTestBase):
         self.assertEqual(resp.status_code, 404)
         self.assertIn("проанализированных", resp.json()["detail"])
 
-    def test_review_no_llm_key_job_error(self):
+    def test_review_no_llm_key_facts_only(self):
+        """Нет ключа — recoverable facts-only разбор, не success-shaped error."""
         with patch.dict(os.environ, {"LLM_API_KEY": ""}):
             resp = self.client.post("/api/review/run", data={"max": "3"})
             self.assertEqual(resp.status_code, 200)
             job = self._wait_job(resp.json()["job_id"])
-        self.assertEqual(job["status"], "error")
-        self.assertIn("LLM_API_KEY", job["error"])
+        self.assertEqual(job["status"], "done", job.get("error"))
+        self.assertIn("LLM_API_KEY", job["result"]["llm_error"])
+        game = job["result"]["games"][0]
+        self.assertTrue(game["moments"])
+        for moment in game["moments"]:
+            self.assertEqual(moment["text_source"], "facts")
+        self.assertEqual(game["summary_source"], "facts")
 
     # --- mentor ---
 
@@ -1348,7 +1370,9 @@ class LlmToolApiTests(ApiTestBase):
             Итог через месяц: ...
         """)
         with patch.dict(os.environ, {"LLM_API_KEY": "test-key"}), \
-                patch("app.api.run_mentor", return_value=reply) as rm:
+                patch("app.api.run_mentor",
+                      return_value=(reply, {"source": "llm", "retries": 0,
+                                            "violations": [], "error": None})) as rm:
             resp = self.client.post(
                 "/api/mentor/run", data={"notes": "Хочу эндшпиль"}
             )
@@ -1668,14 +1692,17 @@ class TaskApiTests(ApiTestBase):
             self.assertEqual(data["explanation"], good)
             llm2.assert_not_called()
 
-    def test_explain_no_llm_key_job_error(self):
+    def test_explain_no_llm_key_facts_only(self):
+        """Нет ключа — задача не падает: facts-only, UI покажет факты."""
         self._seed_tasks()
         with patch.dict(os.environ, {"LLM_API_KEY": ""}):
             resp = self.client.post("/api/task/explain")
             self.assertEqual(resp.status_code, 200)
             job = self._wait_job(resp.json()["job_id"])
-        self.assertEqual(job["status"], "error")
-        self.assertIn("LLM_API_KEY", job["error"])
+        self.assertEqual(job["status"], "done", job.get("error"))
+        self.assertTrue(job["result"]["facts_only"])
+        self.assertIsNone(job["result"]["explanation"])
+        self.assertIn("LLM_API_KEY", job["result"]["reason"])
 
     def test_explain_poison_cache_ignored_and_overwritten(self):
         """thinking-мусор в БД: today врёт explained=false, повтор лечит."""
@@ -1698,9 +1725,9 @@ class TaskApiTests(ApiTestBase):
         with patch.dict(os.environ, {"LLM_API_KEY": "test-key"}), \
                 patch("app.api._task_explain_llm",
                       return_value=(
-                          "Твой ход Nf3 — неточность: ты отдал центр без борьбы. "
-                          "Сильнее было c4 с давлением на поле d5. "
-                          "В похожих позициях сначала занимай центр пешками."
+                          "Твой ход Bb5 — зевок: ты отдал инициативу без борьбы. "
+                          "Сильнее было Bc4 с давлением. "
+                          "В похожих позициях сначала занимай центр."
                       )) as llm:
             resp = self.client.post("/api/task/explain")
             self.assertEqual(resp.status_code, 200)
@@ -1747,47 +1774,22 @@ class TaskApiTests(ApiTestBase):
 
 
 class TrackApiTests(ApiTestBase):
-    """Тесты мини-трекера времени: /api/track/ping и /api/track/today.
+    """Тесты трекера времени: /api/track/today (без скрытого трекинга).
 
-    Время патчится через app.api._now — сеть и реальные часы не участвуют.
+    Скрытый ping удалён: «время сегодня» складывается из часов Lichess
+    в проанализированных партиях и ручного ввода /api/track/lichess_manual.
     """
 
     def setUp(self) -> None:
         super().setUp()
         self._set_current("tester")
 
-    def test_ping_accumulates_site_time(self):
-        clock = {"t": 5_000_000.0}
-        with patch("app.api._now", new=lambda: clock["t"]):
-            first = self.client.post("/api/track/ping")
-            self.assertEqual(first.status_code, 200)
-            self.assertEqual(first.json(), {"ok": True, "total": 0})
-
-            clock["t"] += 120
-            second = self.client.post("/api/track/ping")
-            self.assertEqual(second.json()["total"], 120)
-
-            data = self.client.get("/api/track/today").json()
-        self.assertEqual(data["date"], _today())
-        self.assertEqual(data["site_sec"], 120)
-        self.assertEqual(data["games_today"], 0)
-        self.assertEqual(data["lichess_sec"], 0)
-        self.assertEqual(data["total_sec"], 120)
-
-    def test_ping_gap_over_cap_not_credited(self):
-        clock = {"t": 5_000_000.0}
-        with patch("app.api._now", new=lambda: clock["t"]):
-            self.client.post("/api/track/ping")  # создаёт сессию
-
-            clock["t"] += 1000  # gap > 300с — не начисляем
-            resp = self.client.post("/api/track/ping")
-            self.assertEqual(resp.json()["total"], 0)
-
-            clock["t"] += 60  # last обновлён — этот gap начисляется
-            resp = self.client.post("/api/track/ping")
-            self.assertEqual(resp.json()["total"], 60)
-            data = self.client.get("/api/track/today").json()
-        self.assertEqual(data["site_sec"], 60)
+    def test_ping_endpoint_removed(self):
+        # Секретный трекинг удалён: /api/track/ping больше не существует.
+        resp = self.client.post("/api/track/ping")
+        self.assertIn(resp.status_code, (404, 405))
+        resp = self.client.get("/api/track/ping")
+        self.assertIn(resp.status_code, (404, 405))
 
     def test_today_counts_lichess_games(self):
         today_ms = int(time.time() * 1000)
@@ -1815,33 +1817,9 @@ class TrackApiTests(ApiTestBase):
         self.assertEqual(data["games_today"], 1)
         # убывания 600→598=2, 598→596=2, 596→590=6
         self.assertEqual(data["lichess_sec"], 10)
-        self.assertEqual(data["site_sec"], 0)
-        self.assertEqual(data["total_sec"], data["site_sec"] + data["lichess_sec"])
-
-    def test_total_sec_sums_site_and_lichess(self):
-        today_ms = int(time.time() * 1000)
-        with Database(self.db_path) as db:
-            db.init_db()
-            db.save_games(
-                [
-                    mkgame_moves(
-                        "tr3",
-                        ["e4"],
-                        created_at=today_ms,
-                        clocks=[600.0, 590.0],
-                    ),
-                ],
-                "tester",
-            )
-        clock = {"t": 5_000_000.0}
-        with patch("app.api._now", new=lambda: clock["t"]):
-            self.client.post("/api/track/ping")
-            clock["t"] += 90
-            self.client.post("/api/track/ping")
-            data = self.client.get("/api/track/today").json()
-        self.assertEqual(data["site_sec"], 90)
-        self.assertEqual(data["lichess_sec"], 10)
-        self.assertEqual(data["total_sec"], 100)
+        self.assertEqual(data["manual_sec"], 0)
+        self.assertEqual(data["total_sec"], data["lichess_sec"] + data["manual_sec"])
+        self.assertNotIn("site_sec", data)
 
     def test_empty_clocks_count_as_zero(self):
         today_ms = int(time.time() * 1000)
@@ -1857,20 +1835,7 @@ class TrackApiTests(ApiTestBase):
 
     def test_no_user_404(self):
         self._clear_auth()
-        self.assertEqual(self.client.post("/api/track/ping").status_code, 404)
         self.assertEqual(self.client.get("/api/track/today").status_code, 404)
-
-    def test_ping_stores_valid_json_meta(self):
-        clock = {"t": 5_000_000.0}
-        with patch("app.api._now", new=lambda: clock["t"]):
-            self.client.post("/api/track/ping")
-        with Database(self.db_path) as db:
-            db.init_db()
-            raw = db.get_meta(f"site_time_{_today()}_tester")
-        self.assertIsNotNone(raw)
-        stored = json.loads(raw)
-        self.assertEqual(stored["last"], 5_000_000.0)
-        self.assertEqual(stored["total"], 0)
 
     def test_manual_minutes_accumulate_and_add_to_total(self):
         before = self.client.get("/api/track/today").json()["total_sec"]
@@ -1893,7 +1858,7 @@ class TrackApiTests(ApiTestBase):
         self.assertEqual(data["total_sec"], before + 45 * 60)
         self.assertEqual(
             data["total_sec"],
-            data["site_sec"] + data["lichess_sec"] + data["manual_sec"],
+            data["lichess_sec"] + data["manual_sec"],
         )
 
     def test_manual_minutes_out_of_range_400(self):
@@ -1930,20 +1895,6 @@ class TrackApiTests(ApiTestBase):
         data = self.client.get("/api/track/today").json()
         self.assertEqual(data["manual_sec"], 10 * 60)
         self.assertEqual(data["total_sec"], before + 10 * 60)
-
-    def test_ping_updates_daily_log_minutes(self):
-        """total секунд трекера → целые минуты в daily_log за дату."""
-        clock = {"t": 5_000_000.0}
-        with patch("app.api._now", new=lambda: clock["t"]):
-            self.client.post("/api/track/ping")
-            clock["t"] += 150
-            self.client.post("/api/track/ping")
-        with Database(self.db_path) as db:
-            db.init_db()
-            log = db.get_daily_log("tester", _today())
-        self.assertIsNotNone(log)
-        self.assertEqual(log["minutes"], 2)  # 150 сек → 2 мин (округление)
-        self.assertEqual(log["tasks_total"], 0)
 
 
 class PlanGoalTests(ApiTestBase):
@@ -2084,7 +2035,7 @@ class PlanWeekTests(ApiTestBase):
                         opponent="Rival",
                         opening="Ruy Lopez",
                         eco="C70",
-                        created_at=100,
+                        created_at=int(time.time() * 1000),
                     ),
                 ],
                 "tester",
@@ -2126,18 +2077,159 @@ class PlanWeekTests(ApiTestBase):
         self.assertIsInstance(data["week_tasks"], list)
         self.assertTrue(data["week_tasks"])
         for task in data["week_tasks"]:
-            self.assertEqual(set(task), {"key", "text", "detail"})
+            self.assertEqual(set(task), {"key", "text", "detail", "est_minutes"})
+            self.assertIsInstance(task["est_minutes"], int)
         self.assertEqual(
             set(data["today"]),
-            {"task_done", "time_sec", "drills_today", "drills_total"},
+            {"task_done", "time_sec", "drills_today", "drills_total", "drills_window"},
+        )
+        self.assertEqual(
+            set(data["today"]["drills_window"]),
+            {"days", "games", "unnatural", "total_bad", "source"},
         )
         self.assertIsInstance(data["human_summary"], str)
         self.assertTrue(data["human_summary"])
 
     def test_week_focus_auto_picks_weakest_phase(self):
         data = self._get_week()
-        # миттельшпиль −30 против дебюта −10: слабейшая фаза по avg_drop.
+        # В одной партии 1 ошибка в дебюте и 1 в миттельшпиле: меньше
+        # минимальных 3 ошибок на фазу → fallback «middlegame» с честным
+        # обоснованием «мало данных», а не шумный максимум.
         self.assertEqual(data["focus"]["phase"], "middlegame")
+        self.assertIn("мало данных", data["focus"]["reason"])
+
+    def _seed_week_multi(self) -> None:
+        """Три партии: у каждой грубая ошибка в миттельшпиле (−30)
+        и ошибка в дебюте (−10) — миттельшпиль набирает ≥ 3 ошибок."""
+        now_ms = int(time.time() * 1000)
+        for index in range(3):
+            sans = [
+                "e4", "e5", "Nf3", "Nc6", "Bb5", "a6", "Ba4", "Nf6",
+                "O-O", "Be7", "Re1", "b5", "Bb3", "d6",
+            ]
+            entries = []
+            for i, san in enumerate(sans):
+                if i == 4:
+                    entries.append(self._move(san, "mistake", 10.0, 55.0, 45.0, "Bc4"))
+                elif i == 12:
+                    entries.append(self._move(san, "blunder", 30.0, 60.0, 30.0, "Bc2"))
+                else:
+                    entries.append(self._move(san, "best", 0.0, 55.0, 55.0, san))
+            with Database(self.db_path) as db:
+                db.init_db()
+                db.save_games(
+                    [
+                        mkgame_moves(
+                            f"wk{index}",
+                            sans,
+                            user_color="white",
+                            result_for_user="loss",
+                            opponent="Rival",
+                            opening="Ruy Lopez",
+                            eco="C70",
+                            created_at=now_ms + index,
+                        ),
+                    ],
+                    "tester",
+                )
+                db.save_analysis(
+                    f"wk{index}",
+                    {
+                        "game_id": f"wk{index}",
+                        "user_color": "white",
+                        "result_for_user": "loss",
+                        "opponent": "Rival",
+                        "avg_win_loss": 20.0,
+                        "avg_win_before": 55.0,
+                        "blunders": [12],
+                        "mistakes": [4],
+                        "inaccuracies": [],
+                        "missed_wins": [],
+                        "time_pressure_blunders": [],
+                        "moves": entries,
+                    },
+                    depth=8,
+                )
+                db.set_current_user("tester")
+
+    def test_week_focus_picks_weakest_phase_with_enough_evidence(self):
+        self._seed_week_multi()
+        data = self.client.get("/api/plan/week")
+        self.assertEqual(data.status_code, 200)
+        payload = data.json()
+        self.assertEqual(payload["focus"]["phase"], "middlegame")
+        self.assertIn("3 ошибок", payload["focus"]["reason"])
+
+    def _seed_humanity(self, items) -> None:
+        path = self.data_dir / "tester" / "humanity.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "total_bad": len(items),
+                    "verdicts": {"natural": 0, "borderline": 0,
+                                 "unnatural": sum(1 for i in items if i["verdict"] == "unnatural")},
+                    "items": items,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+    def test_week_drills_use_recent_window_and_assign_when_present(self):
+        self._seed_week()  # партия wk1 создана «сейчас» → в 14-дневном окне
+        now_ms = int(time.time() * 1000)
+        self._seed_humanity(
+            [
+                {"game_id": "wk1", "ply": 12, "san": "Bb3",
+                 "classification": "blunder", "drop": 30.0,
+                 "beta": -4.0, "verdict": "unnatural"}
+                for _ in range(9)
+            ]
+            + [
+                # Старая партия не из окна — считаться не должна.
+                {"game_id": "ancient", "ply": 4, "san": "Nf3",
+                 "classification": "mistake", "drop": 12.0,
+                 "beta": -3.0, "verdict": "unnatural"},
+            ]
+        )
+        data = self.client.get("/api/plan/week")
+        self.assertEqual(data.status_code, 200)
+        payload = data.json()
+        self.assertEqual(payload["today"]["drills_window"]["unnatural"], 9)
+        self.assertEqual(payload["today"]["drills_window"]["games"], 1)
+        self.assertEqual(payload["today"]["drills_window"]["source"], "humanity")
+        self.assertEqual(payload["today"]["drills_today"], 2)  # ceil(9/7)
+        drills_task = next(
+            t for t in payload["week_tasks"] if t["key"] == "drills"
+        )
+        self.assertIn("9 неестественных промахов за последние 14 дней", drills_task["detail"])
+
+    def test_week_budget_within_80_percent_of_minutes(self):
+        self._seed_week()
+        now_ms = int(time.time() * 1000)
+        self._seed_humanity(
+            [
+                {"game_id": "wk1", "ply": 12, "san": "Bb3",
+                 "classification": "blunder", "drop": 30.0,
+                 "beta": -4.0, "verdict": "unnatural"}
+                for _ in range(9)
+            ]
+        )
+        for minutes in (5, 10, 15, 30, 60, 120, 240):
+            resp = self.client.post(
+                "/api/plan/goal",
+                data={"goal": "тест", "minutes": str(minutes), "focus": "auto"},
+            )
+            self.assertEqual(resp.status_code, 200)
+            payload = self.client.get("/api/plan/week").json()
+            total = sum(t["est_minutes"] for t in payload["week_tasks"])
+            budget = int(minutes) * 8 // 10
+            self.assertLessEqual(
+                total, budget,
+                f"budget exceeded at minutes={minutes}: {total} > {budget}",
+            )
+            self.assertEqual(payload["week_budget_minutes"], budget)
 
     def test_week_evidence_has_percent_and_example(self):
         data = self._get_week()
@@ -2160,9 +2252,12 @@ class PlanWeekTests(ApiTestBase):
 
     def test_week_drills_bound(self):
         data = self._get_week()
-        self.assertLessEqual(data["today"]["drills_today"], 20)
+        # Нет данных humanize за окно → честный ноль, а не искусственные 5 дрелей.
+        self.assertEqual(data["today"]["drills_today"], 0)
         self.assertEqual(data["today"]["drills_total"], 0)
-        self.assertEqual(data["today"]["drills_today"], 5)
+        self.assertEqual(data["today"]["drills_window"]["unnatural"], 0)
+        self.assertEqual(data["today"]["drills_window"]["days"], 14)
+        self.assertNotIn("drills", {t["key"] for t in data["week_tasks"]})
 
     def test_week_explicit_focus_wins(self):
         self._seed_week()
@@ -2193,7 +2288,7 @@ class PlanLlmTests(ApiTestBase):
         "Неделя 1: упор на эндшпили + твоё самое слабое место\n"
         "Режим: обычный\n"
         "Норма дня (30 мин):\n"
-        "- Задачи — 10 мин (20 качественных)\n"
+        "- Задачи — 10 мин (10 качественных)\n"
         "- Эндшпиль — 10 мин (ладейные окончания)\n"
         "- Партии — 10 мин (1 партия в день)\n"
         "Итог недели: держим темп, считаем до конца."
@@ -2469,7 +2564,8 @@ class PlanLlmTests(ApiTestBase):
             self.client.get("/api/plan/llm").json(), {"text": None}
         )
 
-    def test_generate_thinking_goes_error(self):
+    def test_generate_thinking_facts_fallback(self):
+        """Служебный разбор вместо плана — facts-only ответ, не error."""
         self._add_user()
         thinking = (
             "THINKING ANALYZE CONSTRAINTS STEP 1 FACTS FROM DATA "
@@ -2481,8 +2577,11 @@ class PlanLlmTests(ApiTestBase):
             resp = self.client.post("/api/plan/generate", data={})
             self.assertEqual(resp.status_code, 200)
             job = self._wait_job(resp.json()["job_id"])
-        self.assertEqual(job["status"], "error")
-        self.assertIn("разбор", job["error"])
+        self.assertEqual(job["status"], "done", job.get("error"))
+        self.assertTrue(job["result"]["plan"]["facts_only"])
+        got = self.client.get("/api/plan/llm").json()
+        self.assertTrue(got["facts_only"])
+        self.assertIn("LLM недоступен", got["text"])
 
     def test_stale_plan_comment_is_hidden(self):
         """Старый кэш «плана» не показывается после смены промпта."""
@@ -2652,7 +2751,7 @@ class PlanLlmTests(ApiTestBase):
             )
 
     def test_generate_basic_topics_rejected_for_advanced(self):
-        """Рейтинг 2100 + детсад в плане → job error «базовые темы», в meta пусто."""
+        """Рейтинг 2100 + детсад в плане → факты недели (facts_only), не брак и не error."""
         self._add_user()
         self._seed_rating(2100)
         with patch.dict(os.environ, {"LLM_API_KEY": "test-key"}), \
@@ -2661,11 +2760,11 @@ class PlanLlmTests(ApiTestBase):
             resp = self.client.post("/api/plan/generate", data={})
             self.assertEqual(resp.status_code, 200)
             job = self._wait_job(resp.json()["job_id"])
-        self.assertEqual(job["status"], "error")
-        self.assertIn("базовые темы", job.get("error") or "")
-        self.assertEqual(
-            self.client.get("/api/plan/llm").json(), {"text": None}
-        )
+        self.assertEqual(job["status"], "done", job.get("error"))
+        self.assertTrue(job["result"]["plan"]["facts_only"])
+        got = self.client.get("/api/plan/llm").json()
+        self.assertTrue(got["facts_only"])
+        self.assertIn("базовые темы", got["llm_error"])
 
     def test_generate_basic_topics_allowed_below_1800(self):
         """Рейтинг 1500: тот же текст — годный план, сохраняется."""
@@ -2724,12 +2823,12 @@ class FrontendTests(ApiTestBase):
         html = resp.text
         self.assertIn("app.js?v=", html)
         self.assertIn("style.css?v=", html)
-        self.assertIn("v0.9.21", html)
+        self.assertIn("v0.9.22", html)
         self.assertIn('id="nav-toggle"', html)
         self.assertIn('aria-controls="nav"', html)
 
     def test_api_version(self):
-        self.assertEqual(self.app.version, "0.9.21")
+        self.assertEqual(self.app.version, "0.9.22")
 
 
 class AuthApiTests(ApiTestBase):
@@ -2753,7 +2852,7 @@ class AuthApiTests(ApiTestBase):
     def test_register_new_and_status(self):
         resp = self.client.post(
             "/api/auth/register",
-            data={"login": "neo", "password": "abcd", "lichess": "NeoChess"},
+            data={"login": "neo", "password": "abcd12345", "lichess": "NeoChess"},
         )
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json(), {"ok": True, "nick": "neo"})
@@ -2770,10 +2869,10 @@ class AuthApiTests(ApiTestBase):
 
     def test_register_validation(self):
         bad = [
-            {"login": "", "password": "abcd", "lichess": "X"},
-            {"login": "x" * 65, "password": "abcd", "lichess": "X"},
+            {"login": "", "password": "abcd12345", "lichess": "X"},
+            {"login": "x" * 65, "password": "abcd12345", "lichess": "X"},
             {"login": "neo", "password": "abc", "lichess": "X"},
-            {"login": "neo", "password": "abcd", "lichess": ""},
+            {"login": "neo", "password": "abcd12345", "lichess": ""},
         ]
         for data in bad:
             with self.subTest(data=data):
@@ -2783,7 +2882,7 @@ class AuthApiTests(ApiTestBase):
                 )
 
     def test_register_duplicate_409(self):
-        data = {"login": "neo", "password": "abcd", "lichess": "NeoChess"}
+        data = {"login": "neo", "password": "abcd12345", "lichess": "NeoChess"}
         self.assertEqual(self.client.post("/api/auth/register", data=data).status_code, 200)
         resp = self.client.post("/api/auth/register", data=data)
         self.assertEqual(resp.status_code, 409)
@@ -2797,7 +2896,7 @@ class AuthApiTests(ApiTestBase):
         with self._legacy_claim():
             resp = self.client.post(
                 "/api/auth/register",
-                data={"login": "OldNick", "password": "abcd", "lichess": "OldLichess"},
+                data={"login": "OldNick", "password": "abcd12345", "lichess": "OldLichess"},
             )
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json(), {"ok": True, "nick": "OldNick"})
@@ -2829,14 +2928,14 @@ class AuthApiTests(ApiTestBase):
             with self.subTest(login=bad):
                 resp = self.client.post(
                     "/api/auth/register",
-                    data={"login": bad, "password": "abcd", "lichess": "X"},
+                    data={"login": bad, "password": "abcd12345", "lichess": "X"},
                 )
                 self.assertEqual(resp.status_code, 400, resp.text)
 
     def test_login_wrong_and_unknown_401(self):
         self.client.post(
             "/api/auth/register",
-            data={"login": "neo", "password": "abcd", "lichess": "NeoChess"},
+            data={"login": "neo", "password": "abcd12345", "lichess": "NeoChess"},
         )
         fresh = self._fresh_client()
         resp = fresh.post(
@@ -2844,18 +2943,18 @@ class AuthApiTests(ApiTestBase):
         )
         self.assertEqual(resp.status_code, 401)
         resp = fresh.post(
-            "/api/auth/login", data={"login": "ghost", "password": "abcd"}
+            "/api/auth/login", data={"login": "ghost", "password": "abcd12345"}
         )
         self.assertEqual(resp.status_code, 401)
 
     def test_login_ok_and_logout(self):
         self.client.post(
             "/api/auth/register",
-            data={"login": "neo", "password": "abcd", "lichess": "NeoChess"},
+            data={"login": "neo", "password": "abcd12345", "lichess": "NeoChess"},
         )
         fresh = self._fresh_client()
         resp = fresh.post(
-            "/api/auth/login", data={"login": "neo", "password": "abcd"}
+            "/api/auth/login", data={"login": "neo", "password": "abcd12345"}
         )
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(fresh.get("/api/auth/status").json()["logged_in"], True)
@@ -2869,14 +2968,14 @@ class AuthApiTests(ApiTestBase):
     def test_inactive_blocks(self):
         self.client.post(
             "/api/auth/register",
-            data={"login": "neo", "password": "abcd", "lichess": "NeoChess"},
+            data={"login": "neo", "password": "abcd12345", "lichess": "NeoChess"},
         )
         with Database(self.db_path) as db:
             db.init_db()
             db.set_active("neo", False)
         fresh = self._fresh_client()
         resp = fresh.post(
-            "/api/auth/login", data={"login": "neo", "password": "abcd"}
+            "/api/auth/login", data={"login": "neo", "password": "abcd12345"}
         )
         self.assertEqual(resp.status_code, 403)
         # старая сессия тоже гаснет
@@ -2890,27 +2989,27 @@ class AuthApiTests(ApiTestBase):
     def test_password_change(self):
         self.client.post(
             "/api/auth/register",
-            data={"login": "neo", "password": "oldpw", "lichess": "NeoChess"},
+            data={"login": "neo", "password": "oldpassword", "lichess": "NeoChess"},
         )
         resp = self.client.post(
-            "/api/auth/password", data={"old": "wrong", "new": "newpw"}
+            "/api/auth/password", data={"old": "wrong", "new": "newpassword"}
         )
         self.assertEqual(resp.status_code, 401)
         resp = self.client.post(
-            "/api/auth/password", data={"old": "oldpw", "new": "newpw"}
+            "/api/auth/password", data={"old": "oldpassword", "new": "newpassword"}
         )
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json(), {"ok": True})
         fresh = self._fresh_client()
         self.assertEqual(
             fresh.post(
-                "/api/auth/login", data={"login": "neo", "password": "oldpw"}
+                "/api/auth/login", data={"login": "neo", "password": "oldpassword"}
             ).status_code,
             401,
         )
         self.assertEqual(
             fresh.post(
-                "/api/auth/login", data={"login": "neo", "password": "newpw"}
+                "/api/auth/login", data={"login": "neo", "password": "newpassword"}
             ).status_code,
             200,
         )
@@ -2931,7 +3030,7 @@ class AuthApiTests(ApiTestBase):
             db.set_active("OldNick", False)
         resp = self.client.post(
             "/api/auth/register",
-            data={"login": "OldNick", "password": "abcd", "lichess": "OldLichess"},
+            data={"login": "OldNick", "password": "abcd12345", "lichess": "OldLichess"},
         )
         self.assertEqual(resp.status_code, 403)
         self.assertEqual(resp.json()["detail"], "Доступ ограничен")
@@ -2940,13 +3039,13 @@ class AuthApiTests(ApiTestBase):
         """После смены пароля старая сессия больше не валидна."""
         self.client.post(
             "/api/auth/register",
-            data={"login": "neo", "password": "oldpw", "lichess": "NeoChess"},
+            data={"login": "neo", "password": "oldpassword", "lichess": "NeoChess"},
         )
         self.assertEqual(
             self.client.get("/api/auth/status").json()["logged_in"], True
         )
         resp = self.client.post(
-            "/api/auth/password", data={"old": "oldpw", "new": "newpw"}
+            "/api/auth/password", data={"old": "oldpassword", "new": "newpassword"}
         )
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(
@@ -2957,7 +3056,7 @@ class AuthApiTests(ApiTestBase):
     def test_lichess_change(self):
         self.client.post(
             "/api/auth/register",
-            data={"login": "neo", "password": "abcd", "lichess": "NeoChess"},
+            data={"login": "neo", "password": "abcd12345", "lichess": "NeoChess"},
         )
         resp = self.client.post("/api/auth/lichess", data={"lichess": "NewNick"})
         self.assertEqual(resp.status_code, 200)
@@ -2969,7 +3068,7 @@ class AuthApiTests(ApiTestBase):
     def test_coach_fetch_uses_lichess(self):
         self.client.post(
             "/api/auth/register",
-            data={"login": "coachuser", "password": "abcd", "lichess": "ForeignNick"},
+            data={"login": "coachuser", "password": "abcd12345", "lichess": "ForeignNick"},
         )
         with tempfile.NamedTemporaryFile() as fh, \
                 patch("app.api.fetch_user_games", return_value=[]) as fetch:
@@ -3628,8 +3727,19 @@ class DayPlanApiTests(ApiTestBase):
         super().setUp()
         self._set_current("tester")
 
+    def _seed_weak_opening_user(self) -> None:
+        """Четыре проигранные партии в одном дебюте: минимум для
+        предиката is_weak_opening (≥ 4 партий, счёт < 50%)."""
+        with Database(self.db_path) as db:
+            db.init_db()
+            games = [mkgame(f"dp{i}") for i in range(4)]
+            db.save_games(games, "tester")
+            for game in games:
+                db.save_analysis(game.id, {"summary": []}, depth=8)
+            db.set_current_user("tester")
+
     def test_dayplan_builds_and_repeat_is_stable(self) -> None:
-        self._seed_user("tester", "dp")
+        self._seed_weak_opening_user()
         first = self.client.get("/api/dayplan")
         self.assertEqual(first.status_code, 200, first.text)
         data = first.json()
@@ -3654,7 +3764,7 @@ class DayPlanApiTests(ApiTestBase):
         self.assertEqual(second.json(), data)
 
     def test_dayplan_toggle_updates_done_and_daily_progress(self) -> None:
-        self._seed_user("tester", "dp")
+        self._seed_weak_opening_user()
         data = self.client.get("/api/dayplan").json()
         day = data["date"]
         task_id = data["tasks"][0]["id"]
@@ -3755,6 +3865,170 @@ class AdminCohortTests(ApiTestBase):
         self.assertTrue(
             csv_resp.text.startswith("nick,rating_start,rating_end")
         )
+
+
+
+
+class PasswordPolicyTests(ApiTestBase):
+    """Минимальная длина нового пароля >= 8 на сервере."""
+
+    def test_register_short_password_rejected(self):
+        resp = self.client.post(
+            "/api/auth/register",
+            data={"login": "neo", "password": "1234567", "lichess": "NeoChess"},
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("8", resp.json()["detail"])
+
+    def test_register_eight_char_password_accepted(self):
+        resp = self.client.post(
+            "/api/auth/register",
+            data={"login": "neo", "password": "12345678", "lichess": "NeoChess"},
+        )
+        self.assertEqual(resp.status_code, 200)
+
+    def test_password_change_short_password_rejected(self):
+        self._register("neo")
+        resp = self.client.post(
+            "/api/auth/password", data={"old": "abcd12345", "new": "short7"}
+        )
+        self.assertEqual(resp.status_code, 400)
+        resp = self.client.post(
+            "/api/auth/password", data={"old": "abcd12345", "new": "longenough"}
+        )
+        self.assertEqual(resp.status_code, 200)
+
+
+class LoginRateLimitTests(ApiTestBase):
+    """Rate-limit логина: окно TTL, generic-ответы, очистка при успехе."""
+
+    def _register_and_forget(self, nick: str = "neo") -> None:
+        self._register(nick)
+        self.client.cookies.clear()
+
+    def test_repeated_failures_blocked_then_429_even_with_correct_password(self):
+        self._register_and_forget()
+        for _ in range(5):
+            resp = self.client.post(
+                "/api/auth/login", data={"login": "neo", "password": "wrongpass"}
+            )
+            self.assertEqual(resp.status_code, 401)
+        # Лимит исчерпан: даже верный пароль получает generic 429.
+        resp = self.client.post(
+            "/api/auth/login", data={"login": "neo", "password": "abcd12345"}
+        )
+        self.assertEqual(resp.status_code, 429)
+        self.assertIn("Слишком много", resp.json()["detail"])
+
+    def test_failed_counter_persisted_in_db_not_memory(self):
+        self._register_and_forget()
+        self.client.post(
+            "/api/auth/login", data={"login": "neo", "password": "wrongpass"}
+        )
+        digest = hashlib.sha256("neo".encode("utf-8")).hexdigest()[:32]
+        with Database(self.db_path) as db:
+            db.init_db()
+            raw_id = db.get_meta(f"login_fail_id:{digest}")
+            raw_ip = db.get_meta("login_fail_ip:testclient")
+        self.assertIsNotNone(raw_id)
+        self.assertIsNotNone(raw_ip)
+        self.assertEqual(json.loads(raw_id)["count"], 1)
+        self.assertEqual(json.loads(raw_ip)["count"], 1)
+
+    def test_successful_login_clears_counter(self):
+        self._register_and_forget()
+        for _ in range(4):
+            self.client.post(
+                "/api/auth/login", data={"login": "neo", "password": "wrongpass"}
+            )
+        resp = self.client.post(
+            "/api/auth/login", data={"login": "neo", "password": "abcd12345"}
+        )
+        self.assertEqual(resp.status_code, 200)
+        digest = hashlib.sha256("neo".encode("utf-8")).hexdigest()[:32]
+        with Database(self.db_path) as db:
+            db.init_db()
+            self.assertIsNone(db.get_meta(f"login_fail_id:{digest}"))
+            self.assertIsNone(db.get_meta("login_fail_ip:testclient"))
+        # Счётчик сброшен: снова можно ошибиться 5 раз до 429.
+        self.client.cookies.clear()
+        for _ in range(5):
+            self.client.post(
+                "/api/auth/login", data={"login": "neo", "password": "wrongpass"}
+            )
+        resp = self.client.post(
+            "/api/auth/login", data={"login": "neo", "password": "wrongpass"}
+        )
+        self.assertEqual(resp.status_code, 429)
+
+    def test_rate_limit_window_expires(self):
+        self._register_and_forget()
+        clock = {"t": 5_000_000.0}
+        with patch("app.api._now", new=lambda: clock["t"]):
+            for _ in range(5):
+                self.client.post(
+                    "/api/auth/login",
+                    data={"login": "neo", "password": "wrongpass"},
+                )
+            resp = self.client.post(
+                "/api/auth/login", data={"login": "neo", "password": "wrongpass"}
+            )
+            self.assertEqual(resp.status_code, 429)
+            clock["t"] += settings.login_rate_window_sec + 1
+            resp = self.client.post(
+                "/api/auth/login", data={"login": "neo", "password": "wrongpass"}
+            )
+            self.assertEqual(resp.status_code, 401)
+
+    def test_unknown_login_gets_same_generic_401(self):
+        self._register_and_forget()
+        resp = self.client.post(
+            "/api/auth/login", data={"login": "ghost", "password": "whatever1"}
+        )
+        self.assertEqual(resp.status_code, 401)
+        self.assertEqual(resp.json()["detail"], "Неверный логин или пароль")
+
+
+class DeleteAccountReauthTests(ApiTestBase):
+    """Удаление своего аккаунта: повторная авторизация паролем."""
+
+    def test_self_delete_requires_password(self):
+        self._register("ada")
+        resp = self.client.post("/api/user/delete", data={"nick": "ada"})
+        self.assertEqual(resp.status_code, 400)
+        # Аккаунт на месте.
+        self.assertEqual(self.client.get("/api/user/current").status_code, 200)
+
+    def test_self_delete_wrong_password_rejected(self):
+        self._register("ada")
+        resp = self.client.post(
+            "/api/user/delete",
+            data={"nick": "ada", "password": "not-the-password"},
+        )
+        self.assertEqual(resp.status_code, 401)
+        self.assertEqual(self.client.get("/api/user/current").status_code, 200)
+
+    def test_self_delete_with_password_succeeds_and_wipes_session(self):
+        self._register("ada")
+        resp = self.client.post(
+            "/api/user/delete",
+            data={"nick": "ada", "password": "abcd12345"},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self.client.get("/api/user/current").status_code, 404)
+
+    def test_admin_delete_other_account_does_not_require_password(self):
+        self._register("ada")
+        self._register("boss")
+        self._make_admin("boss")
+        resp = self.client.post("/api/user/delete", data={"nick": "ada"})
+        self.assertEqual(resp.status_code, 200)
+
+    def test_seeded_passwordless_self_delete_does_not_require_password(self):
+        self._seed_user("tester", "t")
+        self._set_current("tester")
+        resp = self.client.post("/api/user/delete", data={"nick": "tester"})
+        self.assertEqual(resp.status_code, 200)
 
 
 if __name__ == "__main__":

@@ -13,7 +13,8 @@ import hashlib
 import json
 from typing import Any
 
-from .patterns import PHASE_LABELS
+from .patterns import MOTIF_OTHER, PHASE_LABELS
+from .repertoire import is_weak_opening
 
 __all__ = ["KINDS", "build_tasks"]
 
@@ -91,7 +92,11 @@ def _opening_task(day: str, row: dict[str, Any]) -> dict[str, Any] | None:
     eco = str(row.get("eco") or "").strip() or None
     color = str(row.get("color") or "").strip().lower()
     if color not in _COLOR_RU:
-        color = "white"
+        # «mixed» (оба цвета сведены в одну строку): тренируем тот цвет,
+        # партий которым больше; при равенстве — white, как раньше.
+        white_games = _num(row.get("white_games"))
+        black_games = _num(row.get("black_games"))
+        color = "white" if white_games >= black_games else "black"
     games = int(_num(row.get("games")))
     points = _num(row.get("points_pct"))
     errors = _num(row.get("errors_per_game"))
@@ -148,6 +153,17 @@ def _daily_task(day: str, task: dict[str, Any]) -> dict[str, Any]:
         value = task.get(key)
         if value not in (None, ""):
             action[key] = value
+    attempt = task.get("attempt")
+    if isinstance(attempt, bool):
+        attempt = None
+    if not isinstance(attempt, int):
+        try:
+            parsed = int(attempt)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            parsed = None
+        attempt = parsed if parsed and parsed > 0 else None
+    if attempt is not None:
+        action["attempt"] = attempt
     classification = str(task.get("classification") or "").strip()
     drop = task.get("drop")
     why_parts: list[str] = []
@@ -158,12 +174,14 @@ def _daily_task(day: str, task: dict[str, Any]) -> dict[str, Any]:
     opening = str(task.get("opening") or "").strip()
     if opening:
         why_parts.append(opening)
+    if attempt is not None and attempt > 1:
+        why_parts.append(f"попытка {attempt}")
     why = (
         "Свежая ошибка из твоей партии: " + ", ".join(why_parts) + "."
         if why_parts
         else "Одна ошибка из твоих партий — найди лучший ход."
     )
-    return _make(
+    task_out = _make(
         day,
         "task",
         "Задача дня: найди лучший ход",
@@ -171,6 +189,9 @@ def _daily_task(day: str, task: dict[str, Any]) -> dict[str, Any]:
         action,
         done=bool(task.get("done")),
     )
+    if attempt is not None:
+        task_out["attempt"] = attempt
+    return task_out
 
 
 def _review_task(day: str, plan: dict[str, Any]) -> dict[str, Any]:
@@ -207,6 +228,10 @@ def build_tasks(
     защищены от мусора: неправильные типы просто не дают задач, а не
     ломают ответ API. При нехватке данных остаются «task» и «review»
     (а без задачи — один «review»).
+
+    CTA гейтится доказательствами (audit M4): дебюты — единым предикатом
+    ``is_weak_opening`` (min-sample, shrinkage), общий мотив «прочее»
+    задачей не становится.
     """
     safe_plan = plan if isinstance(plan, dict) else {}
     day = str(date).strip()
@@ -217,16 +242,15 @@ def build_tasks(
     for row in (repertoire.get("weak_openings") or []):
         if not isinstance(row, dict):
             continue
-        games = int(_num(row.get("games")))
-        points = _num(row.get("points_pct"))
-        errors = _num(row.get("errors_per_game"))
-        # Одна победа в одном дебюте — не повод называть его слабым.
-        if games < 2 and points >= 70 and errors < 1.5:
+        # Единый backend-предикат: min sample + shrinkage + исключение
+        # «Без названия»/UNKNOWN_OPENING.
+        if not is_weak_opening(row):
             continue
         openings.append(row)
     patterns = safe_plan.get("patterns")
     patterns = patterns if isinstance(patterns, dict) else {}
-    motifs = _pairs(patterns.get("motifs"))
+    motifs = [(motif, stats) for motif, stats in _pairs(patterns.get("motifs"))
+              if motif != MOTIF_OTHER]
     phases = _pairs(patterns.get("phases"))
 
     candidates: list[dict[str, Any]] = []

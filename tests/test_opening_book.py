@@ -93,5 +93,105 @@ class OpeningBookTests(unittest.TestCase):
         self.assertEqual(book["first_moves"][0]["replies"][0]["responses"][0]["move"], "d4")
 
 
+class OpeningTreeTests(unittest.TestCase):
+    """Регрессия на _to_node: корень обязан строить вложенное дерево.
+
+    Раньше корень с prefix=() не проходил guard (`if prefix and ...`),
+    а рекурсивный вызов ссылался на несуществующий ``top_n``/``top_children``,
+    из-за чего /api/repertoire получал пустое ``tree["children"]`` либо NameError.
+    """
+
+    @staticmethod
+    def _pairs(moves_list: list[list[str]], color: str = "white"):
+        return [
+            (_game(f"g{i}", moves, color=color), {})
+            for i, moves in enumerate(moves_list)
+        ]
+
+    def test_root_has_children(self) -> None:
+        pairs = self._pairs([["e4", "e6", "d4"], ["e4", "e6", "d4"], ["d4", "d5"]])
+        book = build_opening_book(pairs, "white", max_depth=8, top_n=5)
+        tree = book["tree"]
+        self.assertEqual(tree["prefix"], [])
+        self.assertEqual(tree["count"], 3)
+        self.assertEqual([child["move"] for child in tree["children"]], ["e4", "d4"])
+        self.assertEqual(tree["children"][0]["count"], 2)
+        self.assertEqual(tree["top_children"][0]["move"], "e4")
+
+    def test_nested_children_counts_and_prefixes(self) -> None:
+        pairs = self._pairs(
+            [["e4", "e6", "d4", "d5"]] * 4
+            + [["e4", "e6", "Nf3", "d5"]] * 2
+            + [["e4", "c5", "Nf3"]]
+            + [["d4", "d5"]]
+        )
+        book = build_opening_book(pairs, "white", max_depth=8, top_n=5)
+        tree = book["tree"]
+        e4 = next(child for child in tree["children"] if child["move"] == "e4")
+        self.assertEqual(e4["prefix"], ["e4"])
+        self.assertEqual(e4["ply"], 1)
+        self.assertEqual(e4["count"], 7)
+        self.assertEqual(e4["share_pct"], 87.5)
+        self.assertEqual([child["move"] for child in e4["children"]], ["e6", "c5"])
+        e6 = next(child for child in e4["children"] if child["move"] == "e6")
+        self.assertEqual(e6["prefix"], ["e4", "e6"])
+        self.assertEqual(e6["count"], 6)
+        self.assertEqual([child["move"] for child in e6["children"]], ["d4", "Nf3"])
+        d4_node = next(child for child in e6["children"] if child["move"] == "d4")
+        self.assertEqual(d4_node["prefix"], ["e4", "e6", "d4"])
+        self.assertEqual(d4_node["count"], 4)
+        self.assertEqual(d4_node["children"][0]["move"], "d5")
+        self.assertEqual(d4_node["children"][0]["ply"], 4)
+        # /api/repertoire потребляет tree как вложенный JSON: у листа нет детей.
+        self.assertEqual(d4_node["children"][0]["children"], [])
+
+    def test_max_depth_bounds_recursion(self) -> None:
+        pairs = self._pairs([["e4", "e6", "d4", "d5", "Nd2", "c5"]] * 3)
+        book = build_opening_book(pairs, "white", max_depth=2, top_n=5)
+        tree = book["tree"]
+        self.assertEqual([child["move"] for child in tree["children"]], ["e4"])
+        e4 = tree["children"][0]
+        self.assertEqual([child["move"] for child in e4["children"]], ["e6"])
+        e6 = e4["children"][0]
+        self.assertEqual(e6["ply"], 2)
+        self.assertEqual(e6["children"], [])
+
+    def test_max_depth_one_keeps_only_root_children(self) -> None:
+        pairs = self._pairs([["e4", "e6"], ["d4", "d5"]])
+        book = build_opening_book(pairs, "white", max_depth=1, top_n=5)
+        tree = book["tree"]
+        self.assertEqual(len(tree["children"]), 2)
+        for child in tree["children"]:
+            self.assertEqual(child["children"], [])
+            self.assertEqual(child["top_children"], [])
+
+    def test_empty_input_yields_empty_tree(self) -> None:
+        book = build_opening_book([], "white", max_depth=8, top_n=5)
+        tree = book["tree"]
+        self.assertEqual(tree["prefix"], [])
+        self.assertEqual(tree["count"], 0)
+        self.assertIsNone(tree["points_pct"])
+        self.assertEqual(tree["top_children"], [])
+        self.assertEqual(tree["children"], [])
+
+    def test_deterministic_ordering_and_top_n_limit(self) -> None:
+        # Равное число партий на ход: порядок по SAN, а не по случайности.
+        pairs = self._pairs([["d4", "d5"], ["e4", "e5"], ["c4", "e5"], ["g3", "g6"]])
+        book = build_opening_book(pairs, "white", max_depth=2, top_n=2)
+        tree = book["tree"]
+        self.assertEqual([child["move"] for child in tree["children"]], ["c4", "d4"])
+        self.assertEqual([row["move"] for row in tree["top_children"]], ["c4", "d4"])
+        # Повторный вызов даёт идентичный результат.
+        again = build_opening_book(pairs, "white", max_depth=2, top_n=2)
+        self.assertEqual(again["tree"], tree)
+
+    def test_top_n_truncates_children(self) -> None:
+        pairs = self._pairs(
+            [["e4", "e5"]] * 4 + [["d4", "d5"]] * 3 + [["c4", "e5"]] * 2 + [["g3", "g6"]]
+        )
+        book = build_opening_book(pairs, "white", max_depth=2, top_n=2)
+        self.assertEqual([child["move"] for child in book["tree"]["children"]], ["e4", "d4"])
+
+
 if __name__ == "__main__":
     unittest.main()

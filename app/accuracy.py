@@ -219,7 +219,8 @@ def category_stats(phase: dict, motifs: dict | None = None) -> dict[str, float |
     ``phase`` — результат :func:`phase_stats`. Категории фаз берутся из
     точности соответствующей фазы. ``tactics`` — доля тактических мотивов
     среди переданных ``motifs`` (формат ``patterns.motif_stats``: имена
-    мотивов -> count/avg_drop); без ``motifs`` равна 0. ``strategy`` —
+    мотивов -> count/avg_drop); без ``motifs`` (или без мотивов с count > 0)
+    равна ``None`` — «нет данных», а не 0. ``strategy`` —
     приблизительная оценка: accuracy миттельшпиля, урезанная на долю
     тактических ошибок. ``positional`` — приблизительная оценка: среднее
     accuracy дебюта и миттельшпиля по фазам, где есть ходы.

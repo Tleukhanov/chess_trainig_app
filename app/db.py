@@ -197,7 +197,30 @@ CREATE TABLE IF NOT EXISTS {table}(
 )
 """
 
-# Снапшот рейтинга Lichess на дату (не чаще раза в день, см. api.track/ping).
+# Снимок недельного плана (audit C3): пишется в момент сохранения цели или
+# генерации комментария к плану, НЕ при каждом чтении аналитики. Одна строка
+# на (nick, week_start) — повторное сохранение не перезаписывает снимок:
+# базовая неделя фиксируется первым сохранением. ``weak_openings`` и
+# ``motifs`` — компактные JSON-списки агрегатов (без ходов и PII).
+_PLAN_SNAPSHOTS_DDL = """
+CREATE TABLE IF NOT EXISTS {table}(
+    id TEXT PRIMARY KEY,
+    nick TEXT NOT NULL,
+    week_start TEXT NOT NULL,
+    window_n INTEGER NOT NULL,
+    focus_phase TEXT,
+    weak_openings TEXT,
+    motifs TEXT,
+    avg_drop REAL,
+    score REAL,
+    drills_target INTEGER,
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at BIGINT,
+    UNIQUE(nick, week_start)
+)
+"""
+
+# Снапшот рейтинга Lichess на дату (не чаще раза в день, см. /api/auth/login).
 _RATING_SNAPSHOTS_DDL = """
 CREATE TABLE IF NOT EXISTS {table}(
     "user" TEXT NOT NULL,
@@ -266,6 +289,7 @@ _BIGINT_COLUMNS = (
     ("move_notes", "updated_at"),
     ("theory_cache", "fetched_at"),
     ("reading_attempts", "created_at"),
+    ("plan_snapshots", "created_at"),
 )
 
 
@@ -297,6 +321,7 @@ _SCHEMA = f"""
 {_DAILY_PLAN_DDL.format(table="daily_plan")};
 {_DAILY_LOG_DDL.format(table="daily_log")};
 {_RATING_SNAPSHOTS_DDL.format(table="rating_snapshots")};
+{_PLAN_SNAPSHOTS_DDL.format(table="plan_snapshots")};
 {_READING_ATTEMPTS_DDL.format(table="reading_attempts")};
 CREATE TABLE IF NOT EXISTS sessions(
     token TEXT PRIMARY KEY,
@@ -479,6 +504,25 @@ def _row_to_opening_session(row: Any) -> dict[str, Any]:
     return data
 
 
+def _row_to_plan_snapshot(row: Any) -> dict[str, Any]:
+    """Строка plan_snapshots как dict с раскодированными JSON-полями."""
+    data = dict(row)
+    for key in ("weak_openings", "motifs"):
+        value = _uj(data.get(key))
+        data[key] = value if isinstance(value, list) else []
+    data["window_n"] = _optional_int(data.get("window_n")) or 0
+    data["drills_target"] = _optional_int(data.get("drills_target"))
+    data["version"] = _optional_int(data.get("version")) or 1
+    data["created_at"] = _optional_int(data.get("created_at")) or 0
+    for key in ("avg_drop", "score"):
+        value = data.get(key)
+        try:
+            data[key] = float(value) if value is not None else None
+        except (TypeError, ValueError):
+            data[key] = None
+    return data
+
+
 def _row_to_middlegame_session(row: Any) -> MiddlegameSession:
     """Строка middlegame_sessions как :class:`MiddlegameSession`."""
     data = dict(row)
@@ -593,6 +637,7 @@ def _migrate_v3(path: Path | str) -> None:
         conn.execute(_MOVE_NOTES_DDL.format(table="move_notes"))
         conn.execute(_THEORY_CACHE_DDL.format(table="theory_cache"))
         conn.execute(_READING_ATTEMPTS_DDL.format(table="reading_attempts"))
+        conn.execute(_PLAN_SNAPSHOTS_DDL.format(table="plan_snapshots"))
 
         # analyses раньше игр: пока в нём есть FK на games, пересборка games
         # оставила бы висячую ссылку.
@@ -749,6 +794,7 @@ class Database:
             conn.execute(_MOVE_NOTES_DDL.format(table="move_notes"))
             conn.execute(_THEORY_CACHE_DDL.format(table="theory_cache"))
             conn.execute(_READING_ATTEMPTS_DDL.format(table="reading_attempts"))
+            conn.execute(_PLAN_SNAPSHOTS_DDL.format(table="plan_snapshots"))
             existing = {
                 row["column_name"]
                 for row in conn.execute(
@@ -934,19 +980,51 @@ class Database:
                 analyzed.update(row["game_id"] for row in rows)
         return [game_id for game_id in game_ids if game_id not in analyzed]
 
-    def get_analyzed_games(self, user: str, limit: int = 200, offset: int = 0) -> list[tuple[Game, dict]]:
-        """Пары (Game, analysis_json) только для партий с сохранённым анализом."""
+    def get_analyzed_games(
+        self,
+        user: str,
+        limit: int = 200,
+        offset: int = 0,
+        *,
+        since_ms: int | None = None,
+        until_ms: int | None = None,
+    ) -> list[tuple[Game, dict]]:
+        """Пары (Game, analysis_json) только для партий с сохранённым анализом.
+
+        Отбор — последние ``limit`` партий по ``created_at`` (новейшие
+        первыми; tie-break по ``id DESC`` для детерминизма при равных
+        timestamps). В возвращаемом списке партии идут по возрастанию
+        ``created_at``/``id``, как и раньше, чтобы потребители не видели
+        обратный порядок. ``since_ms``/``until_ms`` — необязательные границы
+        по ``created_at`` в миллисекундах (включительно), для внутреннего
+        контекста; публичный контракт не меняется.
+        """
+        try:
+            resolved_limit = max(0, int(limit))
+        except (TypeError, ValueError):
+            resolved_limit = 200
         try:
             resolved_offset = max(0, int(offset))
         except (TypeError, ValueError):
             resolved_offset = 0
+        clauses = ["LOWER(g.player) = LOWER(?)"]
+        params: list[Any] = [user]
+        if since_ms is not None:
+            clauses.append("g.created_at >= ?")
+            params.append(int(since_ms))
+        if until_ms is not None:
+            clauses.append("g.created_at <= ?")
+            params.append(int(until_ms))
+        where = " AND ".join(clauses)
+        params.extend([resolved_limit, resolved_offset])
         with self._connection() as conn:
             rows = conn.execute(
-                "SELECT g.*, a.analysis_json AS analysis_json "
-                "FROM games g JOIN analyses a ON a.game_id = g.id "
-                "WHERE LOWER(g.player) = LOWER(?) ORDER BY g.created_at ASC, g.id ASC LIMIT ? OFFSET ?",
-                (user, limit, resolved_offset),
+                f"SELECT g.*, a.analysis_json AS analysis_json "
+                f"FROM games g JOIN analyses a ON a.game_id = g.id "
+                f"WHERE {where} ORDER BY g.created_at DESC, g.id DESC LIMIT ? OFFSET ?",
+                params,
             ).fetchall()
+        rows = list(reversed(rows))
         result: list[tuple[Game, dict]] = []
         for row in rows:
             game = _row_to_game(row)
@@ -1661,6 +1739,125 @@ class Database:
             {"date": str(row["date"]), "rating": _optional_int(row["rating"])}
             for row in rows
         ]
+
+    # --- снимки недельного плана ---------------------------------------
+
+    def save_plan_snapshot(self, nick: str, week_start: str, *, window_n: int,
+                           focus_phase: str | None, weak_openings: list,
+                           motifs: list, avg_drop: float | None,
+                           score: float | None, drills_target: int | None,
+                           version: int = 1) -> dict[str, Any]:
+        """Фиксирует снимок плана на неделю ``week_start`` (``YYYY-MM-DD``).
+
+        Идемпотентно и «первое сохранение недели выигрывает»: строка на
+        пару ``(nick, week_start)`` уже есть → существующий снимок не
+        перезаписывается (прошлая неделя не переписывается задним числом).
+
+        Возвращает ``{"created": bool, "snapshot": {...}}``. ``window_n`` —
+        фактическое число партий в окне на момент снимка.
+        """
+        key = (nick or "").strip()
+        week = (week_start or "").strip()
+        if not key:
+            raise ValueError("nick не может быть пустым")
+        _parse_iso_day(week)  # ValueError на мусорной дате
+        try:
+            window = max(0, int(window_n))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("window_n должен быть целым >= 0") from exc
+        created_at = int(time.time() * 1000)
+        payload = (
+            str(uuid.uuid4()),
+            key,
+            week,
+            window,
+            str(focus_phase).strip()[:64] if focus_phase else None,
+            _j(weak_openings if isinstance(weak_openings, list) else []),
+            _j(motifs if isinstance(motifs, list) else []),
+            float(avg_drop) if isinstance(avg_drop, (int, float)) and not isinstance(avg_drop, bool) else None,
+            float(score) if isinstance(score, (int, float)) and not isinstance(score, bool) else None,
+            int(drills_target) if isinstance(drills_target, (int, float)) and not isinstance(drills_target, bool) else None,
+            int(version),
+            created_at,
+        )
+        with self._connection() as conn:
+            cursor = conn.execute(
+                "INSERT INTO plan_snapshots("
+                "id, nick, week_start, window_n, focus_phase, weak_openings, "
+                "motifs, avg_drop, score, drills_target, version, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(nick, week_start) DO NOTHING",
+                payload,
+            )
+            inserted = int(getattr(cursor, "rowcount", 0) or 0) > 0
+        snapshot = self.get_plan_snapshot(key, week)
+        return {"created": inserted, "snapshot": snapshot}
+
+    def get_plan_snapshot(self, nick: str, week_start: str) -> dict[str, Any] | None:
+        """Снимок на неделю ``week_start`` или None (снимка нет)."""
+        key = (nick or "").strip()
+        week = (week_start or "").strip()
+        if not key or not week:
+            return None
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM plan_snapshots WHERE LOWER(nick) = LOWER(?) "
+                "AND week_start = ?",
+                (key, week),
+            ).fetchone()
+        return _row_to_plan_snapshot(row) if row else None
+
+    def get_latest_plan_snapshot(self, nick: str) -> dict[str, Any] | None:
+        """Самый свежий снимок игрока (по week_start, затем created_at)."""
+        key = (nick or "").strip()
+        if not key:
+            return None
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM plan_snapshots WHERE LOWER(nick) = LOWER(?) "
+                "ORDER BY week_start DESC, created_at DESC LIMIT 1",
+                (key,),
+            ).fetchone()
+        return _row_to_plan_snapshot(row) if row else None
+
+    def list_plan_snapshots(self, nick: str, limit: int = 8) -> list[dict[str, Any]]:
+        """Последние снимки игрока (по week_start DESC), не больше ``limit``."""
+        key = (nick or "").strip()
+        if not key:
+            return []
+        try:
+            count = min(52, max(1, int(limit)))
+        except (TypeError, ValueError):
+            count = 8
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM plan_snapshots WHERE LOWER(nick) = LOWER(?) "
+                "ORDER BY week_start DESC, created_at DESC LIMIT ?",
+                (key, count),
+            ).fetchall()
+        return [_row_to_plan_snapshot(row) for row in rows]
+
+    def count_analyzed_games_since(self, nick: str, since_ms: int) -> int:
+        """Сколько анализов игрока сделано не раньше ``since_ms`` (мс).
+
+        «Новые данные» для сверки снимка: повторный анализ старой партии
+        тоже считается — это свежие факты, а не перечитывание кеша.
+        """
+        key = (nick or "").strip()
+        if not key:
+            return 0
+        try:
+            since = int(since_ms)
+        except (TypeError, ValueError):
+            since = 0
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM analyses a "
+                "JOIN games g ON g.id = a.game_id "
+                "WHERE LOWER(g.player) = LOWER(?) AND a.analyzed_at >= ?",
+                (key, since),
+            ).fetchone()
+        return int(row["n"] or 0) if row else 0
 
     # --- кеш теории дебютов ---------------------------------------------
 

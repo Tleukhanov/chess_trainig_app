@@ -10,7 +10,8 @@
 
 from __future__ import annotations
 
-from typing import Any
+import re
+from typing import Any, Iterable
 
 import chess
 
@@ -25,6 +26,9 @@ __all__ = [
     "opening_summary",
     "opening_recommendation",
     "task_text",
+    "FactCheckError",
+    "new_facts",
+    "assert_facts",
 ]
 
 PIECE_RU: dict[int, str] = {
@@ -336,3 +340,212 @@ def task_text(payload: dict[str, Any]) -> str:
     if line:
         parts.append(f"Линия движка: {line}.")
     return " ".join(parts)
+
+
+# --------------------------------------------------------------------------- #
+# Проверка фактов в тексте LLM (assert_facts)
+# --------------------------------------------------------------------------- #
+# Детерминированный контракт: свободный текст НЕ «понимается» семантически.
+# Вместо этого из текста механически извлекаются токены четырёх классов
+# (SAN-ходы, UCI-ходы, числа/проценты/со знаком, коды ECO и названия
+# дебютов) и каждый проверяется на опору в нормализованном facts-объекте.
+# Всё, что не находит опоры, — нарушение; вызывающий код решает, что
+# делать (limited retry → facts-only fallback).
+
+#: Маркировка хода в тексте: «1. e4 e5» и «полуход 4» — служебная нумерация,
+#: а не факты; мелкие целые (0..10) поэтому разрешены всегда.
+_STRUCTURAL_MAX = 10
+
+_SAN_TOKEN = (
+    r"(?:O-O-O|O-O"
+    r"|[KQRBN](?:[a-h][1-8]|[a-h]|[1-8])?x?[a-h][1-8](?:=[QRBN])?[+#]?"
+    r"|[a-h]?x?[a-h][1-8](?:=[QRBN])?[+#]?)"
+)
+_TOKEN_RE = re.compile(
+    r"(?P<percent>[+-]?\d+(?:[.,]\d+)?\s*%)"
+    r"|(?P<mate>#[+-]?\d+)"
+    r"|(?P<uci>(?<![A-Za-z0-9])[a-h][1-8][a-h][1-8][qrbn]?(?![A-Za-z0-9]))"
+    r"|(?P<san>(?<![A-Za-z0-9])" + _SAN_TOKEN + r"(?![A-Za-z0-9]))"
+    r"|(?P<eco>\b[A-Ea-e]\d{2}\b)"
+    r"|(?P<signed>[+-]\d+(?:[.,]\d+)?)"
+    r"|(?P<number>\d+(?:[.,]\d+)?)"
+)
+
+_OPENING_WORD = r"[A-Za-zÀ-ÖØ-öø-ÿ]+(?:['’][A-Za-zÀ-ÖØ-öø-ÿ]+)?"
+_OPENING_SUFFIX = (
+    r"(?:Defense|Defence|Gambit|Opening|Variation|System|Attack"
+    r"|Indian|Fianchetto|Counterattack|Countergambit)"
+)
+_OPENING_RE = re.compile(
+    _OPENING_WORD + r"(?:[ \-]" + _OPENING_WORD + r"){0,4}[ \-]" + _OPENING_SUFFIX
+)
+_STR_NUMBER_RE = re.compile(r"\d+(?:[.,]\d+)?")
+
+_DIGITS_TRANSLATE = str.maketrans({",": "."})
+
+
+class FactCheckError(ValueError):
+    """Текст LLM не опирается на переданные движку/анализу факты.
+
+    ``violations`` — список человекочитаемых причин (для лога и для
+    подсказки при ограниченном повторе запроса). Текст исключения —
+    те же причины одной строкой.
+    """
+
+    def __init__(self, violations: list[str]) -> None:
+        self.violations = list(violations)
+        super().__init__("; ".join(self.violations) or "нет опоры на факты")
+
+
+def _parse_float(text: str) -> float | None:
+    try:
+        return float(text.translate(_DIGITS_TRANSLATE))
+    except ValueError:
+        return None
+
+
+def _norm_san(text: str) -> str:
+    """SAN к каноническому виду: рокировки нулями → буквами, без +/#."""
+    cleaned = str(text).strip().replace("0-0-0", "O-O-O").replace("0-0", "O-O")
+    return cleaned.rstrip("+#")
+
+
+def _norm_opening(text: str) -> str:
+    cleaned = str(text).lower().replace("’", "'")
+    return re.sub(r"[\s\-]+", " ", cleaned).strip()
+
+
+def _num_close(value: float, allowed: Iterable[float]) -> bool:
+    for item in allowed:
+        tolerance = 0.051 if abs(item) < 10 else 0.5
+        if abs(value - item) <= tolerance:
+            return True
+    return False
+
+
+def _strings_numbers(strings: Iterable[str]) -> list[float]:
+    numbers: list[float] = []
+    for raw in strings:
+        for token in _STR_NUMBER_RE.findall(str(raw)):
+            value = _parse_float(token)
+            if value is not None:
+                numbers.append(abs(value))
+    return numbers
+
+
+def new_facts(
+    *,
+    sans: Iterable[str] = (),
+    ucis: Iterable[str] = (),
+    numbers: Iterable[float] = (),
+    signed: Iterable[float] = (),
+    mates: Iterable[int] = (),
+    openings: Iterable[str] = (),
+    ecos: Iterable[str] = (),
+    strings: Iterable[str] = (),
+    max_ply: int | None = None,
+) -> dict[str, Any]:
+    """Нормализованный facts-объект для :func:`assert_facts`.
+
+    ``numbers`` — допустимые абсолютные значения чисел (оценки, потери,
+    проценты, счётчики). Числа из ``strings`` (название дебюта, источник,
+    заметки игрока) тоже считаются опорой. ``signed`` — допустимые
+    знаковые значения (оценки в пешках, знак важен). ``mates`` —
+    допустимые маты (по модулю). ``max_ply`` — потолок целых как
+    нумерации полуходов/ходов.
+    """
+    allowed_numbers = [abs(float(n)) for n in numbers if n is not None]
+    allowed_strings = [str(s) for s in strings if str(s).strip()]
+    allowed_numbers += _strings_numbers(allowed_strings)
+    return {
+        "sans": {_norm_san(s) for s in sans if str(s).strip()},
+        "ucis": {str(u).strip().lower() for u in ucis if str(u).strip()},
+        "numbers": allowed_numbers,
+        "signed": [float(s) for s in signed if s is not None],
+        "mates": [abs(int(m)) for m in mates if m is not None],
+        "openings": [_norm_opening(o) for o in openings if str(o).strip()],
+        "ecos": [str(e).strip().upper() for e in ecos if str(e).strip()],
+        "strings": allowed_strings,
+        "max_ply": int(max_ply) if isinstance(max_ply, int) and max_ply > 0 else None,
+    }
+
+
+def assert_facts(output: str, facts: dict[str, Any]) -> None:
+    """Проверяет текст LLM на опору в ``facts``; иначе :class:`FactCheckError`.
+
+    Проверяется только механически извлекаемое: числа/проценты/знаковые
+    оценки, SAN/UCI-ходы, коды ECO и названия дебютов. Свободный текст
+    «не понимается»: если в нём нет токенов этих классов, он считается
+    допустимым. Пустой текст — нарушение.
+    """
+    facts = facts or {}
+    allowed_sans = facts.get("sans") or set()
+    allowed_ucis = facts.get("ucis") or set()
+    allowed_numbers = facts.get("numbers") or []
+    allowed_signed = facts.get("signed") or []
+    allowed_mates = facts.get("mates") or []
+    allowed_openings = facts.get("openings") or []
+    allowed_ecos = facts.get("ecos") or []
+    max_ply = facts.get("max_ply")
+
+    violations: list[str] = []
+    text = output if isinstance(output, str) else str(output or "")
+    if not text.strip():
+        raise FactCheckError(["пустой ответ"])
+    text = text.replace("0-0-0", "O-O-O").replace("0-0", "O-O")
+
+    for match in _TOKEN_RE.finditer(text):
+        kind = match.lastgroup
+        token = match.group()
+        if kind == "percent":
+            value = _parse_float(token.replace("%", "").replace(" ", ""))
+            if value is None or not _num_close(abs(value), allowed_numbers):
+                violations.append(f"неподтверждённый процент {token.strip()}")
+        elif kind == "mate":
+            value = _parse_float(token.lstrip("#+-"))
+            if value is None or int(abs(value)) not in allowed_mates:
+                violations.append(f"неподтверждённый мат {token}")
+        elif kind == "uci":
+            if token.lower() not in allowed_ucis:
+                violations.append(f"неподтверждённый UCI {token}")
+        elif kind == "san":
+            if _norm_san(token) not in allowed_sans:
+                violations.append(f"неподтверждённый ход {token}")
+        elif kind == "eco":
+            if token.upper() not in allowed_ecos:
+                violations.append(f"неподтверждённый код ECO {token}")
+        elif kind == "signed":
+            value = _parse_float(token)
+            if value is None or not _num_close(value, allowed_signed):
+                violations.append(f"неподтверждённая оценка {token}")
+        elif kind == "number":
+            value = _parse_float(token)
+            if value is None:
+                violations.append(f"непосильная для разбора цифра {token}")
+                continue
+            magnitude = abs(value)
+            if magnitude <= _STRUCTURAL_MAX:
+                continue
+            if magnitude.is_integer() and max_ply and magnitude <= max_ply:
+                continue
+            if not _num_close(magnitude, allowed_numbers):
+                violations.append(f"неподтверждённое число {token}")
+
+    for match in _OPENING_RE.finditer(text):
+        candidate = _norm_opening(match.group())
+        if not allowed_openings:
+            violations.append(f"неподтверждённое название дебюта {match.group()}")
+            continue
+        supported = any(
+            candidate == opening
+            or candidate in opening
+            or opening in candidate
+            for opening in allowed_openings
+        )
+        if not supported:
+            violations.append(f"неподтверждённое название дебюта {match.group()}")
+
+    # Одинаковые нарушения схлопываем, порядок сохраняем (детерминированно).
+    unique = list(dict.fromkeys(violations))
+    if unique:
+        raise FactCheckError(unique)

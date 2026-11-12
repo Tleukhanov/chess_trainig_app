@@ -39,7 +39,7 @@ from . import middlegame as mg
 from . import reading
 from . import theory
 from . import timeutil
-from .analyzer import Engine, win_percent
+from .analyzer import Engine, analysis_needs_refresh, win_percent
 from .coach import _extract_json, build_request, run_coach
 from .config import settings
 from .dayplan import build_tasks
@@ -59,7 +59,13 @@ from .intent_review import intent_cache_key, review_intents
 from .review import repeated_mistakes
 from .llm import ChatMessage, LLMClient, _is_local_host, clean_llm_text, looks_like_refusal, looks_like_thinking
 from .maia import MaiaLitePolicy
-from .mentor import build_mentor_request, format_mentor_reply, run_mentor
+from .mentor import (
+    build_mentor_facts,
+    build_mentor_request,
+    format_mentor_reply,
+    mentor_facts_brief,
+    run_mentor,
+)
 from .metrics import metric
 from .mistakes import cause_label, classify_cause, explain_cause
 from .opponent import build_confrontations, build_opponent_profile
@@ -85,9 +91,18 @@ from .patterns import analyze_user_moves, phase
 from .review_moves import badge_for, badge_label, detect_sacrifice
 from .pgn_import import MAX_PGN_BYTES, parse_pgn_games
 from .plan import build_plan
-from .progress import build_progress
+from .progress import (
+    build_progress,
+    monday_of_week,
+    snapshot_delta,
+    summarize_recent,
+    MIN_NEW_GAMES,
+    MIN_SNAPSHOT_AGE_DAYS,
+    SNAPSHOT_CAVEAT,
+    SNAPSHOT_VERSION,
+)
 from .opening_book import build_opening_book
-from .repertoire import Repertoire, opening_stats
+from .repertoire import Repertoire, is_weak_opening, opening_stats
 from .report import build_report
 
 # --- job registry ----------------------------------------------------------
@@ -556,20 +571,35 @@ def _player_name(player: dict | None) -> str:
     return str(name) if name else "—"
 
 
-def _review_entry(game, analysis, idx, moments: dict, summary: str | None) -> dict:
-    """Формирует запись «Одна партия» для разбора (поля как в CLI-выводе)."""
+def _review_entry(
+    game,
+    analysis,
+    idx,
+    moments: dict,
+    summary: str | None,
+    meta: dict[str, Any] | None = None,
+) -> dict:
+    """Формирует запись «Одна партия» для разбора (поля как в CLI-выводе).
+
+    ``meta`` — ``meta`` из :func:`app.coach.run_coach`: по нему моментам
+    и summary проставляется ``text_source``/``summary_source`` (``"llm"`` |
+    ``"facts"``), чтобы UI различал проверенную прозу модели и факты.
+    """
     moves = analysis.get("moves") or []
+    sources = (meta or {}).get("moments_source") or {}
     entry_moments = []
     for ply in idx:
         move = moves[ply] if ply < len(moves) else {}
         drop = move.get("drop")
+        text = moments.get(ply)
         entry_moments.append(
             {
                 "ply": ply + 1,
                 "san": move.get("san"),
                 "classification": move.get("classification"),
                 "drop": drop if isinstance(drop, (int, float)) else None,
-                "text": moments.get(ply),
+                "text": text,
+                "text_source": sources.get(ply, "llm") if text else None,
             }
         )
     return {
@@ -581,6 +611,7 @@ def _review_entry(game, analysis, idx, moments: dict, summary: str | None) -> di
         "avg_win_loss": metric(analysis, "avg_win_loss", default=None),
         "moments": entry_moments,
         "summary": summary,
+        "summary_source": (meta or {}).get("summary_source"),
     }
 
 
@@ -595,14 +626,25 @@ def _run_review_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None
 
         job.phase = "Разбор партий"
         llm = None
-        if not params["dry_run"]:
-            _ensure_llm_key()
-            llm = LLMClient()
+        llm_error: str | None = None
+        level = None
+        try:
+            if not params["dry_run"]:
+                _ensure_llm_key()
+                llm = LLMClient()
+        except Exception as exc:  # LLM недоступен — facts-only разбор
+            logger.info("review: LLM недоступен, показываю факты: %s", exc)
+            llm_error = str(exc)
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            level = _plan_player_level(db, job.user)
 
         games = []
         prompts = []
         for game, analysis in pairs:
-            messages, idx = build_request(game, analysis, params["moments"])
+            messages, idx = build_request(
+                game, analysis, params["moments"], level=level
+            )
             if not messages:
                 continue
             if params["dry_run"]:
@@ -612,15 +654,15 @@ def _run_review_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None
                 )
                 games.append(_review_entry(game, analysis, idx, {}, None))
                 continue
-            moments, summary = run_coach(
-                game, analysis, llm, max_moments=params["moments"]
+            moments, summary, meta = run_coach(
+                game, analysis, llm, max_moments=params["moments"], level=level
             )
             moments = {
                 ply: clean_llm_text(text) for ply, text in moments.items()
             }
             if summary:
                 summary = clean_llm_text(summary)
-            games.append(_review_entry(game, analysis, idx, moments, summary))
+            games.append(_review_entry(game, analysis, idx, moments, summary, meta))
 
         job.result = {"games": games}
         if params["dry_run"]:
@@ -628,7 +670,14 @@ def _run_review_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None
             job.result["prompts"] = prompts
             job.summary = f"Промптов собрано: {len(prompts)} для {len(games)} партий"
         else:
-            job.summary = f"Разобрано партий: {len(games)}"
+            if llm_error:
+                job.result["llm_error"] = llm_error
+                job.summary = (
+                    f"Разобрано партий: {len(games)} "
+                    "(LLM недоступен — показаны факты движка)"
+                )
+            else:
+                job.summary = f"Разобрано партий: {len(games)}"
         job.status = "done"
     except Exception as exc:
         job.status = "error"
@@ -647,6 +696,9 @@ def _run_mentor_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None
 
         job.phase = "Сборка плана"
         humanity_path = shared_data.humanity_path(nick, root=app.state.data_dir)
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            level = _plan_player_level(db, nick)
         plan_report = build_plan(
             pairs,
             user=nick,
@@ -674,6 +726,7 @@ def _run_mentor_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None
             plan_report,
             extra=params.get("notes") or "",
             progress=progress_report,
+            level=level,
         )
 
         if params["dry_run"]:
@@ -686,16 +739,39 @@ def _run_mentor_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None
             job.summary = "Mentor: собраны промпты без вызова LLM"
         else:
             job.phase = "Ответ тренера"
-            _ensure_llm_key()
-            llm = LLMClient()
-            reply = run_mentor(llm, request)
+            facts = build_mentor_facts(plan_report, progress_report)
+            brief = mentor_facts_brief(plan_report, progress_report)
+            facts_only = False
+            llm_error: str | None = None
+            model: str | None = None
+            try:
+                _ensure_llm_key()
+                llm = LLMClient()
+                model = llm.model
+                reply, meta = run_mentor(llm, request, facts=facts, brief=brief)
+                if meta.get("source") != "llm":
+                    facts_only = True
+                    model = None
+                    llm_error = meta.get("error") or "ответ модели не прошёл проверку фактов"
+            except Exception as exc:  # LLM недоступен — recoverable facts-only
+                logger.info("mentor: LLM недоступен, показываю факты: %s", exc)
+                facts_only = True
+                reply = brief
+                model = None
+                llm_error = str(exc)
             job.result = {
                 "user": plan_report.get("user"),
-                "model": llm.model,
+                "model": model,
                 "notes": params.get("notes") or "",
                 "reply": format_mentor_reply(clean_llm_text(reply)),
+                "facts_only": facts_only,
+                "llm_error": llm_error,
             }
-            job.summary = f"План тренера по {plan_report.get('games', 0)} партиям"
+            job.summary = (
+                f"План тренера по {plan_report.get('games', 0)} партиям (по фактам движка)"
+                if facts_only
+                else f"План тренера по {plan_report.get('games', 0)} партиям"
+            )
         job.status = "done"
     except Exception as exc:
         job.status = "error"
@@ -705,14 +781,27 @@ def _run_mentor_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None
 
 
 def _run_task_explain_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None:
-    """Фоновый поток: LLM-объяснение «Задачи дня» → таблица task_explanations."""
+    """Фоновый поток: LLM-объяснение «Задачи дня» → таблица task_explanations.
+
+    LLM опционален: при недоступности/невалидном ответе задача не падает —
+    job завершается ``done`` с ``facts_only: true`` и ``explanation: null``,
+    а UI показывает facts-only разбор задачи (``explanation_facts``).
+    """
     try:
-        _ensure_llm_key()
         payload = params["payload"]
         job.phase = "Объяснение задачи"
-        text = _task_explain_llm(payload)
-        if not text:
-            raise RuntimeError("LLM вернул пустое объяснение")
+        try:
+            _ensure_llm_key()
+            text = _task_explain_llm(payload)
+            if not text:
+                raise RuntimeError("LLM вернул пустое объяснение")
+        except Exception as exc:  # LLM недоступен — recoverable facts-only
+            logger.info("task explain: LLM недоступен, показываю факты: %s", exc)
+            job.result = {"explanation": None, "facts_only": True, "reason": str(exc)}
+            job.summary = "LLM недоступен — показан разбор по фактам движка"
+            job.status = "done"
+            job.finished = time.time()
+            return
         with Database(app.state.db_path) as db:
             db.init_db()
             db.save_task_explanation(
@@ -722,7 +811,7 @@ def _run_task_explain_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -
                 payload["ply"],
                 text,
             )
-        job.result = {"explanation": text}
+        job.result = {"explanation": text, "facts_only": False}
         job.summary = "Объяснение задачи готово"
         job.status = "done"
     except Exception as exc:
@@ -804,6 +893,20 @@ class DayPlanToggleBody(BaseModel):
     date: str
     task_id: str
     done: bool = True
+
+
+class ReportRefreshBody(BaseModel):
+    """Тело POST /api/report/refresh: явное подтверждение и отбор партий.
+
+    ``confirm`` обязателен: обновление пересобирает анализы заново
+    (Stockfish, время пропорционально числу партий). ``game_ids`` — точный
+    список партий (только свои проанализированные); отсутствие списка —
+    все устаревшие анализы. ``limit`` — потолок партий за один вызов.
+    """
+
+    confirm: bool = False
+    game_ids: list[str] | None = None
+    limit: int = 10
 
 
 # --- Шахматные утилиты: свободный разбор позиции (stateless) -----------------
@@ -1037,26 +1140,30 @@ def _opening_resolve_elos(
     return int(my_elo), int(opp_elo)
 
 
-_OPENING_REPORT_SYSTEM = """Ты — шахматный тренер по дебюту для сильного любителя. Говори по-русски, коротко и конкретно.
-Опирайся ТОЛЬКО на переданные факты: ходы дебюта, оценки win%, классификации и лучшие ходы движка. НЕ выдумывай варианты, угрозы и оценки, которых нет в данных.
-Ответь строго одним JSON-объектом такой структуры:
-{
-  "summary": "краткий обзор: вышел ли ты из дебюта нормально (2-3 предложения)",
-  "opening": "название дебюта",
-  "moments": [
-    {"ply": <номер полухода>, "san": "<ход>", "kind": "good|better|bad", "text": "почему", "better": "<лучший ход или —>"}
-  ],
-  "opponent": "как играл соперник в заданном стиле (1-2 предложения)",
-  "recommendation": "что тренировать и по репертуару (1-2 предложения)"
-}
-В "moments" — ТОЛЬКО твои неточности, ошибки и зевки (classification inaccuracy/mistake/blunder), 1-4 штуки. НЕ включай хорошие и лучшие ходы. Поле "better" бери строго из фактов движка. В "text" — одно конкретное предложение: какой ресурс/угроза/план упущен, без повторения цифр. Если ошибок нет — "moments": []. Только русский язык, без английского и без разбора по шагам."""
-
-
-def _opening_fmt_win(value: Any) -> str:
-    """Форматирует win% одним знаком или '—' для None/нечисла."""
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        return "—"
-    return f"{float(value):.1f}"
+def _theory_ideas_facts(line: list[Any]) -> dict[str, Any]:
+    """Facts-объект для идей теории: ходы линии и статистика Explorer."""
+    sans: list[str] = []
+    numbers: list[float] = []
+    for item in line or []:
+        if isinstance(item, str):
+            item = {"san": item}
+        if not isinstance(item, dict):
+            continue
+        san = item.get("san")
+        if san:
+            sans.append(str(san))
+        for key in ("games", "white", "draws", "black"):
+            value = item.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                numbers.append(float(value))
+    name, eco = classify_opening(sans)
+    return facttext.new_facts(
+        sans=sans,
+        numbers=numbers,
+        openings=[name] if name else (),
+        ecos=[eco] if eco else (),
+        strings=[s for s in (name, eco) if s],
+    )
 
 
 def _opening_user_entries(
@@ -1183,37 +1290,6 @@ def _deepen_opening_errors(
             engine.__exit__(None, None, None)
 
 
-def _opening_analyze_messages(entry: dict[str, Any]) -> list[ChatMessage]:
-    """Промпт LLM-отчёта по дебюту: факты построчно + требование JSON."""
-    lines = [
-        f"Дебют: {entry['opening_name'] or '—'} ({entry['eco'] or '—'}).",
-        f"Ты играл за {entry['color_ru']}; соперник — человеко-подобный стиль "
-        f"«{entry['style_label']}» ({entry['style_desc']}).",
-        f"Рейтинги: ты ~{entry['my_elo']}, соперник "
-        f"{'Maia+ (гибрид, ~2200-2400)' if entry['opp_elo'] == -1 else '~' + str(entry['opp_elo'])}. "
-        f"Сыграно полуходов: {entry['plies']}.",
-        "Ходы дебюта: " + (" ".join(entry["moves"]) or "—"),
-        "",
-        "Твои ходы (полуход, ход, win% до→после, потеря, классификация, лучший ход):",
-    ]
-    if entry["user_entries"]:
-        for item in entry["user_entries"]:
-            lines.append(
-                f"- {item['ply']}. {item['san']} — "
-                f"{_opening_fmt_win(item['win_before'])}→{_opening_fmt_win(item['win_after'])}, "
-                f"потеря {_opening_fmt_win(item['drop'])} ({item['classification'] or '—'}), "
-                f"лучше: {item['best'] or '—'}"
-            )
-    else:
-        lines.append("- (нет данных движка по ходам пользователя)")
-    lines.append("")
-    lines.append("Ответ — только JSON по заданной структуре.")
-    return [
-        ChatMessage("system", _OPENING_REPORT_SYSTEM),
-        ChatMessage("user", "\n".join(lines)),
-    ]
-
-
 def _normalize_opening_moments(
     raw: Any, fallback_entries: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -1317,6 +1393,7 @@ def _llm_json_with_retries(
     error_prefix: str,
     temperature: float = 0.4,
     max_tokens: int | None = None,
+    validator: Any | None = None,
 ) -> dict[str, Any]:
     """JSON-ответ LLM с тремя попытками.
 
@@ -1324,6 +1401,10 @@ def _llm_json_with_retries(
     возвращают пустоту (``finish_reason=length``), а отключение reasoning у
     провайдера тоже может не сработать. Порядок: обычный запрос → без reasoning
     → снова обычный с жёстким запретом текста вокруг JSON.
+
+    ``validator`` — необязательный callable(dict) -> None; любое исключение
+    от него трактуется как неудачная попытка (с подсказкой в следующей),
+    после трёх неудач — ``RuntimeError`` с префиксом ``error_prefix``.
     """
     llm = LLMClient()
     user_hint = "\nБез пошагового разбора. Сразу один JSON-объект."
@@ -1344,7 +1425,12 @@ def _llm_json_with_retries(
         ),
     ]
     last_error: RuntimeError | None = None
+    violation_hint = ""
     for attempt_messages, kwargs in attempts:
+        if violation_hint:
+            attempt_messages = attempt_messages[:-1] + [
+                ChatMessage("user", attempt_messages[-1].content + violation_hint)
+            ]
         try:
             text = clean_llm_text(
                 llm.chat(
@@ -1358,20 +1444,21 @@ def _llm_json_with_retries(
             data = _extract_json(text) if isinstance(text, str) else None
         except RuntimeError as exc:
             last_error = exc
+            violation_hint = ""
             continue
+        if isinstance(data, dict) and validator is not None:
+            try:
+                validator(data)
+            except ValueError as exc:
+                last_error = RuntimeError(f"ответ модели не прошёл проверку фактов: {exc}")
+                violation_hint = _violations_hint(
+                    [str(exc)] if str(exc) else ["ответ без опоры на факты"]
+                )
+                continue
         if isinstance(data, dict):
             return data
     detail = f" (последняя ошибка: {last_error})" if last_error else ""
     raise RuntimeError(f"{error_prefix}: 3 попытки не дали JSON{detail}")
-
-
-def _opening_report_llm(entry: dict[str, Any]) -> dict[str, Any]:
-    """LLM-отчёт по дебюту как JSON-словарь (3 попытки, см. хелпер)."""
-    return _llm_json_with_retries(
-        _opening_analyze_messages(entry),
-        error_prefix="LLM не вернул JSON-отчёт по дебюту",
-        max_tokens=_REPORT_MAX_TOKENS,
-    )
 
 
 def _build_opening_report(
@@ -1704,47 +1791,20 @@ def _ensure_worst_moment(
     return report
 
 
-def _middlegame_fact_text(
-    engine_facts: list[dict[str, Any]], session: mg.MiddlegameSession
-) -> tuple[str, str]:
-    """Фактический разбор плана и урок: только ходы игрока и линии движка."""
-    user_is_white = session.side == "white"
-    errors = [
-        fact
-        for fact in engine_facts
-        if isinstance(fact, dict)
-        and ((int(fact.get("ply", 0)) % 2 == 1) == user_is_white)
-        and float(fact.get("delta") or 0) >= 5
-    ]
-    if not errors:
-        return "Ошибок с потерей ≥5% win по движку нет.", "Движок не видит потерь в этой партии."
-    errors.sort(key=lambda fact: int(fact.get("ply") or 0))
-    parts = []
-    for fact in errors[:4]:
-        line = " ".join(str(move) for move in (fact.get("pv") or [])[:4])
-        parts.append(
-            f"{fact.get('san')} — потеря {float(fact.get('delta') or 0):.1f}%, "
-            f"лучше {fact.get('best_san') or '—'}"
-            + (f" ({line})" if line else "")
-        )
-    worst = max(errors, key=lambda fact: float(fact.get("delta") or 0))
-    worst_line = " ".join(str(move) for move in (worst.get("pv") or [])[:4])
-    lesson = (
-        f"Главный ресурс по движку — {worst.get('best_san') or '—'}"
-        + (f": {worst_line}" if worst_line else "")
-        + "."
-    )
-    return "; ".join(parts) + ".", lesson
+def _middlegame_report_llm(prompt: str, validator: Any | None = None) -> dict[str, Any]:
+    """LLM-отчёт по миттельшпилю (3 попытки, см. хелпер).
 
-
-def _middlegame_report_llm(prompt: str) -> dict[str, Any]:
-    """LLM-отчёт по миттельшпилю (3 попытки, см. хелпер)."""
+    ``validator`` — необязательный callable(dict); при неуспехе — повторы
+    с подсказкой, после трёх неудач RuntimeError (вызывающий код
+    откатится на facts-only отчёт).
+    """
     _ensure_llm_key()
     return _llm_json_with_retries(
         [ChatMessage("user", prompt)],
         error_prefix="LLM не вернул JSON-отчёт по миттельшпилю",
         temperature=0.3,
         max_tokens=_REPORT_MAX_TOKENS,
+        validator=validator,
     )
 
 
@@ -1772,20 +1832,54 @@ def _run_middlegame_analyze_job(
 
         job.phase = "Отчёт тренера"
         _persist_job(app.state.db_path, job, session_id=session_id)
+        position_obj = mg.POSITION_BY_KEY.get(session.position_key)
+        user_is_white = session.side == "white"
+        facts_for_llm = mg.build_report_facts(session, engine_facts, position_obj)
+
+        def _validate_summary(data: dict[str, Any]) -> None:
+            summary = data.get("summary") if isinstance(data, dict) else None
+            if isinstance(summary, str) and summary.strip():
+                facttext.assert_facts(summary.strip(), facts_for_llm)
+
         prompt = mg.build_report_prompt(
             session,
             engine_facts=engine_facts,
-            position=mg.POSITION_BY_KEY.get(session.position_key),
+            position=position_obj,
         )
-        report = mg.ground_report(
-            mg.normalize_report(_middlegame_report_llm(prompt)),
-            engine_facts,
-            fen=session.fen,
-            moves=list(session.moves),
-        )
-        report = _ensure_worst_moment(report, session, engine_facts)
+        plan_comment, lesson = mg.facts_plan_comment(engine_facts, user_is_white)
+        facts_only = False
+        summary_kind = "llm_opinion"
+        llm_error: str | None = None
+        try:
+            report = mg.ground_report(
+                mg.normalize_report(
+                    _middlegame_report_llm(prompt, validator=_validate_summary)
+                ),
+                engine_facts,
+                fen=session.fen,
+                moves=list(session.moves),
+            )
+            report = _ensure_worst_moment(report, session, engine_facts)
+        except Exception as exc:  # LLM недоступен — recoverable facts-only
+            logger.info("middlegame: LLM недоступен, показываю факты: %s", exc)
+            report = mg.build_facts_report(session, engine_facts, position_obj)
+            facts_only = True
+            summary_kind = "engine_facts"
+            llm_error = str(exc)
+        if not (isinstance(report.get("summary"), str) and report["summary"].strip()) \
+                or report.get("summary") == "Итог не сформирован.":
+            # Пустой/дефолтный summary модели — заменяем фактами движка.
+            facts_report = mg.build_facts_report(session, engine_facts, position_obj)
+            report["summary"] = facts_report["summary"]
+            summary_kind = "engine_facts"
+        # Вердикт — только от движка: LLM в этом поле не участвует.
+        report["verdict"] = mg.engine_verdict(engine_facts, user_is_white)
+        report["verdict_source"] = "engine"
+        report["facts_only"] = facts_only
+        report["summary_kind"] = summary_kind
+        if llm_error:
+            report["llm_error"] = llm_error
         # Комментарий к плану и урок — только факты, без «активизируй фигуры».
-        plan_comment, lesson = _middlegame_fact_text(engine_facts, session)
         report["plan_comment"] = plan_comment
         report["lesson"] = lesson
 
@@ -1796,7 +1890,11 @@ def _run_middlegame_analyze_job(
             fresh.status = "analyzed"
             db.update_middlegame_session(fresh)
         job.result = {"report": report}
-        job.summary = f"Отчёт по миттельшпилю готов ({len(moves)} полуходов)"
+        job.summary = (
+            f"Отчёт по миттельшпилю готов ({len(moves)} полуходов, факты движка)"
+            if facts_only
+            else f"Отчёт по миттельшпилю готов ({len(moves)} полуходов)"
+        )
         job.status = "done"
         _persist_job(app.state.db_path, job, session_id=session_id)
     except Exception as exc:
@@ -1815,6 +1913,8 @@ def _run_middlegame_analyze_job(
 _SESSION_COOKIE = "ct_session"
 _SESSION_DAYS = 30
 _SESSION_MAX_AGE = _SESSION_DAYS * 24 * 3600
+# Минимальная длина НОВОГО пароля (регистрация и смена пароля).
+PASSWORD_MIN_LENGTH = 8
 
 
 def _is_active_record(rec: dict | None) -> bool:
@@ -1901,6 +2001,75 @@ def _set_session_cookie(
     )
 
 
+# --- Rate-limit логина ------------------------------------------------------
+# Счётчики неудачных попыток хранятся в meta-таблице приложения (та же БД,
+# что и всё состояние: SQLite data/trainer.db или PostgreSQL по
+# DATABASE_URL), а не в памяти процесса — лимит переживает рестарт и общий
+# для всех процессов, работающих с одной базой. Если несколько процессов
+# работают с РАЗНЫМИ SQLite-файлами, лимит действует в пределах каждого
+# файла — запускайте один процесс на базу или вынесите БД в PostgreSQL.
+# IP берём из соединения (request.client.host); за reverse proxy он будет
+# IP прокси, поэтому пороги (LOGIN_RATE_MAX_ATTEMPTS/LOGIN_RATE_WINDOW_SEC)
+# надо выбирать с учётом этого.
+
+
+def _login_rate_keys(request: Request, login: str) -> tuple[str, str]:
+    """Ключи meta: по IP соединения и по sha256(логина)."""
+    client = getattr(request, "client", None)
+    ip = (client.host if client and client.host else "unknown").strip() or "unknown"
+    ip_key = f"login_fail_ip:{ip}"
+    digest = hashlib.sha256((login or "").strip().lower().encode("utf-8")).hexdigest()
+    id_key = f"login_fail_id:{digest[:32]}"
+    return ip_key, id_key
+
+
+def _login_rate_state(db: Database, key: str, now: float) -> dict[str, float] | None:
+    """Состояние счётчика {count, window_start}; протухшее окно → None."""
+    raw = db.get_meta(key)
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        count = float(data["count"])
+        window_start = float(data["window_start"])
+    except (TypeError, ValueError, KeyError):
+        return None
+    if window_start <= 0 or now - window_start >= settings.login_rate_window_sec:
+        return None
+    return {"count": count, "window_start": window_start}
+
+
+def _login_rate_blocked(db: Database, keys: tuple[str, str], now: float) -> bool:
+    """True, если по любому из ключей исчерпан лимит за текущее окно."""
+    limit = max(1, int(settings.login_rate_max_attempts))
+    for key in keys:
+        state = _login_rate_state(db, key, now)
+        if state is not None and state["count"] >= limit:
+            return True
+    return False
+
+
+def _login_rate_record_failure(db: Database, keys: tuple[str, str], now: float) -> None:
+    """Регистрирует неудачную попытку: новое окно или инкремент текущего."""
+    for key in keys:
+        state = _login_rate_state(db, key, now)
+        if state is None:
+            payload = {"count": 1, "window_start": now}
+        else:
+            payload = {
+                "count": state["count"] + 1,
+                "window_start": state["window_start"],
+            }
+        db.set_meta(key, json.dumps(payload))
+
+
+def _login_rate_clear(db: Database, keys: tuple[str, str]) -> None:
+    """Успешный вход: счётчики по IP и логину удаляются."""
+    with db._connection() as conn:
+        for key in keys:
+            conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+
+
 def _call_data(fn, db_path: Path):
     """Вызывает слой данных; RuntimeError («нет партий») → HTTP 404.
 
@@ -1963,6 +2132,176 @@ def _task_done_key(date: str, user: str) -> str:
     return f"daily_done_{date}_{user}"
 
 
+_TASK_REPEAT_WINDOW_DAYS_DEFAULT = 7
+_TASK_HISTORY_CAP = 500
+_TASK_RECENCY_HALF_LIFE_DAYS = 30.0
+
+
+def _task_history_key(user: str) -> str:
+    """Ключ meta: история попыток задач игрока (JSON-список, новые в конце)."""
+    return f"task_history_{(user or '').strip()}"
+
+
+def _task_repeat_window_days() -> int:
+    """K-дневное окно подавления решённых позиций (0 — отключить).
+
+    Задаётся переменной окружения ``TASK_REPEAT_WINDOW_DAYS``; по умолчанию
+    7 дней. Значения вне 0..365 зажимаются.
+    """
+    raw = os.environ.get("TASK_REPEAT_WINDOW_DAYS", "").strip()
+    if not raw:
+        return _TASK_REPEAT_WINDOW_DAYS_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError:
+        return _TASK_REPEAT_WINDOW_DAYS_DEFAULT
+    return max(0, min(365, value))
+
+
+def _load_task_history(db: Database, user: str) -> list[dict[str, Any]]:
+    """История попыток из meta; битые данные → пустая история, не падаем."""
+    raw = db.get_meta(_task_history_key(user))
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+    history: list[dict[str, Any]] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        task_key = item.get("task_key")
+        date = item.get("date")
+        if not isinstance(task_key, str) or not task_key:
+            continue
+        if not isinstance(date, str) or not date:
+            continue
+        try:
+            attempt = int(item.get("attempt") or 0)
+            ts = int(item.get("ts") or 0)
+        except (TypeError, ValueError):
+            attempt, ts = 0, 0
+        history.append(
+            {
+                "task_key": task_key,
+                "date": date,
+                "correct": bool(item.get("correct")),
+                "attempt": attempt,
+                "ts": ts,
+            }
+        )
+    return history
+
+
+def _record_task_attempt(
+    db: Database, user: str, task_key: str, date: str, correct: bool
+) -> int:
+    """Записывает попытку по задаче; возвращает её номер (1 — первая).
+
+    История per-position: номер попытки копится по ``task_key`` и не
+    сбрасывается ежедневно. Список в meta ограничен последними
+    ``_TASK_HISTORY_CAP`` записями — старые попытки очищаются, чтобы
+    конфиг не разрастался.
+    """
+    history = _load_task_history(db, user)
+    prior = [
+        int(item.get("attempt") or 0)
+        for item in history
+        if item["task_key"] == task_key
+    ]
+    attempt = 1 + (max(prior) if prior else 0)
+    history.append(
+        {
+            "task_key": task_key,
+            "date": date,
+            "correct": bool(correct),
+            "attempt": attempt,
+            "ts": int(time.time() * 1000),
+        }
+    )
+    if len(history) > _TASK_HISTORY_CAP:
+        history = history[-_TASK_HISTORY_CAP:]
+    db.set_meta(_task_history_key(user), json.dumps(history, ensure_ascii=False))
+    return attempt
+
+
+def _solve_suppress_cutoff(today: str, window_days: int) -> str | None:
+    """ISO-дата, строго старше которой решения ещё подавляются; None — выкл."""
+    if window_days <= 0:
+        return None
+    try:
+        day = datetime.date.fromisoformat(today) - datetime.timedelta(days=window_days)
+    except ValueError:
+        return None
+    return day.isoformat()
+
+
+def _suppressed_task_keys(
+    history: list[dict[str, Any]], today: str, window_days: int
+) -> set[str]:
+    """Ключи задач, решённых (correct) внутри окна последних K дней.
+
+    Подавление касается только верно решённых позиций: неверные ответы
+    не прячут позицию. ``date`` — ISO ``YYYY-MM-DD``, строки сравнимы лексикографически.
+    """
+    cutoff = _solve_suppress_cutoff(today, window_days)
+    if cutoff is None:
+        return set()
+    suppressed: set[str] = set()
+    for item in history:
+        if not item.get("correct"):
+            continue
+        if str(item.get("date") or "") > cutoff:
+            suppressed.add(item["task_key"])
+    return suppressed
+
+
+def _task_weight(item: dict[str, Any], now_ms: float | None = None) -> float:
+    """Вес кандидата в задачу дня: чем свежее партия и грубее ошибка, тем выше.
+
+    Recency задаётся half-life 30 дней; ``drop`` — множителем 1..100.
+    Старые/незначительные ошибки получают низкий, но не нулевой вес.
+    """
+    if now_ms is None:
+        now_ms = time.time() * 1000
+    move = item.get("move") if isinstance(item.get("move"), dict) else {}
+    drop_raw = move.get("drop")
+    try:
+        drop = float(drop_raw)
+    except (TypeError, ValueError):
+        drop = 5.0
+    drop = min(max(drop, 1.0), 100.0)
+    created = item.get("created_at") or 0
+    try:
+        created = float(created)
+    except (TypeError, ValueError):
+        created = 0.0
+    if created <= 0:
+        age_days = 3650.0
+    else:
+        age_days = max(0.0, (now_ms - created) / 86_400_000.0)
+    recency = 0.5 ** (age_days / _TASK_RECENCY_HALF_LIFE_DAYS)
+    return drop * recency
+
+
+def _seeded_weighted_choice(
+    fresh: list[dict[str, Any]], date: str, user: str, now_ms: float
+) -> dict[str, Any]:
+    """Детерминированный взвешенный выбор по seed (дата+user).
+
+    Не криптографическое решение, а стабильный способ показать свежую
+    грубую ошибку чаще, чем старую мелкую, не меняясь между запросами дня.
+    """
+    if len(fresh) == 1:
+        return fresh[0]
+    weights = [_task_weight(item, now_ms) for item in fresh]
+    seed = int(hashlib.sha256(f"{date}{user}".encode("utf-8")).hexdigest(), 16)
+    return random.Random(seed).choices(fresh, weights=weights, k=1)[0]
+
+
 def _task_pool(db: Database, user: str) -> list[dict[str, Any]]:
     """Пул кандидатов в задачу дня: ошибки (blunder/mistake) самого пользователя.
 
@@ -2005,12 +2344,21 @@ def _task_pool(db: Database, user: str) -> list[dict[str, Any]]:
     return pool
 
 
-def _pick_daily_task(db: Database, user: str, date: str) -> dict[str, Any]:
-    """Одна детерминированная задача на день: выбор фиксируется в meta.
+def _pick_daily_task(
+    db: Database, user: str, date: str, repeat: bool = False
+) -> dict[str, Any]:
+    """Одна задача на день: взвешенный выбор, фиксируется в meta.
 
-    Первый запрос за день выбирает задачу (sha256(дата+user) % len(pool))
-    и записывает её; повторные читают записанную. Если записанная задача
-    больше не найдена в пуле (удалили партию) — выбирается новая.
+    Кандидаты взвешиваются по свежести партии (half-life 30 дней) и размеру
+    ошибки (``drop``), выбор детерминирован seed'ом дата+user и записывается
+    в meta; повторные вызовы дня читают записанный. Решённые в течение
+    последних K дней (``TASK_REPEAT_WINDOW_DAYS``, по умолчанию 7) позиции
+    подавляются и не предлагаются снова, пока не истечёт окно; ``repeat=True``
+    — явный запрос повтора (окно игнорируется). Если подавлены все позиции,
+    возбуждается RuntimeError с подсказкой про ``repeat=1``: повторный показ
+    решённой позиции возможен только по явному запросу пользователя.
+    Если записанная задача больше не найдена в пуле (удалили партию) —
+    выбирается новая.
     """
     pool = _task_pool(db, user)
     if not pool:
@@ -2018,16 +2366,59 @@ def _pick_daily_task(db: Database, user: str, date: str) -> dict[str, Any]:
             f"Для {user} нет проанализированных ошибок — сначала запусти анализ "
             "(страница «Анализ»), тогда появится задача дня."
         )
+    now_ms = time.time() * 1000
+    history = _load_task_history(db, user)
+    window = _task_repeat_window_days()
+    suppressed = set() if repeat else _suppressed_task_keys(history, date, window)
+    suppressed_count = sum(1 for item in pool if item["task_key"] in suppressed)
     key = _task_choice_key(date, user)
     stored = db.get_meta(key)
+    chosen: dict[str, Any] | None = None
     if stored:
+        # Стабильность дня важнее подавления: если сегодняшнюю задачу уже
+        # выдавали (в том числе по repeat=1) и она всё ещё в пуле — возвращаем её
+        # даже если игрок только что её решил (иначе страница задачи «сломается»
+        # сразу после ответа).
         for item in pool:
             if item["task_key"] == stored:
-                return item
-    digest = int(hashlib.sha256(f"{date}{user}".encode("utf-8")).hexdigest(), 16)
-    chosen = pool[digest % len(pool)]
-    db.set_meta(key, chosen["task_key"])
+                chosen = item
+                break
+    if chosen is None:
+        fresh = [item for item in pool if item["task_key"] not in suppressed]
+        if not fresh:
+            # Все позиции решались недавно: повтор НЕ показываем без явного
+            # запроса (repeat=1), чтобы не маскировать решённую позицию под
+            # новую тему. Пустой день честнее «ещё одного повтора».
+            raise RuntimeError(
+                f"Все позиции в пуле ({suppressed_count} шт.) уже решались за "
+                f"последние {window} дн. — новых задач нет. "
+                "Явный повтор решённой позиции: /api/task/today?repeat=1 "
+                "(кнопка «Повторить решённую ранее» на странице задачи)."
+            )
+        chosen = _seeded_weighted_choice(fresh, date, user, now_ms)
+        db.set_meta(key, chosen["task_key"])
+    task_history = [item for item in history if item["task_key"] == chosen["task_key"]]
+    attempts = len(task_history)
+    chosen = dict(chosen)
+    chosen["attempt"] = attempts + 1
+    chosen["attempts"] = attempts
+    chosen["solved_before"] = any(item.get("correct") for item in task_history)
+    dates = [str(item.get("date") or "") for item in task_history]
+    chosen["last_attempt"] = max(dates) if dates else None
+    chosen["suppressed_count"] = suppressed_count
+    chosen["repeat_requested"] = bool(repeat)
     return chosen
+
+
+def _task_explanation_ok(payload: dict[str, Any], text: Any) -> bool:
+    """True, если закешированное LLM-объяснение проходит проверку фактов."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    try:
+        facttext.assert_facts(text, _task_explain_facts(payload))
+    except facttext.FactCheckError:
+        return False
+    return True
 
 
 def _is_bad_explanation(text: Any) -> bool:
@@ -2043,10 +2434,19 @@ def _is_bad_explanation(text: Any) -> bool:
     return len(text.strip()) < 80
 
 
-def _task_payload(db: Database, user: str, date: str | None = None) -> dict[str, Any]:
-    """JSON для /api/task/today: позиция до хода, решение и объяснение."""
+def _task_payload(
+    db: Database, user: str, date: str | None = None, repeat: bool = False
+) -> dict[str, Any]:
+    """JSON для /api/task/today: позиция до хода, решение и объяснение.
+
+    ``repeat=True`` — явный запрос повтора: окно подавления решённых позиций
+    игнорируется. Попытки отслеживаются per-position (``task_key``):
+    ``attempt`` — номер предстоящей попытки (1 = позиция видна впервые),
+    ``attempts`` — сколько попыток уже было, ``suppressed_count`` — сколько
+    позиций пула скрыто окном K дней.
+    """
     day = date or _today()
-    item = _pick_daily_task(db, user, day)
+    item = _pick_daily_task(db, user, day, repeat=repeat)
     game = item["game"]
     move = item["move"]
     ply = item["ply"]
@@ -2076,10 +2476,28 @@ def _task_payload(db: Database, user: str, date: str | None = None) -> dict[str,
         cursor.push(line_move)
         best_line_fens.append(cursor.fen())
     explanation = db.get_task_explanation(item["task_key"])
-    if explanation is not None and _is_bad_explanation(explanation):
-        # Отравленный кэш (reasoning-разбор/safety-заглушка/огрызок вместо ответа):
-        # игнорируем, кнопка «Объяснить» снова доступна, успешный повтор перезапишет
-        # мусор через UPSERT save_task_explanation. Строки из БД не удаляем.
+    if explanation is not None and (
+        _is_bad_explanation(explanation)
+        or not _task_explanation_ok(
+            {
+                "san_played": played_san,
+                "best_san": best,
+                "best_line": [str(s) for s in (move.get("best_line") or [])],
+                "win_before": move.get("win_before"),
+                "win_after": move.get("win_after"),
+                "drop": move.get("drop"),
+                "ply": ply,
+                "opening": game.opening,
+                "eco": game.eco,
+                "opponent": game.opponent,
+            },
+            explanation,
+        )
+    ):
+        # Отравленный кэш (мусор или текст без опоры на факты):
+        # игнорируем, кнопка «Объяснить» снова доступна, успешный повтор
+        # перезапишет мусор через UPSERT save_task_explanation.
+        # Строки из БД не удаляем.
         explanation = None
     result = {
         "date": day,
@@ -2112,6 +2530,13 @@ def _task_payload(db: Database, user: str, date: str | None = None) -> dict[str,
         "explanation": explanation,
         "explained": explanation is not None,
         "done": db.get_meta(_task_done_key(day, user)) == "1",
+        "attempt": item.get("attempt", 1),
+        "attempts": item.get("attempts", 0),
+        "solved_before": bool(item.get("solved_before")),
+        "last_attempt": item.get("last_attempt"),
+        "suppressed_count": int(item.get("suppressed_count") or 0),
+        "repeat_requested": bool(item.get("repeat_requested")),
+        "repeat_window_days": _task_repeat_window_days(),
     }
     # Детерминированная версия для UI: не зависит от качества и наличия LLM.
     result["explanation_facts"] = facttext.task_text(result)
@@ -2152,7 +2577,7 @@ def _maybe_snapshot_rating(db: Database, nick: str, day: str) -> None:
     """Запускает снапшот не чаще раза в день (успех и ошибка считаются).
 
     Маркер попытки в meta ставится до потока: если Lichess недоступен,
-    каждый ping не будет заново ждать таймаут.
+    каждый вход не будет заново ждать таймаут.
     """
     if not _RATING_SNAPSHOT_ENABLED:
         return
@@ -2291,6 +2716,37 @@ def _cohort_payload(db: Database, days: int) -> dict[str, Any]:
         )
 
         logs = db.list_daily_logs(nick, count, end_day)
+        # Аналитика активности считается напрямую из таблиц за окно, а не из
+        # кеша daily_log (его минуты/анализы раньше обновлял скрытый ping,
+        # который удалён). Окно: последние ``count`` дней до end_day включительно.
+        try:
+            start_day = (
+                datetime.date.fromisoformat(str(end_day))
+                - datetime.timedelta(days=count - 1)
+            ).isoformat()
+            start_ms = timeutil.day_bounds_ms(start_day)[0]
+            end_ms = timeutil.day_bounds_ms(str(end_day))[1]
+        except (TypeError, ValueError):
+            start_ms, end_ms = None, None
+        window_games = 0
+        window_analyses = 0
+        if start_ms is not None:
+            with db._connection() as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS n FROM games "
+                    "WHERE LOWER(player) = LOWER(?) "
+                    "AND created_at >= ? AND created_at < ?",
+                    (nick, start_ms, end_ms),
+                ).fetchone()
+                window_games = int(row["n"] or 0) if row else 0
+                row = conn.execute(
+                    "SELECT COUNT(*) AS n FROM analyses a "
+                    "JOIN games g ON g.id = a.game_id "
+                    "WHERE LOWER(g.player) = LOWER(?) "
+                    "AND a.analyzed_at >= ? AND a.analyzed_at < ?",
+                    (nick, start_ms, end_ms),
+                ).fetchone()
+                window_analyses = int(row["n"] or 0) if row else 0
         active = [
             item
             for item in logs
@@ -2303,8 +2759,12 @@ def _cohort_payload(db: Database, days: int) -> dict[str, Any]:
         completion_pct = (
             round(tasks_done / tasks_total * 100.0, 1) if tasks_total else 0.0
         )
-        improved_rating = rating_delta is not None and rating_delta >= 30
-        improved_activity = completion_pct >= 60.0 and days_active >= 10
+        # Активность ≠ обучение: это сырые сигналы вовлечённости. Старые
+        # ключи improved_* сохранены как deprecated-алиасы тех же значений —
+        # но больше не называются «улучшением» и не читаются как рост игрока.
+        active_rating = rating_delta is not None and rating_delta >= 30
+        active_completion = completion_pct >= 60.0 and days_active >= 10
+        active = active_rating or active_completion
         rows.append(
             {
                 "nick": nick,
@@ -2319,29 +2779,49 @@ def _cohort_payload(db: Database, days: int) -> dict[str, Any]:
                 "tasks_done": tasks_done,
                 "tasks_total": tasks_total,
                 "completion_pct": completion_pct,
-                "games_analyzed": sum(
-                    int(item.get("games_analyzed") or 0) for item in logs
-                ),
-                "analyses": sum(int(item.get("analyses") or 0) for item in logs),
+                "games_analyzed": window_games,
+                "analyses": window_analyses,
                 "last_seen": _last_seen_iso(record.get("last_seen_at")),
-                "improved_rating": improved_rating,
-                "improved_activity": improved_activity,
-                "improved": improved_rating or improved_activity,
+                # Новые имена: активность/вовлечённость, не «улучшение».
+                "active": active,
+                "active_rating": active_rating,
+                "active_completion": active_completion,
+                # Deprecated aliases (deprecated, kept for compatibility):
+                # те же значения, но это НЕ измерение обучения игрока.
+                "improved": active,
+                "improved_rating": active_rating,
+                "improved_activity": active_completion,
             }
         )
 
     return {
         "days": count,
         "users": rows,
+        # Оговорка: когорта показывает вовлечённость и сырой Δ рейтинга,
+        # а не эффективность плана и не «обученность» игроков.
+        "note": (
+            "active_* — сигналы активности (Δ рейтинга >= 30 или >= 60% "
+            "плана за >= 10 дней), не доказательство обучения/роста. "
+            "improved_* — устаревшие алиасы active_*, не измерение прогресса."
+        ),
+        "deprecated_keys": ["improved", "improved_rating", "improved_activity"],
         "summary": {
             "users": len(rows),
             "active_users": sum(1 for row in rows if row["days_active"] > 0),
-            "improved": sum(1 for row in rows if row["improved"]),
+            "active": sum(1 for row in rows if row["active"]),
+            "active_by_rating": sum(
+                1 for row in rows if row["active_rating"]
+            ),
+            "active_by_completion": sum(
+                1 for row in rows if row["active_completion"]
+            ),
+            # Deprecated aliases (см. note): не использовать в новых отчётах.
+            "improved": sum(1 for row in rows if row["active"]),
             "improved_by_rating": sum(
-                1 for row in rows if row["improved_rating"]
+                1 for row in rows if row["active_rating"]
             ),
             "improved_by_activity": sum(
-                1 for row in rows if row["improved_activity"]
+                1 for row in rows if row["active_completion"]
             ),
             "avg_rating_delta": _mean(
                 [
@@ -2374,6 +2854,10 @@ _COHORT_CSV_COLUMNS = (
     "completion_pct",
     "games_analyzed",
     "analyses",
+    "active",
+    "active_rating",
+    "active_completion",
+    # Deprecated aliases (см. note в /api/admin/cohort): не обучение.
     "improved",
     "improved_rating",
     "improved_activity",
@@ -2431,6 +2915,44 @@ def _fmt_win(value: Any) -> str:
     return f"{value:.1f}"
 
 
+def _task_explain_facts(payload: dict[str, Any]) -> dict[str, Any]:
+    """Facts-объект для объяснения задачи (для ``assert_facts``)."""
+    sans = [payload.get("san_played"), payload.get("best_san")]
+    sans += list(payload.get("best_line") or [])
+    win_before = payload.get("win_before")
+    win_after = payload.get("win_after")
+    drop = payload.get("drop")
+
+    def _num(value: Any) -> float | None:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+        return None
+
+    numbers = [v for v in (_num(win_before), _num(win_after), _num(drop)) if v is not None]
+    ply = payload.get("ply")
+    max_ply = int(ply) if isinstance(ply, int) and ply > 0 else None
+    opening = payload.get("opening") or None
+    eco = payload.get("eco") or None
+    strings = [str(value) for value in (opening, eco, payload.get("opponent")) if value]
+    return facttext.new_facts(
+        sans=[s for s in sans if s],
+        numbers=numbers,
+        openings=[opening] if opening else (),
+        ecos=[eco] if eco else (),
+        strings=strings,
+        max_ply=max_ply,
+    )
+
+
+def _violations_hint(violations: list[str]) -> str:
+    joined = "; ".join(violations) or "нет опоры на факты"
+    return (
+        "\nПредыдущий ответ содержал факты без опоры в данных: "
+        + joined
+        + ". Перепиши так, чтобы остались ТОЛЬКО факты из данных выше."
+    )
+
+
 def _task_explain_messages(payload: dict[str, Any]) -> list[ChatMessage]:
     """Промпт LLM-объяснения задачи (по-русски, только факты из данных)."""
     color = "белые" if payload["user_color"] == "white" else "чёрные"
@@ -2459,27 +2981,56 @@ def _task_explain_messages(payload: dict[str, Any]) -> list[ChatMessage]:
 
 
 def _task_explain_llm(payload: dict[str, Any]) -> str:
-    """Один вызов LLM для объяснения задачи (с повтором при плохом ответе).
+    """LLM-объяснение задачи с проверкой фактов (не более 2 попыток).
 
     thinking-блоки вырезаются, thinking-разбор/safety-заглушка/огрызок
-    вместо ответа — это ошибка (job уйдёт в error, а не сохранит мусор в БД).
+    вместо ответа — это ошибка. Ответ дополнительно проверяется
+    детерминированным ``assert_facts``; при нарушении — одна повторная
+    попытка с подсказкой, затем RuntimeError (вызывающий код покажет
+    facts-only разбор вместо непроверенного текста модели).
     """
     llm = LLMClient()
     messages = _task_explain_messages(payload)
-    text = clean_llm_text(llm.chat(messages, temperature=0.4))
-    if text and not _is_bad_explanation(text):
+    facts = _task_explain_facts(payload)
+    last_violations: list[str] = []
+    for attempt in range(2):
+        try:
+            text = clean_llm_text(llm.chat(messages, temperature=0.4))
+        except RuntimeError as exc:
+            if attempt:
+                raise
+            messages = [
+                messages[0],
+                ChatMessage(
+                    "user",
+                    messages[1].content + "\nБез разбора. Сразу объяснение по-русски.",
+                ),
+            ]
+            continue
+        if not text or _is_bad_explanation(text):
+            messages = [
+                messages[0],
+                ChatMessage(
+                    "user",
+                    messages[1].content + "\nБез разбора. Сразу объяснение по-русски.",
+                ),
+            ]
+            continue
+        try:
+            facttext.assert_facts(text, facts)
+        except facttext.FactCheckError as exc:
+            last_violations = list(dict.fromkeys(exc.violations))
+            messages = [
+                messages[0],
+                ChatMessage(
+                    "user",
+                    messages[1].content + _violations_hint(last_violations),
+                ),
+            ]
+            continue
         return text
-    retry = [
-        messages[0],
-        ChatMessage(
-            "user",
-            messages[1].content + "\nБез разбора. Сразу объяснение по-русски.",
-        ),
-    ]
-    second = clean_llm_text(llm.chat(retry, temperature=0.4))
-    if not second or _is_bad_explanation(second):
-        raise RuntimeError("Модель не дала объяснение задачи (повтор не помог)")
-    return second
+    detail = f" (нарушения: {'; '.join(last_violations)})" if last_violations else ""
+    raise RuntimeError(f"Модель не дала проверяемое объяснение задачи{detail}")
 
 # --- Цель и недельный план ------------------------------------------------
 
@@ -2638,13 +3189,23 @@ def _week_phases(plan: dict[str, Any] | None) -> list[tuple[str, dict[str, Any]]
     return out
 
 
+#: Минимум ошибок в фазе, чтобы фаза могла стать фокусом недели
+#: (audit M4): меньше — max по avg_drop это шум, а не сигнал.
+_MIN_PHASE_ERRORS = 3
+
+#: Окно для подсчёта дрелей (audit M5): последние N дней по created_at.
+_DRILLS_WINDOW_DAYS = 14
+
+
 def _resolve_week_focus(
     goal: dict[str, Any], plan: dict[str, Any] | None
 ) -> tuple[str, str]:
     """Фаза фокуса недели + человеческое обоснование с цифрами.
 
-    Явный фокус цели побеждает; иначе — слабейшая фаза по avg_drop;
-    без данных — 'middlegame' по умолчанию.
+    Явный фокус цели побеждает; иначе — слабейшая фаза по avg_drop среди
+    фаз, где набралось хотя бы ``_MIN_PHASE_ERRORS`` ошибок. Если таких
+    фаз нет — fallback «middlegame» с честным обоснованием «мало данных»,
+    а не шумный максимум одной-двух ошибок.
     """
     phases = _week_phases(plan)
     by_phase = {name: stats for name, stats in phases}
@@ -2654,22 +3215,62 @@ def _resolve_week_focus(
         if stats:
             count = int(stats.get("count") or 0)
             avg = float(stats.get("avg_drop") or 0.0)
-            return wanted, f"твой выбор; {count} ошибок, средняя потеря {avg:.1f}%"
-        return wanted, "выбран тобой в цели"
-    if phases:
+            if count < _MIN_PHASE_ERRORS:
+                return (
+                    wanted,
+                    f"твой выбор; всего {count} ошибок за окно — мало данных, "
+                    f"вывод осторожный (средняя потеря {avg:.1f}%)",
+                )
+            return wanted, (
+                f"твой выбор; {count} ошибок, средняя потеря {avg:.1f}% "
+                "за окно последних проанализированных партий"
+            )
+        return wanted, "выбран тобой в цели (данных по фазе пока нет)"
+    qualified = [
+        (name, stats)
+        for name, stats in phases
+        if int((stats or {}).get("count") or 0) >= _MIN_PHASE_ERRORS
+    ]
+    if qualified:
         name, stats = max(
-            phases, key=lambda item: float((item[1] or {}).get("avg_drop") or 0.0)
+            qualified, key=lambda item: float((item[1] or {}).get("avg_drop") or 0.0)
         )
         count = int(stats.get("count") or 0)
         avg = float(stats.get("avg_drop") or 0.0)
-        return name, f"{count} ошибок, средняя потеря {avg:.1f}%"
-    return "middlegame", "нет данных анализа — взят миттельшпиль по умолчанию"
+        return (
+            name,
+            f"{count} ошибок (мин. {_MIN_PHASE_ERRORS} для выбора), "
+            f"средняя потеря {avg:.1f}% — за окно последних проанализированных партий",
+        )
+    return (
+        "middlegame",
+        f"мало данных: ни в одной фазе не набралось {_MIN_PHASE_ERRORS} ошибок — "
+        "фокус по умолчанию, собираем базу",
+    )
 
 
 def _week_drills_portion(unnatural: int) -> int:
-    """Дневная порция дрелей: min(20, max(5, ceil(unnatural/7)))."""
-    portion = (max(0, int(unnatural)) + 6) // 7
-    return min(20, max(5, portion))
+    """Дневная порция дрелей: ``ceil(unnatural / 7)``, cap 20, без пола.
+
+    ``unnatural`` — неестественные промахи за последние
+    ``_DRILLS_WINDOW_DAYS`` дней (не all-time счётчик). При нуле
+    доказательств — ноль дрелей, а не искусственная пятёрка (audit M5).
+    """
+    n = max(0, int(unnatural or 0))
+    if n <= 0:
+        return 0
+    return min(20, (n + 6) // 7)
+
+
+def _weak_opening_rows(
+    plan: dict[str, Any] | None, limit: int | None = None
+) -> list[dict[str, Any]]:
+    """Слабые дебюты из плана, прошедшие единый предикат (audit M4)."""
+    if not isinstance(plan, dict):
+        return []
+    raw = (plan.get("repertoire") or {}).get("weak_openings")
+    rows = [row for row in (raw or []) if is_weak_opening(row)]
+    return rows[:limit] if limit is not None else rows
 
 
 def _build_week_tasks(
@@ -2678,40 +3279,95 @@ def _build_week_tasks(
     weak_opening: dict[str, Any] | None,
     focus_phase: str,
     focus_reason: str,
-) -> list[dict[str, str]]:
-    """Детерминированный список задач на неделю (ключи key/text/detail)."""
+    drills_window: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Детерминированный список задач на неделю.
+
+    Каждая задача несёт ``est_minutes`` (на день). Сумма оценок по
+    активным задачам не превышает ``floor(minutes * 0.8)``: при нехватке
+    бюджета оценки урезаются консервативно (never overestimate), начиная
+    с дрелей. Если за окно в ``_DRILLS_WINDOW_DAYS`` дней неестественных
+    промахов ноль — задача «дрели» не назначается вовсе (audit M5).
+    """
     portion = _week_drills_portion(unnatural)
     phase_ru = _PLAN_FOCUS_RU.get(focus_phase, focus_phase)
     phase_prep = _PLAN_FOCUS_PREP.get(focus_phase, phase_ru)
-    tasks = [
+
+    window = drills_window if isinstance(drills_window, dict) else {}
+    window_days = int(window.get("days") or _DRILLS_WINDOW_DAYS)
+    window_games = window.get("games")
+    window_bad = window.get("total_bad")
+    games_txt = (
+        f"{int(window_games)} партий в окне" if isinstance(window_games, int) else "окно последних проанализированных партий"
+    )
+
+    # Сырые оценки (на день), затем консервативная подгонка под бюджет.
+    opening_est = 4   # ~30 мин в неделю: разбор 2 партий
+    phase_est = 5     # ~35 мин в неделю: разбор 3 партий
+    daily_est = 5     # задача дня
+    drills_est = 2 * portion
+    budget = max(0, int(minutes) * 8 // 10)
+
+    estimates: dict[str, int] = {}
+    remaining = budget
+    for key, raw_est in (
+        ("daily-task", daily_est),
+        ("drills", drills_est),
+        ("opening", opening_est),
+        ("phase", phase_est),
+    ):
+        if key == "drills" and portion <= 0:
+            continue
+        est = min(raw_est, remaining)
+        estimates[key] = est
+        remaining -= est
+
+    tasks: list[dict[str, Any]] = [
         {
             "key": "daily-task",
             "text": "Решай задачу дня каждый день (7 из 7)",
             "detail": "задача дня ×7: ни дня без тактики",
-        },
-        {
-            "key": "drills",
-            "text": f"Реши {portion} дрелей в день",
-            "detail": f"{unnatural} неестественных ошибок за неделю — по {portion} в день",
+            "est_minutes": estimates["daily-task"],
         },
     ]
+    if portion > 0:
+        detail = (
+            f"{unnatural} неестественных промахов за последние {window_days} дней "
+            f"({games_txt}) — по {portion} в день"
+        )
+        if isinstance(window_bad, int) and window_bad > 0:
+            detail += f" из {window_bad} плохих ходов в окне"
+        tasks.append(
+            {
+                "key": "drills",
+                "text": f"Реши {portion} дрелей в день",
+                "detail": detail,
+                "est_minutes": estimates["drills"],
+            }
+        )
     if weak_opening:
         name = str(weak_opening.get("opening") or "—")
-        epg = weak_opening.get("errors_per_game")
+        epg = weak_opening.get("errors_per_game_shrunk", weak_opening.get("errors_per_game"))
         epg_txt = f"{float(epg):.2f}" if isinstance(epg, (int, float)) else "—"
+        opening_detail = (
+            f"сжатая оценка: {epg_txt} ошибок на партию "
+            f"(приор k=5, {int(weak_opening.get('games') or 0)} партий)"
+        )
         tasks.append(
             {
                 "key": "opening",
                 "text": f"Разобрать 2 партии в дебюте «{name}»",
-                "detail": f"худший дебют: {epg_txt} ошибок на партию",
+                "detail": opening_detail,
+                "est_minutes": estimates["opening"],
             }
         )
     else:
         tasks.append(
             {
                 "key": "opening",
-                "text": "Разобрать 2 партии в слабейшем дебюте",
-                "detail": "нет данных по дебютам — возьми любые 2 проигранные",
+                "text": "Дебютный фокус не выбран",
+                "detail": "нет дебюта с достаточной выборкой и плохой формой — данных для рекомендации нет",
+                "est_minutes": estimates["opening"],
             }
         )
     tasks.append(
@@ -2719,13 +3375,7 @@ def _build_week_tasks(
             "key": "phase",
             "text": f"Разобрать 3 партии с ошибками в {phase_prep}",
             "detail": f"фокус недели: {phase_ru} ({focus_reason})",
-        }
-    )
-    tasks.append(
-        {
-            "key": "time",
-            "text": f"Занимайся {minutes} мин в день ({minutes * 7} мин за неделю)",
-            "detail": "время из твоей цели: минута в день лучше часа раз в неделю",
+            "est_minutes": estimates["phase"],
         }
     )
     return tasks
@@ -2735,49 +3385,76 @@ def _build_human_summary(
     focus_phase: str,
     phases: list[tuple[str, dict[str, Any]]],
     weak_opening: dict[str, Any] | None,
-    humanity: dict[str, Any] | None,
+    drills_window: dict[str, Any] | None,
     drills_today: int,
 ) -> str:
-    """Человеческий итог недели шаблонами, без LLM (3–5 предложений)."""
+    """Человеческий итог недели шаблонами, без LLM (3–5 предложений).
+
+    Про неестественные промахи говорится по окну последних
+    ``_DRILLS_WINDOW_DAYS`` дней (не all-time), с числом партий/плохих
+    ходов и честным «нет данных» при пустом окне.
+    """
     phase_ru = _PLAN_FOCUS_RU.get(focus_phase, focus_phase)
     parts: list[str] = []
     stats = dict(phases).get(focus_phase) if phases else None
-    if stats:
+    if stats and int(stats.get("count") or 0) >= _MIN_PHASE_ERRORS:
         count = int(stats.get("count") or 0)
         avg = float(stats.get("avg_drop") or 0.0)
         parts.append(
-            f"Главная дыра — {phase_ru}: {count} ошибок, средняя потеря {avg:.1f}%."
+            f"Главная дыра — {phase_ru}: {count} ошибок за окно последних "
+            f"проанализированных партий, средняя потеря {avg:.1f}%."
         )
     else:
-        parts.append(f"На неделе качаем {phase_ru}: данных пока мало, собираем базу.")
+        parts.append(f"На неделе качаем {phase_ru}: данных за окно мало, собираем базу.")
     if weak_opening:
         name = str(weak_opening.get("opening") or "—")
-        epg = weak_opening.get("errors_per_game")
+        epg = weak_opening.get("errors_per_game_shrunk", weak_opening.get("errors_per_game"))
         epg_txt = f"{float(epg):.2f}" if isinstance(epg, (int, float)) else "—"
-        parts.append(f"Худший дебют — {name}: {epg_txt} ошибок на партию.")
-    total = 0
-    unnatural = 0
-    if isinstance(humanity, dict):
-        total = int(humanity.get("total") or 0)
-        unnatural = int(humanity.get("unnatural") or 0)
-    if total <= 0:
-        parts.append("Нет данных о человечности ошибок — запусти оценку ошибок, чтобы делать вывод.")
+        games_n = int(weak_opening.get("games") or 0)
+        parts.append(
+            f"Слабый дебют — {name}: {epg_txt} ошибок на партию "
+            f"(сжатая оценка, {games_n} партий)."
+        )
+    window = drills_window if isinstance(drills_window, dict) else {}
+    window_days = int(window.get("days") or _DRILLS_WINDOW_DAYS)
+    window_games = int(window.get("games") or 0)
+    unnatural = int(window.get("unnatural") or 0)
+    total_bad = int(window.get("total_bad") or 0)
+    if total_bad <= 0:
+        if window.get("source") == "humanity":
+            parts.append(
+                f"За последние {window_days} дней плохих ходов в окне ({window_games} партий) "
+                "не найдено — выводов о человечности не делаем."
+            )
+        else:
+            parts.append(
+                f"Нет данных для оценки неестественности за последние {window_days} дней "
+                "(нужна оценка ошибок) — выводов не делаем."
+            )
     else:
-        share = round(unnatural / total * 100, 1)
+        share = round(unnatural / total_bad * 100, 1)
         if share >= 40.0:
             parts.append(
-                f"Много случайных ходов — {share}% неестественных из {total}: "
+                f"Много случайных ходов за последние {window_days} дней — "
+                f"{share}% неестественных из {total_bad} ({window_games} партий в окне): "
                 "играй медленнее, считай до конца."
             )
         else:
             parts.append(
-                f"Ошибки в основном естественные ({share}% неестественных из {total}) — "
+                f"За последние {window_days} дней ошибки в основном естественные "
+                f"({share}% неестественных из {total_bad}, {window_games} партий в окне) — "
                 "работаем над счётом."
             )
-    parts.append(
-        f"Вывод на неделю: качаем {phase_ru} — {drills_today} дрелей в день "
-        "плюс разбор партий из списка выше."
-    )
+    if drills_today > 0:
+        parts.append(
+            f"Вывод на неделю: качаем {phase_ru} — {drills_today} дрелей в день "
+            f"(по окну {window_days} дней) плюс разбор партий из списка выше."
+        )
+    else:
+        parts.append(
+            f"Вывод на неделю: качаем {phase_ru}; дрелей не назначаю — "
+            f"за последние {window_days} дней неестественных промахов не найдено."
+        )
     return " ".join(parts)
 
 
@@ -2895,25 +3572,32 @@ def _plan_week_payload(db: Database, nick: str, data_dir: Any) -> dict[str, Any]
     phases = _week_phases(plan)
     focus_phase, focus_reason = _resolve_week_focus(goal, plan)
 
-    weak_openings = []
-    if isinstance(plan, dict):
-        weak_openings = (plan.get("repertoire") or {}).get("weak_openings") or []
-    weak_opening = weak_openings[0] if weak_openings else None
+    weak_opening = None
+    weak_openings = _weak_opening_rows(plan, limit=1)
+    if weak_openings:
+        weak_opening = weak_openings[0]
 
     drills_total = 0
-    unnatural = 0
-    humanity = None
     if isinstance(plan, dict):
         drills = plan.get("drills") or {}
         try:
             drills_total = int(drills.get("total") or 0)
         except (TypeError, ValueError):
             drills_total = 0
-        try:
-            unnatural = int(drills.get("unnatural") or 0)
-        except (TypeError, ValueError):
-            unnatural = 0
-        humanity = plan.get("humanity")
+    # Дрели — по окну последних _DRILLS_WINDOW_DAYS дней, не all-time.
+    try:
+        drills_window = shared_data.recent_drills_unnatural(
+            db, nick, days=_DRILLS_WINDOW_DAYS, root=data_dir
+        )
+    except Exception:
+        drills_window = {
+            "days": _DRILLS_WINDOW_DAYS,
+            "games": 0,
+            "unnatural": 0,
+            "total_bad": 0,
+            "source": "no-humanity-items",
+        }
+    unnatural = int(drills_window.get("unnatural") or 0)
     drills_today = _week_drills_portion(unnatural)
 
     try:
@@ -2923,22 +3607,15 @@ def _plan_week_payload(db: Database, nick: str, data_dir: Any) -> dict[str, Any]
         task_done = None
 
     day = _today()
-    now = _now()
     try:
-        track_state = _track_state(db, _track_key(day, nick))
         manual_sec = _manual_seconds(db, _lichess_manual_key(day, nick))
         games = db.get_games(nick, limit=100_000)
-        site_sec = 0.0
-        if track_state is not None:
-            site_sec = track_state["total"] + max(
-                0.0, min(now - track_state["last"], 60.0)
-            )
         lichess_sec = 0.0
         for game in games:
             if timeutil.date_of_ms(game.created_at) != day:
                 continue
             lichess_sec += _clock_seconds(game.clocks)
-        time_sec = int(site_sec + lichess_sec + manual_sec)
+        time_sec = int(lichess_sec + manual_sec)
     except (ValueError, TypeError, OSError):
         time_sec = 0
 
@@ -2947,24 +3624,195 @@ def _plan_week_payload(db: Database, nick: str, data_dir: Any) -> dict[str, Any]
     )
     evidence = _week_evidence(db, nick, focus_phase, weak_opening_name)
 
+    # Планируемый бюджет: 0.8 от минуты пользователя — не больше.
+    week_tasks = _build_week_tasks(
+        minutes, unnatural, weak_opening, focus_phase, focus_reason, drills_window
+    )
+
     return {
         "goal": goal["goal"],
         "minutes_per_day": minutes,
         "focus": {"phase": focus_phase, "reason": focus_reason},
         "evidence": evidence,
-        "week_tasks": _build_week_tasks(
-            minutes, unnatural, weak_opening, focus_phase, focus_reason
-        ),
+        "week_tasks": week_tasks,
+        "week_budget_minutes": int(minutes) * 8 // 10,
         "today": {
             "task_done": task_done,
             "time_sec": time_sec,
             "drills_today": drills_today,
             "drills_total": drills_total,
+            # Честная метка окна: откуда взяты дрели (audit M5/M8).
+            "drills_window": {
+                "days": int(drills_window.get("days") or _DRILLS_WINDOW_DAYS),
+                "games": int(drills_window.get("games") or 0),
+                "unnatural": unnatural,
+                "total_bad": int(drills_window.get("total_bad") or 0),
+                "source": str(drills_window.get("source") or "no-humanity-items"),
+            },
         },
         "human_summary": _build_human_summary(
-            focus_phase, phases, weak_opening, humanity, drills_today
+            focus_phase, phases, weak_opening, drills_window, drills_today
         ),
     }
+
+# --- Снимок недельного плана (описательная петля, audit C3) --------------
+
+def _week_snapshot_payload(
+    db: Database, nick: str, data_dir: Any
+) -> dict[str, Any] | None:
+    """Агрегаты окна на момент сохранения плана (или None — снимать нечего).
+
+    Источники те же, что у /api/plan/week; наружу уходят только счётчики и
+    названия (слабые дебюты, мотивы), никаких ходов, соперников и PII.
+    """
+    try:
+        pairs = shared_data.repertoire_pairs(db, nick)
+    except RuntimeError:
+        return None
+    summary = summarize_recent(pairs)
+    plan: dict[str, Any] | None = None
+    try:
+        plan = shared_data.plan(db, nick, root=data_dir)
+    except RuntimeError:
+        plan = None
+    goal = _load_plan_goal(db, nick)
+    focus_phase, _ = _resolve_week_focus(goal, plan)
+
+    try:
+        # drills_target — дневная норма из свежего окна, как в /api/plan/week.
+        unnatural = int(
+            shared_data.recent_drills_unnatural(
+                db, nick, days=_DRILLS_WINDOW_DAYS, root=data_dir
+            ).get("unnatural")
+            or 0
+        )
+    except Exception:
+        unnatural = 0
+
+    weak_openings: list[dict[str, Any]] = []
+    motifs: list[dict[str, Any]] = []
+    if isinstance(plan, dict):
+        # Снимок фиксирует только подтверждённо слабые дебюты (audit M4).
+        for item in _weak_opening_rows(plan, limit=3):
+            try:
+                games_n = int(item.get("games") or 0)
+            except (TypeError, ValueError):
+                games_n = 0
+            weak_openings.append(
+                {
+                    "opening": str(item.get("opening") or "—"),
+                    "eco": item.get("eco"),
+                    "games": games_n,
+                    "errors_per_game": item.get("errors_per_game"),
+                    "points_pct": item.get("points_pct"),
+                }
+            )
+        for entry in (plan.get("patterns") or {}).get("motifs") or []:
+            if not (isinstance(entry, (list, tuple)) and len(entry) == 2):
+                continue
+            name, stats = entry
+            stats = stats if isinstance(stats, dict) else {}
+            try:
+                count_n = int(stats.get("count") or 0)
+            except (TypeError, ValueError):
+                count_n = 0
+            motifs.append(
+                {
+                    "motif": str(name),
+                    "count": count_n,
+                    "avg_drop": stats.get("avg_drop"),
+                }
+            )
+            if len(motifs) >= 3:
+                break
+    return {
+        "window_n": summary["window_n"],
+        "focus_phase": focus_phase,
+        # drills_target — дневная норма из плана недели (как «Реши N дрелей
+        # в день»), не недельный итог.
+        "drills_target": _week_drills_portion(unnatural),
+        "weak_openings": weak_openings,
+        "motifs": motifs,
+        "avg_drop": summary["avg_drop"],
+        "score": summary["score_pct"],
+    }
+
+
+def _save_week_snapshot(db: Database, nick: str, data_dir: Any) -> dict[str, Any] | None:
+    """Best-effort снимок при сохранении/генерации плана недели.
+
+    Вызывать только из явных действий пользователя (сохранение цели,
+    генерация комментария), НЕ из аналитики. Ошибка сохранения снимка не
+    роняет запрос: логируем и продолжаем. Прошлая неделя не перезаписывается
+    (см. Database.save_plan_snapshot).
+    """
+    try:
+        payload = _week_snapshot_payload(db, nick, data_dir)
+        if payload is None:
+            return None
+        day = _today()
+        try:
+            week_start = monday_of_week(datetime.date.fromisoformat(day))
+        except ValueError:
+            week_start = day
+        return db.save_plan_snapshot(
+            nick, week_start, version=SNAPSHOT_VERSION, **payload
+        )
+    except Exception:
+        logger.warning("week plan snapshot failed", exc_info=True)
+        return None
+
+
+def _snapshot_public(snap: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Снимок для ответа API: + читаемая ISO-дата, без лишнего."""
+    if not snap:
+        return None
+    out = dict(snap)
+    created_ms = int(out.get("created_at") or 0)
+    created_iso: str | None = None
+    if created_ms > 0:
+        try:
+            created_iso = datetime.datetime.fromtimestamp(
+                created_ms / 1000, tz=timeutil.timezone_for()
+            ).isoformat(timespec="seconds")
+        except (OverflowError, OSError, ValueError):
+            created_iso = None
+    out["created_iso"] = created_iso
+    return out
+
+
+def _week_snapshot_status(db: Database, nick: str) -> dict[str, Any]:
+    """Снимок + описательные дельты «на сейчас» с жёсткими гейтами.
+
+    Честные состояния: ``no_snapshot`` | ``pending`` (<7 дней) |
+    ``insufficient_data`` (<10 новых анализов) | ``ok`` (сырые дельты).
+    Партии не пересчитываются при каждом чтении аналитики — только здесь.
+    """
+    snap = db.get_latest_plan_snapshot(nick)
+    if not snap:
+        return {
+            "status": "no_snapshot",
+            "snapshot": None,
+            "current": None,
+            "deltas": None,
+            "new_games": 0,
+            "age_days": None,
+            "days_remaining": None,
+            "min_new_games": MIN_NEW_GAMES,
+            "min_age_days": MIN_SNAPSHOT_AGE_DAYS,
+            "caveat": SNAPSHOT_CAVEAT,
+        }
+    created_ms = int(snap.get("created_at") or 0)
+    now_ms = int(time.time() * 1000)
+    age_days = (now_ms - created_ms) / 86_400_000 if created_ms > 0 else None
+    new_games = db.count_analyzed_games_since(nick, created_ms)
+    window_n = max(1, int(snap.get("window_n") or 1))
+    pairs = db.get_analyzed_games(nick, limit=window_n)
+    current = summarize_recent(pairs)
+    result = snapshot_delta(snap, current, new_games=new_games, age_days=age_days)
+    result["snapshot"] = _snapshot_public(result["snapshot"])
+    return result
+
 
 # --- Индивидуальный LLM-план недели ---------------------------------------
 
@@ -3072,48 +3920,49 @@ def _plan_llm_input(db: Database, nick: str, data_dir: Any) -> dict[str, Any]:
     focus_phase, focus_reason = _resolve_week_focus(goal, plan)
     weak_openings: list[dict[str, Any]] = []
     drills_total = 0
-    drills_unnatural = 0
     humanity = None
     score_pct = None
     avg_win_loss = None
     if plan is not None:
-        raw_weak = (plan.get("repertoire") or {}).get("weak_openings") or []
-        for item in raw_weak[:6]:
-            if not isinstance(item, dict):
-                continue
-            games = item.get("games")
-            points = item.get("points_pct")
-            errors = item.get("errors_per_game")
+        for item in _weak_opening_rows(plan, limit=3):
             try:
-                games_n = int(games) if games is not None else 0
-                points_n = float(points) if points is not None else 0.0
-                errors_n = float(errors) if errors is not None else 0.0
+                errors_n = float(
+                    item.get(
+                        "errors_per_game_shrunk", item.get("errors_per_game") or 0.0
+                    )
+                )
             except (TypeError, ValueError):
-                games_n, points_n, errors_n = 0, 0.0, 0.0
-            if games_n < 2 and points_n >= 70 and errors_n < 1.5:
-                continue
+                errors_n = 0.0
             weak_openings.append(
                 {
                     "opening": str(item.get("opening") or "—"),
                     "errors_per_game": round(errors_n, 2),
                 }
             )
-            if len(weak_openings) >= 3:
-                break
         drills = plan.get("drills") or {}
         try:
             drills_total = int(drills.get("total") or 0)
         except (TypeError, ValueError):
             drills_total = 0
-        try:
-            drills_unnatural = int(drills.get("unnatural") or 0)
-        except (TypeError, ValueError):
-            drills_unnatural = 0
         humanity = plan.get("humanity")
         if isinstance(plan.get("score_pct"), (int, float)):
             score_pct = round(float(plan["score_pct"]), 1)
         if isinstance(plan.get("avg_win_loss"), (int, float)):
             avg_win_loss = round(float(plan["avg_win_loss"]), 2)
+
+    try:
+        drills_window = shared_data.recent_drills_unnatural(
+            db, nick, days=_DRILLS_WINDOW_DAYS, root=data_dir
+        )
+    except Exception:
+        drills_window = {
+            "days": _DRILLS_WINDOW_DAYS,
+            "games": 0,
+            "unnatural": 0,
+            "total_bad": 0,
+            "source": "no-humanity-items",
+        }
+    drills_unnatural = int(drills_window.get("unnatural") or 0)
 
     level = _plan_player_level(db, nick)
 
@@ -3140,6 +3989,8 @@ def _plan_llm_input(db: Database, nick: str, data_dir: Any) -> dict[str, Any]:
         "unnatural_verdict": _plan_unnatural_verdict(humanity),
         "drills_total": drills_total,
         "drills_unnatural": drills_unnatural,
+        "drills_window_days": int(drills_window.get("days") or _DRILLS_WINDOW_DAYS),
+        "drills_window_games": int(drills_window.get("games") or 0),
         "score_pct": score_pct,
         "avg_win_loss": avg_win_loss,
         "week_tasks": _build_week_tasks(
@@ -3148,6 +3999,7 @@ def _plan_llm_input(db: Database, nick: str, data_dir: Any) -> dict[str, Any]:
             weak_openings[0] if weak_openings else None,
             focus_phase,
             focus_reason,
+            drills_window,
         ),
         "prompt_version": 2,
     }
@@ -3226,7 +4078,7 @@ def _plan_llm_messages(entry: dict[str, Any]) -> list[ChatMessage]:
             if isinstance(t, dict) and t.get("text")
         ) + ".",
         f"Человечность: {entry.get('unnatural_verdict')}.",
-        f"Дрели: всего {entry.get('drills_total')}, неестественных {entry.get('drills_unnatural')}.",
+        f"Дрели: всего в кеше {entry.get('drills_total')}; неестественных за последние {entry.get('drills_window_days') or _DRILLS_WINDOW_DAYS} дней ({entry.get('drills_window_games') or 0} партий в окне): {entry.get('drills_unnatural')}.",
         f"Счёт: {score if score is not None else '—'}%; средняя потеря: {loss if loss is not None else '—'}%.",
         "Ответ — только объяснение, почему такой план, без нового списка задач.",
     ]
@@ -3269,29 +4121,163 @@ def _plan_chat_ok(text: str, advanced: bool) -> bool:
     return True
 
 
-def _plan_llm_chat(messages: list[ChatMessage], advanced: bool = False) -> str:
-    """Один вызов LLM для плана (с повтором при thinking-мусоре).
+def _plan_llm_facts(entry: dict[str, Any]) -> dict[str, Any]:
+    """Facts-объект для комментария к недельному плану (assert_facts)."""
+    numbers: list[float] = []
+    for key in (
+        "minutes",
+        "drills_total",
+        "drills_unnatural",
+        "drills_window_days",
+        "drills_window_games",
+        "score_pct",
+        "avg_win_loss",
+        "rating",
+        "target_rating",
+        "weeks_left",
+    ):
+        value = entry.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            numbers.append(float(value))
 
-    thinking-блоки вырезаются, служебный разбор вместо плана — это ошибка
-    (job уйдёт в error, мусор в meta не пишется).
-    """
-    llm = LLMClient()
-    text = clean_llm_text(llm.chat(messages, temperature=0.4))
-    if _plan_chat_ok(text, advanced):
-        return text
-    retry = [
-        messages[0],
-        ChatMessage(
-            "user",
-            messages[1].content + "\nБез разбора. Сразу готовый план по-русски.",
-        ),
+    weak = entry.get("weak_openings") or []
+    weak_names: list[str] = []
+    for item in weak:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("opening")
+        if name:
+            weak_names.append(str(name))
+        errors = item.get("errors_per_game")
+        if isinstance(errors, (int, float)) and not isinstance(errors, bool):
+            numbers.append(float(errors))
+
+    evidence = entry.get("evidence") or {}
+    if isinstance(evidence, dict):
+        for key in ("games_total", "games_with_error", "share_pct"):
+            value = evidence.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                numbers.append(float(value))
+        for key in ("worst", "opening_worst"):
+            item = evidence.get(key)
+            if not isinstance(item, dict):
+                continue
+            drop = item.get("drop")
+            if isinstance(drop, (int, float)) and not isinstance(drop, bool):
+                numbers.append(float(drop))
+
+    sans: list[str] = []
+    openings = list(weak_names)
+    for key in ("worst", "opening_worst"):
+        item = evidence.get(key) if isinstance(evidence, dict) else None
+        if isinstance(item, dict):
+            for san_key in ("san", "move_label"):
+                san = item.get(san_key)
+                if san:
+                    sans.append(str(san))
+            opening = item.get("opening")
+            if opening:
+                openings.append(str(opening))
+
+    goal = entry.get("goal")
+    strings = [str(goal)] if goal else []
+    strings += weak_names
+    if isinstance(evidence, dict):
+        for key in ("worst", "opening_worst"):
+            item = evidence.get(key)
+            if isinstance(item, dict):
+                for text_key in ("game_id", "move_label", "opening"):
+                    value = item.get(text_key)
+                    if value:
+                        strings.append(str(value))
+
+    return facttext.new_facts(
+        sans=sans,
+        numbers=numbers,
+        openings=openings,
+        strings=strings,
+    )
+
+
+def _plan_llm_facts_brief(entry: dict[str, Any]) -> str:
+    """Факты-only комментарий к плану: те же строки-факты, без LLM."""
+    lines = [
+        "LLM недоступен или ответ не прошёл проверку фактов — ниже только",
+        "проверяемые данные недели (без комментария модели):",
+        _evidence_line(entry.get("evidence")),
     ]
-    second = clean_llm_text(llm.chat(retry, temperature=0.4))
-    if _plan_chat_ok(second, advanced):
-        return second
-    if advanced and second and _plan_has_basic_stuff(second):
-        raise RuntimeError("LLM вернул базовые темы вместо продвинутого плана")
-    raise RuntimeError("LLM вернул служебный разбор вместо плана")
+    weak = entry.get("weak_openings") or []
+    weak_txt = "; ".join(
+        f"{w.get('opening')} ({w.get('errors_per_game')} ошибок/партию)"
+        for w in weak
+        if isinstance(w, dict) and w.get("opening")
+    )
+    if weak_txt:
+        lines.append(f"Топ слабых дебютов: {weak_txt}.")
+    loss = entry.get("avg_win_loss")
+    score = entry.get("score_pct")
+    lines.append(
+        f"Счёт: {score if score is not None else '—'}%; "
+        f"средняя потеря win%: {loss if loss is not None else '—'}."
+    )
+    return "\n".join(lines)
+
+
+def _plan_llm_chat(
+    messages: list[ChatMessage],
+    advanced: bool = False,
+    facts: dict[str, Any] | None = None,
+    *,
+    brief: str | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """LLM-план недели с проверкой фактов (не более 2 попыток).
+
+    thinking-блоки вырезаются, служебный разбор и детсад для 1800+ — брак.
+    Ответ дополнительно проверяется детерминированным ``assert_facts``; при
+    нарушении — одна повторная попытка с подсказкой, затем ``brief``
+    (facts-only) вместо непроверенного текста модели. Возвращает
+    ``(текст, meta)``; ``meta["source"]`` — ``"llm"`` | ``"facts"``.
+    """
+    meta: dict[str, Any] = {"source": "llm", "violations": [], "error": None}
+    llm = LLMClient()
+    messages_now = list(messages)
+    text = ""
+    try:
+        for attempt in range(2):
+            text = clean_llm_text(llm.chat(messages_now, temperature=0.4))
+            violations: list[str] = []
+            if not _plan_chat_ok(text, advanced):
+                violations = ["служебный разбор или базовая теория вместо плана"]
+            elif facts is not None:
+                try:
+                    facttext.assert_facts(text, facts)
+                except facttext.FactCheckError as exc:
+                    violations = list(dict.fromkeys(exc.violations))
+            if not violations:
+                return text, meta
+            meta["violations"] = violations
+            if attempt == 0:
+                messages_now = [
+                    messages_now[0],
+                    ChatMessage(
+                        "user",
+                        messages_now[1].content + _violations_hint(violations),
+                    ),
+                ]
+    except RuntimeError as exc:
+        meta["error"] = str(exc)
+        if brief:
+            meta["source"] = "facts"
+            return brief, meta
+        raise
+    if advanced and text and _plan_has_basic_stuff(text):
+        meta["error"] = "LLM вернул базовые темы вместо продвинутого плана"
+    elif not meta["error"]:
+        meta["error"] = "ответ модели не прошёл проверку фактов"
+    if brief:
+        meta["source"] = "facts"
+        return brief, meta
+    raise RuntimeError(meta["error"])
 
 
 def _run_plan_llm_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None:
@@ -3309,16 +4295,25 @@ def _run_plan_llm_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> No
             job.summary = "План недели: собраны промпты без вызова LLM"
         else:
             job.phase = "План недели"
-            _ensure_llm_key()
             rating = params["input"].get("rating")
             advanced = (
                 isinstance(rating, int)
                 and not isinstance(rating, bool)
                 and rating >= 1800
             )
-            text = _plan_llm_chat(messages, advanced=advanced)
+            facts = _plan_llm_facts(params["input"])
+            brief = _plan_llm_facts_brief(params["input"])
+            try:
+                _ensure_llm_key()
+                text, meta = _plan_llm_chat(
+                    messages, advanced=advanced, facts=facts, brief=brief
+                )
+            except Exception as exc:  # LLM недоступен — recoverable facts-only
+                logger.info("plan llm: LLM недоступен, показываю факты: %s", exc)
+                text, meta = brief, {"source": "facts", "violations": [], "error": str(exc)}
             if not text:
                 raise RuntimeError("LLM вернул пустой план")
+            facts_only = meta.get("source") != "llm"
             created = _today()
             record = {
                 "text": text,
@@ -3326,6 +4321,8 @@ def _run_plan_llm_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> No
                 "input_hash": params["input_hash"],
                 "weeks_left": params["input"].get("weeks_left"),
                 "prompt_version": params["input"].get("prompt_version"),
+                "facts_only": facts_only,
+                "llm_error": meta.get("error"),
             }
             with Database(app.state.db_path) as db:
                 db.init_db()
@@ -3338,9 +4335,15 @@ def _run_plan_llm_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> No
                     "text": text,
                     "created_at": created,
                     "weeks_left": record["weeks_left"],
+                    "facts_only": facts_only,
+                    "llm_error": meta.get("error"),
                 }
             }
-            job.summary = "Комментарий тренера готов"
+            job.summary = (
+                "Комментарий тренера (факты недели, без LLM)"
+                if facts_only
+                else "Комментарий тренера готов"
+            )
         job.status = "done"
     except Exception as exc:
         job.status = "error"
@@ -3369,6 +4372,8 @@ def _load_plan_llm(db: Database, nick: str) -> dict[str, Any] | None:
         "weeks_left": data.get("weeks_left"),
         "input_hash": data.get("input_hash"),
         "prompt_version": data.get("prompt_version"),
+        "facts_only": bool(data.get("facts_only")),
+        "llm_error": data.get("llm_error"),
     }
 
 # --- Мини-трекер времени ---------------------------------------------------
@@ -3376,23 +4381,6 @@ def _load_plan_llm(db: Database, nick: str) -> dict[str, Any] | None:
 def _now() -> float:
     """Текущий unix-время (сек) — отдельная функция ради тестов (патчат)."""
     return time.time()
-
-
-def _track_key(date: str, user: str) -> str:
-    """Ключ meta с сессией на сайте за дату (на пользователя)."""
-    return f"site_time_{date}_{user}"
-
-
-def _track_state(db: Database, key: str) -> dict[str, float] | None:
-    """Читает сессию трекера {"last", "total"}; нет записи/битый JSON → None."""
-    raw = db.get_meta(key)
-    if not raw:
-        return None
-    try:
-        data = json.loads(raw)
-        return {"last": float(data["last"]), "total": float(data["total"])}
-    except (TypeError, ValueError, KeyError):
-        return None
 
 
 def _lichess_manual_key(date: str, user: str) -> str:
@@ -3439,7 +4427,7 @@ def create_api(
     db_path: Path | None = None,
     data_dir: Path | None = None,
 ) -> FastAPI:
-    app = FastAPI(title="Chess Trainer API", version="0.9.21", docs_url="/api/docs", redoc_url=None)
+    app = FastAPI(title="Chess Trainer API", version="0.9.22", docs_url="/api/docs", redoc_url=None)
     app.state.db_path = Path(db_path) if db_path else settings.db_path
     app.state.data_dir = Path(data_dir) if data_dir else settings.data_dir
 
@@ -3513,8 +4501,19 @@ def create_api(
         return {"ok": True, "nick": clean}
 
     @app.post("/api/user/delete")
-    def api_user_delete(request: Request, nick: str = Form(...)):
-        """Удаляет профиль и его партии/анализ из БД (файлы data/<ник>/ остаются)."""
+    def api_user_delete(
+        request: Request,
+        nick: str = Form(...),
+        password: str = Form(""),
+    ):
+        """Удаляет профиль и его партии/анализ из БД и артефакты на диске.
+
+        Свой аккаунт (в т.ч. для админа): если у профиля есть пароль,
+        обязателен верный ``password`` — повторная авторизация перед
+        необратимым удалением. Паролем не защищённые legacy-профили и
+        удаление ЧУЖОГО профиля админом пароль не требуют (админ может
+        не знать чужой пароль).
+        """
         clean = nick.strip()
         if not clean:
             raise HTTPException(400, "Ник не может быть пустым")
@@ -3523,12 +4522,32 @@ def create_api(
         nick = _session_nick(request, db)
         if not nick:
             raise HTTPException(401, "Нужен вход")
-        if clean.lower() != nick.lower() and not is_admin(db, nick):
+        is_self = clean.lower() == nick.lower()
+        if not is_self and not is_admin(db, nick):
             raise HTTPException(403, "Можно удалить только свой профиль")
+        target = db.get_user_record(clean)
+        if is_self and target and target.get("password_hash"):
+            if not (password or ""):
+                raise HTTPException(
+                    400, "Пароль для подтверждения удаления"
+                )
+            if not verify_password(password, target["password_hash"]):
+                raise HTTPException(401, "Неверный пароль")
         deleted = db.delete_user(clean)
         if deleted:
             _purge_user_jobs(clean)
             _delete_user_artifacts(app.state.data_dir, clean)
+            # Чистим rate-limit счётчик логина удаляемого (хеш логина,
+            # без самого ника; ключ мог остаться после неудачных входов).
+            try:
+                digest = hashlib.sha256(clean.lower().encode("utf-8")).hexdigest()
+                with db._connection() as conn:
+                    conn.execute(
+                        "DELETE FROM meta WHERE key = ?",
+                        (f"login_fail_id:{digest[:32]}",),
+                    )
+            except Exception:  # noqa: BLE001 — удаление профиля важнее чистки
+                logger.debug("cannot purge login rate key for %s", clean)
         return {"ok": True, "nick": clean}
 
     @app.post("/api/user/fide")
@@ -3760,6 +4779,105 @@ def create_api(
             raise HTTPException(404, "No report")
         return rep
 
+    @app.post("/api/report/refresh")
+    def api_report_refresh(request: Request, body: ReportRefreshBody):
+        """Переанализирует устаревшие анализы (нет разметки ``themes``).
+
+        Безопасный путь для старых кешей: только явное подтверждение
+        (``confirm=true``), партии текущего игрока, потолок ``limit`` за
+        вызов. Анализ заменяется только при успешном переанализировании;
+        при ошибке движка прежний успешный анализ остаётся нетронутым, а
+        ошибка попадает в ответ. Партией, которая есть у другого игрока
+        (общий кеш), не трогаем совсем. Старые данные не удаляются.
+        """
+        user = _current_user(app.state.db_path, request)
+        if not user:
+            raise HTTPException(404, "No current user")
+        if not body.confirm:
+            raise HTTPException(
+                400,
+                "Обновление нужно подтвердить явно: переанализ стоит Stockfish-времени "
+                "(глубина 10, ~несколько секунд на партию). Старый анализ заменится "
+                "только после успешного переанализирования. Повтори с confirm=true.",
+            )
+        try:
+            limit = int(body.limit)
+        except (TypeError, ValueError):
+            limit = 10
+        limit = max(1, min(20, limit))
+        if _running_jobs_count() > 0:
+            raise HTTPException(409, "Идёт фоновый анализ — дождись его окончания")
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            pairs = db.get_analyzed_games(user["nick"], limit=200)
+            if body.game_ids is not None:
+                wanted = {gid for gid in body.game_ids if isinstance(gid, str)}
+                target_all = [(g, a) for g, a in pairs if g.id in wanted]
+                found = {g.id for g, _ in target_all}
+                not_found = sorted(wanted - found)
+            else:
+                target_all = [(g, a) for g, a in pairs if analysis_needs_refresh(a)]
+                not_found = []
+            truncated = max(0, len(target_all) - limit)
+            target = target_all[:limit]
+            refreshed: list[str] = []
+            failed: list[dict[str, Any]] = []
+            skipped: list[dict[str, str]] = []
+            for game, _analysis in target:
+                if _analysis_has_foreign_copy(db, game.id, user["nick"]):
+                    skipped.append(
+                        {
+                            "game_id": game.id,
+                            "reason": "партия есть у другого игрока — общий кеш не перезаписываем",
+                        }
+                    )
+                    continue
+                if not game.moves:
+                    skipped.append({"game_id": game.id, "reason": "в партии нет ходов"})
+                    continue
+                try:
+                    with Engine(depth=10, multipv=1, time_ms=800) as engine:
+                        summary = engine.analyze_game(game).summary()
+                except Exception as exc:  # noqa: BLE001 — старая запись остаётся
+                    logger.warning("Refresh analysis failed for %s: %s", game.id, exc)
+                    failed.append({"game_id": game.id, "error": str(exc)})
+                    continue
+                try:
+                    db.save_analysis(game.id, summary, depth=10)
+                except Exception as exc:  # noqa: BLE001 — старая запись остаётся
+                    logger.warning("Refresh save failed for %s: %s", game.id, exc)
+                    failed.append(
+                        {"game_id": game.id, "error": f"анализ не сохранён: {exc}"}
+                    )
+                    continue
+                refreshed.append(game.id)
+            after = db.get_analyzed_games(user["nick"], limit=200)
+            stale_after = [
+                g.id for g, a in after if analysis_needs_refresh(a)
+            ]
+        return {
+            "requested": len(target),
+            "refreshed": refreshed,
+            "failed": failed,
+            "skipped": skipped,
+            "not_found": not_found,
+            "truncated": truncated,
+            "needs_refresh": {
+                "count": len(stale_after),
+                "total": len(after),
+                "game_ids": stale_after[:50],
+            },
+            "cost": (
+                "Каждая партия заново проанализирована Stockfish "
+                "(глубина 10, 1 линия): время пропорционально числу партий."
+            ),
+            "note": (
+                "Старый анализ заменяется только после успешного переанализирования; "
+                "при ошибке движка прежний кеш сохраняется без изменений. "
+                "Данные не удаляются."
+            ),
+        }
+
     @app.get("/api/plan/goal")
     def api_plan_goal_get(request: Request):
         user = _current_user(app.state.db_path, request)
@@ -3830,6 +4948,7 @@ def create_api(
                 _plan_goal_key(user["nick"]),
                 json.dumps(saved, ensure_ascii=False),
             )
+            _save_week_snapshot(db, user["nick"], app.state.data_dir)
         return {"ok": True, **saved}
 
     @app.get("/api/plan/week")
@@ -3839,6 +4958,21 @@ def create_api(
             raise HTTPException(404, "No current user")
         with Database(app.state.db_path) as db:
             return _plan_week_payload(db, user["nick"], app.state.data_dir)
+
+    @app.get("/api/plan/week/snapshot")
+    def api_plan_week_snapshot(request: Request):
+        """Снимок текущей недели + описательные дельты к текущему окну.
+
+        Чистая аналитика чтения: снимок сюда не пишет. Гейты: <7 дней —
+        pending, <10 новых анализов — insufficient_data, иначе сырые
+        дельты со ссылкой на n и оговоркой про отсутствие причинности.
+        """
+        user = _current_user(app.state.db_path, request)
+        if not user:
+            raise HTTPException(404, "No current user")
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            return _week_snapshot_status(db, user["nick"])
 
     @app.get("/api/plan/llm")
     def api_plan_llm_get(request: Request):
@@ -3869,6 +5003,8 @@ def create_api(
             db.init_db()
             entry = _plan_llm_input(db, user["nick"], app.state.data_dir)
             raw = db.get_meta(_plan_llm_key(user["nick"]))
+            if dry_run != "on":
+                _save_week_snapshot(db, user["nick"], app.state.data_dir)
         digest = hashlib.sha256(
             json.dumps(entry, ensure_ascii=False, sort_keys=True).encode("utf-8")
         ).hexdigest()
@@ -3893,6 +5029,8 @@ def create_api(
                     "text": saved["text"],
                     "created_at": saved.get("created_at"),
                     "weeks_left": saved.get("weeks_left"),
+                    "facts_only": bool(saved.get("facts_only")),
+                    "llm_error": saved.get("llm_error"),
                 },
             }
         _check_job_limits(user["nick"])
@@ -4239,6 +5377,9 @@ def create_api(
         """LLM-объяснение идеи линии: факты Explorer/ECO, без выдумок.
 
         Если идеи выключены или LLM недоступен — ``ideas: null`` и 200.
+        Ответ модели дополнительно проверяется ``assert_facts``: при
+        нарушениях ``ideas: null`` и ``rejected: true`` (клиент покажет
+        данные книги вместо непроверенного текста).
         """
         user = _current_user(app.state.db_path, request)
         if not user:
@@ -4252,6 +5393,13 @@ def create_api(
             )
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
+        if isinstance(text, str) and text.strip():
+            facts = _theory_ideas_facts(body.line)
+            try:
+                facttext.assert_facts(text.strip(), facts)
+            except facttext.FactCheckError as exc:
+                logger.info("theory ideas отклонены по фактам: %s", exc)
+                return {"ideas": None, "cached": cached, "rejected": True}
         return {"ideas": text, "cached": cached}
 
     @app.get("/api/games")
@@ -4835,12 +5983,13 @@ def create_api(
 
     # --- Задача дня ---
     @app.get("/api/task/today")
-    def api_task_today(request: Request):
+    def api_task_today(request: Request, repeat: bool = False):
         user = _current_user(app.state.db_path, request)
         if not user:
             raise HTTPException(404, "No current user")
         return _call_data(
-            lambda db: _task_payload(db, user["nick"]), app.state.db_path
+            lambda db: _task_payload(db, user["nick"], repeat=repeat),
+            app.state.db_path,
         )
 
     @app.post("/api/task/answer")
@@ -4862,9 +6011,20 @@ def create_api(
                 best = None
             correct = best is not None and given == best
             # Задача считается решённой только при верном ответе; иначе
-            # пользователь может попробовать ещё раз.
+            # пользователь может попробовать ещё раз. Попытка пишется вне
+            # зависимости от верности; номер попытки копится по позиции.
             if correct:
                 db.set_meta(_task_done_key(payload["date"], user["nick"]), "1")
+            try:
+                attempt = _record_task_attempt(
+                    db, user["nick"], payload["task_key"], payload["date"], correct
+                )
+            except Exception:  # noqa: BLE001 — ответ важнее записи истории
+                logger.warning(
+                    "Не удалось записать попытку для %s", payload["task_key"],
+                    exc_info=True,
+                )
+                attempt = None
             return {
                 "correct": correct,
                 "expected": payload["best_san"],
@@ -4872,6 +6032,7 @@ def create_api(
                 "win_before": payload["win_before"],
                 "win_after": payload["win_after"],
                 "san_played": payload["san_played"],
+                "attempt": attempt,
             }
 
         return _call_data(_check, app.state.db_path)
@@ -4885,7 +6046,7 @@ def create_api(
             lambda db: _task_payload(db, user["nick"]), app.state.db_path
         )
         cached = payload.get("explanation")
-        if cached and not _is_bad_explanation(cached):
+        if cached and not _is_bad_explanation(cached) and _task_explanation_ok(payload, cached):
             return {"cached": True, "explanation": cached}
         _check_job_limits(user["nick"])
         job = CoachJob(
@@ -4926,36 +6087,9 @@ def create_api(
 
         return _call_data(_legal, app.state.db_path)
 
-    # --- Мини-трекер времени ---
-    @app.post("/api/track/ping")
-    def api_track_ping(request: Request):
-        user = _current_user(app.state.db_path, request)
-        if not user:
-            raise HTTPException(404, "No current user")
-        now = _now()
-        day = _today()
-        nick = user["nick"]
-        key = _track_key(day, nick)
-        with Database(app.state.db_path) as db:
-            state = _track_state(db, key)
-            if state is None:
-                total = 0.0
-            else:
-                gap = now - state["last"]
-                total = state["total"] + gap if 0.0 <= gap <= 300.0 else state["total"]
-            db.set_meta(key, json.dumps({"last": now, "total": total}))
-            # Дневной лог: минуты сайта (total/60) и активность по партиям/анализам.
-            activity = db.daily_activity_counts(nick, day)
-            db.upsert_daily_log(
-                nick,
-                day,
-                minutes=int(round(total / 60.0)),
-                games_analyzed=activity["games_analyzed"],
-                analyses=activity["analyses"],
-            )
-        _maybe_snapshot_rating(db, nick, day)
-        return {"ok": True, "total": int(total)}
-
+    # --- Мини-трекер времени: только данные, введённые пользователем ---
+    # Скрытого трекинга сессии нет: время берётся из часов Lichess в
+    # проанализированных партиях и из ручного ввода (/api/track/lichess_manual).
     @app.post("/api/track/lichess_manual")
     def api_track_lichess_manual(request: Request, minutes: str = Form("")):
         user = _current_user(app.state.db_path, request)
@@ -4975,14 +6109,9 @@ def create_api(
         if not user:
             raise HTTPException(404, "No current user")
         day = _today()
-        now = _now()
         with Database(app.state.db_path) as db:
-            state = _track_state(db, _track_key(day, user["nick"]))
             manual_sec = _manual_seconds(db, _lichess_manual_key(day, user["nick"]))
             games = db.get_games(user["nick"], limit=100_000)
-        site_sec = 0.0
-        if state is not None:
-            site_sec = state["total"] + max(0.0, min(now - state["last"], 60.0))
         lichess_sec = 0.0
         games_today = 0
         for game in games:
@@ -4992,10 +6121,9 @@ def create_api(
             lichess_sec += _clock_seconds(game.clocks)
         return {
             "date": day,
-            "site_sec": int(site_sec),
             "lichess_sec": int(lichess_sec),
             "manual_sec": int(manual_sec),
-            "total_sec": int(site_sec + lichess_sec + manual_sec),
+            "total_sec": int(lichess_sec + manual_sec),
             "games_today": games_today,
         }
 
@@ -6048,8 +7176,10 @@ def create_api(
             for item in settings.admin_nicks
             if str(item).strip()
         }
-        if len(password or "") < 4:
-            raise HTTPException(400, "Пароль: минимум 4 символа")
+        if len(password or "") < PASSWORD_MIN_LENGTH:
+            raise HTTPException(
+                400, f"Пароль: минимум {PASSWORD_MIN_LENGTH} символов"
+            )
         lich = (lichess or "").strip()
         if not 1 <= len(lich) <= 64:
             raise HTTPException(400, "Укажи Lichess-ник")
@@ -6097,11 +7227,14 @@ def create_api(
                     ),
                 )
             nick = clean
+        # Успешная регистрация/claim сбрасывает счётчики неудачных входов.
+        _login_rate_clear(db, _login_rate_keys(request, nick))
         token = secrets.token_hex(32)
         db.create_session(nick, token, days=_SESSION_DAYS)
         _set_session_cookie(
             response, token, secure=_request_is_https(request)
         )
+        _maybe_snapshot_rating(db, nick, _today())
         return {"ok": True, "nick": nick}
 
     @app.post("/api/auth/login")
@@ -6114,18 +7247,29 @@ def create_api(
         clean = (login or "").strip()
         db = Database(app.state.db_path)
         db.init_db()
+        rate_keys = _login_rate_keys(request, clean)
+        now = _now()
+        if _login_rate_blocked(db, rate_keys, now):
+            # Ответ намеренно generic: не раскрываем, существует ли аккаунт.
+            raise HTTPException(
+                429, "Слишком много попыток входа. Попробуй позже."
+            )
         rec = db.get_user_record(clean)
         if not rec or not rec.get("password_hash"):
+            _login_rate_record_failure(db, rate_keys, now)
             raise HTTPException(401, "Неверный логин или пароль")
         if not verify_password(password or "", rec["password_hash"]):
+            _login_rate_record_failure(db, rate_keys, now)
             raise HTTPException(401, "Неверный логин или пароль")
         if not _is_active_record(rec):
             raise HTTPException(403, "Доступ ограничен")
+        _login_rate_clear(db, rate_keys)
         token = secrets.token_hex(32)
         db.create_session(rec["nick"], token, days=_SESSION_DAYS)
         _set_session_cookie(
             response, token, secure=_request_is_https(request)
         )
+        _maybe_snapshot_rating(db, rec["nick"], _today())
         return {"ok": True, "nick": rec["nick"]}
 
     @app.post("/api/auth/logout")
@@ -6166,8 +7310,10 @@ def create_api(
             or not verify_password(old or "", rec["password_hash"])
         ):
             raise HTTPException(401, "Неверный старый пароль")
-        if len(new or "") < 4:
-            raise HTTPException(400, "Новый пароль: минимум 4 символа")
+        if len(new or "") < PASSWORD_MIN_LENGTH:
+            raise HTTPException(
+                400, f"Новый пароль: минимум {PASSWORD_MIN_LENGTH} символов"
+            )
         db.set_password_hash(nick, hash_password(new))
         # Все живые сессии (включая текущую) больше не действуют:
         # с новым паролем нужно войти заново.

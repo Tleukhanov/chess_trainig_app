@@ -241,16 +241,16 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(
             set(report), {"verdict", "summary", "plan_comment", "moments", "lesson"}
         )
-        self.assertEqual(report["verdict"], "partial")
+        self.assertIsNone(report["verdict"])
         self.assertEqual(report["moments"], [])
         self.assertTrue(report["summary"])
         self.assertTrue(report["plan_comment"])
         self.assertTrue(report["lesson"])
 
-    def test_normalize_report_coerces_verdict(self) -> None:
-        self.assertEqual(normalize_report({"verdict": " GOOD "})["verdict"], "good")
-        self.assertEqual(normalize_report({"verdict": "wrong"})["verdict"], "wrong")
-        self.assertEqual(normalize_report({"verdict": "нечто"})["verdict"], "partial")
+    def test_normalize_report_ignores_llm_verdict(self) -> None:
+        """verdict от модели в отчёт не попадает — его выставит движок."""
+        for raw in (" GOOD ", "wrong", "нечто"):
+            self.assertIsNone(normalize_report({"verdict": raw})["verdict"])
 
     def test_normalize_report_cleans_moments(self) -> None:
         report = normalize_report(
