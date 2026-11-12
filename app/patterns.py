@@ -22,6 +22,7 @@ __all__ = [
     "MOTIF_FORK",
     "MOTIF_PIN",
     "MOTIF_HANGING",
+    "MOTIF_OTHER",
     "phase",
     "piece_value_on",
     "motifs_for",
@@ -38,6 +39,9 @@ MOTIF_MATE = "пропущенный мат"
 MOTIF_FORK = "вилка"
 MOTIF_PIN = "связка"
 MOTIF_HANGING = "висячая фигура"
+#: Общий бакет мотивов без распознанного узора. Диагностика, не цель:
+#: в CTA/задачи не превращаем (audit M4).
+MOTIF_OTHER = "прочее"
 
 _PIECE_VALUE = {
     chess.PAWN: 1,
@@ -320,7 +324,7 @@ def motif_stats(items: list[dict[str, Any]]) -> dict[str, dict[str, float]]:
         motifs = item.get("motifs") or []
         keys = [motif for motif in motifs if isinstance(motif, str) and motif]
         if not keys:
-            keys = ["прочее"]
+            keys = [MOTIF_OTHER]
         drop = item.get("drop")
         for key in keys:
             counts[key] += 1

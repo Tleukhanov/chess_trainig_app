@@ -241,6 +241,77 @@ def drills(
     }
 
 
+def recent_drills_unnatural(
+    db: Database,
+    user: str | None,
+    *,
+    days: int = 14,
+    root: Path | None = None,
+    now_ms: int | None = None,
+) -> dict[str, Any]:
+    """Неестественные промахи за недавнее окно (audit M5).
+
+    ``drills_unnatural.pgn`` и humanity.json покрывают всё время игры;
+    недельный план берёт только свежие партии. humanity.json items
+    привязываются к окну по ``created_at`` проанализированных партий
+    (``db.get_analyzed_games`` — последние N). Возвращает
+    ``{"days", "games", "unnatural", "total_bad", "source"}``, где ``source``
+    — ``"humanity"`` (items сматчены с окном), ``"no-humanity-items"``
+    (файла нет/нет items — привязать к окну нечего) или ``"no-user"``.
+    Честные нули: нет данных → ``unnatural == 0``, а не выдуманные дрели.
+    """
+    window_days = days if isinstance(days, int) and days > 0 else 14
+    if now_ms is None:
+        import time as _time
+
+        now_ms = int(_time.time() * 1000)
+    cutoff_ms = now_ms - window_days * 86_400_000
+    if not user:
+        return {
+            "days": window_days,
+            "games": 0,
+            "unnatural": 0,
+            "total_bad": 0,
+            "source": "no-user",
+        }
+    try:
+        pairs = repertoire_pairs(db, user)
+    except RuntimeError:
+        pairs = []
+    window_ids = {
+        game.id
+        for game, _ in pairs
+        if getattr(game, "created_at", 0) and int(game.created_at) >= cutoff_ms
+    }
+    raw = load_humanity_raw(humanity_path(user, root=root))
+    items = raw.get("items") if isinstance(raw, dict) else None
+    if not isinstance(items, list):
+        return {
+            "days": window_days,
+            "games": len(window_ids),
+            "unnatural": 0,
+            "total_bad": 0,
+            "source": "no-humanity-items",
+        }
+    unnatural = 0
+    total_bad = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("game_id") not in window_ids:
+            continue
+        total_bad += 1
+        if item.get("verdict") == "unnatural":
+            unnatural += 1
+    return {
+        "days": window_days,
+        "games": len(window_ids),
+        "unnatural": unnatural,
+        "total_bad": total_bad,
+        "source": "humanity",
+    }
+
+
 def report(db: Database, user: str | None) -> dict | None:
     """Отчёт ``build_report`` по последним 200 проанализированным партиям или None."""
     if not user:
@@ -258,6 +329,7 @@ __all__ = [
     "humanity_path",
     "load_humanity",
     "load_humanity_raw",
+    "recent_drills_unnatural",
     "line_to_dict",
     "overview",
     "plan",

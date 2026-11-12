@@ -21,10 +21,15 @@ from .games import Game
 
 __all__ = [
     "UNKNOWN_OPENING",
+    "MIN_WEAK_OPENING_GAMES",
+    "WEAK_OPENING_SHRINKAGE_K",
+    "WEAK_OPENING_MAX_POINTS_PCT",
+    "WEAK_OPENING_MIN_SHRUNK_ERRORS",
     "RepertoireNode",
     "LineSummary",
     "Repertoire",
     "opening_stats",
+    "is_weak_opening",
     "repertoire_to_pgn",
     "repertoire_to_json",
     "format_lines",
@@ -34,9 +39,85 @@ _ERROR_CLASSES = frozenset({"blunder", "mistake"})
 
 #: Название дебюта, когда сервер его не прислал: в сводках по дебютам
 #: такие партии собираются вместе, но как «дебют» они бесполезны —
-#: в частности, их нельзя использовать для сопоставления репертуаров.
+#: в частности, их нельзя использовать для сопоставления репертуаров и
+#: как повод для CTA/рекомендации (audit M4).
 UNKNOWN_OPENING = "Без названия"
 _PGN_DATE = "2026.09.19"
+
+# --- Минимальная доказательная база «слабого» дебюта (audit M4) ----------
+#
+# Стабильное сжатие (shrinkage) ошибок на партию: псевдо-приор — K партий
+# с нулевыми ошибками.
+#
+#     errors_per_game_shrunk = bad_moves / (games + K)
+#                          = errors_per_game * games / (games + K)
+#
+# K = 5 выбран как консервативный приор для любительского уровня: при
+# n = 5 партий оценка стягивается вдвое к нулю, при n >= 25 — минимум на
+# 83% от сырого значения. Сортировка и предикат слабости работают по
+# сжатой оценке, сырое ``errors_per_game`` сохраняется в выводе как есть.
+WEAK_OPENING_SHRINKAGE_K = 5
+#: Минимум партий в дебюте, иначе он не признаётся слабым (малая выборка).
+MIN_WEAK_OPENING_GAMES = 4
+#: Дебют слаб, если счёт в нём ниже break-even...
+WEAK_OPENING_MAX_POINTS_PCT = 50.0
+#: ...или сжатая оценка ошибок на партию не ниже этого порога.
+WEAK_OPENING_MIN_SHRUNK_ERRORS = 1.0
+
+
+def _is_unknown_opening_name(name: Any) -> bool:
+    if name is None:
+        return True
+    text = str(name).strip().lower()
+    return text in ("", UNKNOWN_OPENING.lower(), "unknown", "unknown opening")
+
+
+def is_weak_opening(row: dict[str, Any]) -> bool:
+    """Единый backend-предикат «слабый дебют» для CTA и планов.
+
+    True только если: название дебюта известно; партий не меньше
+    ``MIN_WEAK_OPENING_GAMES``; и есть свидетельство слабости — счёт
+    ниже ``WEAK_OPENING_MAX_POINTS_PCT`` либо сжатые ошибки на партию
+    не ниже ``WEAK_OPENING_MIN_SHRUNK_ERRORS`` (``bad_moves / (games +
+    K)``, K = ``WEAK_OPENING_SHRINKAGE_K``).
+
+    ``UNKNOWN_OPENING``/«Без названия» и короткие выборки всегда False:
+    их нельзя рекомендовать к разбору.
+    """
+    if not isinstance(row, dict):
+        return False
+    if _is_unknown_opening_name(row.get("opening")):
+        return False
+    try:
+        games = int(row.get("games") or 0)
+    except (TypeError, ValueError):
+        return False
+    if games < MIN_WEAK_OPENING_GAMES:
+        return False
+    points = row.get("points_pct")
+    try:
+        points_n = float(points) if points is not None else None
+    except (TypeError, ValueError):
+        points_n = None
+    shrunk = row.get("errors_per_game_shrunk")
+    if shrunk is None:
+        try:
+            bad = row.get("bad_moves")
+            if bad is not None:
+                shrunk_n = float(bad) / (games + WEAK_OPENING_SHRINKAGE_K)
+            else:
+                epg = float(row.get("errors_per_game") or 0.0)
+                shrunk_n = epg * games / (games + WEAK_OPENING_SHRINKAGE_K)
+        except (TypeError, ValueError):
+            shrunk_n = 0.0
+    else:
+        try:
+            shrunk_n = float(shrunk)
+        except (TypeError, ValueError):
+            shrunk_n = 0.0
+    if points_n is not None and points_n < WEAK_OPENING_MAX_POINTS_PCT:
+        return True
+    return shrunk_n >= WEAK_OPENING_MIN_SHRUNK_ERRORS
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,7 +297,10 @@ def opening_stats(
     партии строки сыграны этим цветом, ``mixed`` — партии обоих цветов
     сведены в одну строку (числа относятся к обоим цветам вместе).
     Точные счётчики по цветам — в полях ``white_games`` и ``black_games``.
-    Сортировка: сначала по ошибкам на партию (убыв.), затем по числу партий.
+    Сортировка: по сжатой оценке ошибок на партию (убыв., shrinkage
+    ``bad_moves / (games + K)``, K = ``WEAK_OPENING_SHRINKAGE_K``), затем
+    по числу партий. Поле ``errors_per_game_shrunk`` — та самая сжатая
+    оценка; сырая ``errors_per_game`` сохраняется без изменений.
     """
     groups: dict[tuple[str, str | None], dict[str, Any]] = {}
 
@@ -277,6 +361,7 @@ def opening_stats(
             # а не молчаливое «white».
             color = "mixed"
         points_pct = (group["wins"] + 0.5 * group["draws"]) / games * 100.0 if games else 0.0
+        errors_shrunk = bad / (games + WEAK_OPENING_SHRINKAGE_K) if games else 0.0
         rows.append(
             {
                 "opening": group["opening"],
@@ -287,13 +372,14 @@ def opening_stats(
                 "points_pct": round(points_pct, 1),
                 "bad_moves": bad,
                 "errors_per_game": round(bad / games, 2) if games else 0.0,
+                "errors_per_game_shrunk": round(errors_shrunk, 2),
                 "avg_drop": round(group["sum_drop"] / bad, 2) if bad else 0.0,
                 "color": color,
                 "white_games": white_games,
                 "black_games": black_games,
             }
         )
-    rows.sort(key=lambda row: (-row["errors_per_game"], -row["games"]))
+    rows.sort(key=lambda row: (-row["errors_per_game_shrunk"], -row["games"]))
     return rows
 
 

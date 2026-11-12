@@ -96,7 +96,7 @@ from .progress import (
     SNAPSHOT_VERSION,
 )
 from .opening_book import build_opening_book
-from .repertoire import Repertoire, opening_stats
+from .repertoire import Repertoire, is_weak_opening, opening_stats
 from .report import build_report
 
 # --- job registry ----------------------------------------------------------
@@ -2777,13 +2777,23 @@ def _week_phases(plan: dict[str, Any] | None) -> list[tuple[str, dict[str, Any]]
     return out
 
 
+#: Минимум ошибок в фазе, чтобы фаза могла стать фокусом недели
+#: (audit M4): меньше — max по avg_drop это шум, а не сигнал.
+_MIN_PHASE_ERRORS = 3
+
+#: Окно для подсчёта дрелей (audit M5): последние N дней по created_at.
+_DRILLS_WINDOW_DAYS = 14
+
+
 def _resolve_week_focus(
     goal: dict[str, Any], plan: dict[str, Any] | None
 ) -> tuple[str, str]:
     """Фаза фокуса недели + человеческое обоснование с цифрами.
 
-    Явный фокус цели побеждает; иначе — слабейшая фаза по avg_drop;
-    без данных — 'middlegame' по умолчанию.
+    Явный фокус цели побеждает; иначе — слабейшая фаза по avg_drop среди
+    фаз, где набралось хотя бы ``_MIN_PHASE_ERRORS`` ошибок. Если таких
+    фаз нет — fallback «middlegame» с честным обоснованием «мало данных»,
+    а не шумный максимум одной-двух ошибок.
     """
     phases = _week_phases(plan)
     by_phase = {name: stats for name, stats in phases}
@@ -2793,22 +2803,62 @@ def _resolve_week_focus(
         if stats:
             count = int(stats.get("count") or 0)
             avg = float(stats.get("avg_drop") or 0.0)
-            return wanted, f"твой выбор; {count} ошибок, средняя потеря {avg:.1f}%"
-        return wanted, "выбран тобой в цели"
-    if phases:
+            if count < _MIN_PHASE_ERRORS:
+                return (
+                    wanted,
+                    f"твой выбор; всего {count} ошибок за окно — мало данных, "
+                    f"вывод осторожный (средняя потеря {avg:.1f}%)",
+                )
+            return wanted, (
+                f"твой выбор; {count} ошибок, средняя потеря {avg:.1f}% "
+                "за окно последних проанализированных партий"
+            )
+        return wanted, "выбран тобой в цели (данных по фазе пока нет)"
+    qualified = [
+        (name, stats)
+        for name, stats in phases
+        if int((stats or {}).get("count") or 0) >= _MIN_PHASE_ERRORS
+    ]
+    if qualified:
         name, stats = max(
-            phases, key=lambda item: float((item[1] or {}).get("avg_drop") or 0.0)
+            qualified, key=lambda item: float((item[1] or {}).get("avg_drop") or 0.0)
         )
         count = int(stats.get("count") or 0)
         avg = float(stats.get("avg_drop") or 0.0)
-        return name, f"{count} ошибок, средняя потеря {avg:.1f}%"
-    return "middlegame", "нет данных анализа — взят миттельшпиль по умолчанию"
+        return (
+            name,
+            f"{count} ошибок (мин. {_MIN_PHASE_ERRORS} для выбора), "
+            f"средняя потеря {avg:.1f}% — за окно последних проанализированных партий",
+        )
+    return (
+        "middlegame",
+        f"мало данных: ни в одной фазе не набралось {_MIN_PHASE_ERRORS} ошибок — "
+        "фокус по умолчанию, собираем базу",
+    )
 
 
 def _week_drills_portion(unnatural: int) -> int:
-    """Дневная порция дрелей: min(20, max(5, ceil(unnatural/7)))."""
-    portion = (max(0, int(unnatural)) + 6) // 7
-    return min(20, max(5, portion))
+    """Дневная порция дрелей: ``ceil(unnatural / 7)``, cap 20, без пола.
+
+    ``unnatural`` — неестественные промахи за последние
+    ``_DRILLS_WINDOW_DAYS`` дней (не all-time счётчик). При нуле
+    доказательств — ноль дрелей, а не искусственная пятёрка (audit M5).
+    """
+    n = max(0, int(unnatural or 0))
+    if n <= 0:
+        return 0
+    return min(20, (n + 6) // 7)
+
+
+def _weak_opening_rows(
+    plan: dict[str, Any] | None, limit: int | None = None
+) -> list[dict[str, Any]]:
+    """Слабые дебюты из плана, прошедшие единый предикат (audit M4)."""
+    if not isinstance(plan, dict):
+        return []
+    raw = (plan.get("repertoire") or {}).get("weak_openings")
+    rows = [row for row in (raw or []) if is_weak_opening(row)]
+    return rows[:limit] if limit is not None else rows
 
 
 def _build_week_tasks(
@@ -2817,40 +2867,95 @@ def _build_week_tasks(
     weak_opening: dict[str, Any] | None,
     focus_phase: str,
     focus_reason: str,
-) -> list[dict[str, str]]:
-    """Детерминированный список задач на неделю (ключи key/text/detail)."""
+    drills_window: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Детерминированный список задач на неделю.
+
+    Каждая задача несёт ``est_minutes`` (на день). Сумма оценок по
+    активным задачам не превышает ``floor(minutes * 0.8)``: при нехватке
+    бюджета оценки урезаются консервативно (never overestimate), начиная
+    с дрелей. Если за окно в ``_DRILLS_WINDOW_DAYS`` дней неестественных
+    промахов ноль — задача «дрели» не назначается вовсе (audit M5).
+    """
     portion = _week_drills_portion(unnatural)
     phase_ru = _PLAN_FOCUS_RU.get(focus_phase, focus_phase)
     phase_prep = _PLAN_FOCUS_PREP.get(focus_phase, phase_ru)
-    tasks = [
+
+    window = drills_window if isinstance(drills_window, dict) else {}
+    window_days = int(window.get("days") or _DRILLS_WINDOW_DAYS)
+    window_games = window.get("games")
+    window_bad = window.get("total_bad")
+    games_txt = (
+        f"{int(window_games)} партий в окне" if isinstance(window_games, int) else "окно последних проанализированных партий"
+    )
+
+    # Сырые оценки (на день), затем консервативная подгонка под бюджет.
+    opening_est = 4   # ~30 мин в неделю: разбор 2 партий
+    phase_est = 5     # ~35 мин в неделю: разбор 3 партий
+    daily_est = 5     # задача дня
+    drills_est = 2 * portion
+    budget = max(0, int(minutes) * 8 // 10)
+
+    estimates: dict[str, int] = {}
+    remaining = budget
+    for key, raw_est in (
+        ("daily-task", daily_est),
+        ("drills", drills_est),
+        ("opening", opening_est),
+        ("phase", phase_est),
+    ):
+        if key == "drills" and portion <= 0:
+            continue
+        est = min(raw_est, remaining)
+        estimates[key] = est
+        remaining -= est
+
+    tasks: list[dict[str, Any]] = [
         {
             "key": "daily-task",
             "text": "Решай задачу дня каждый день (7 из 7)",
             "detail": "задача дня ×7: ни дня без тактики",
-        },
-        {
-            "key": "drills",
-            "text": f"Реши {portion} дрелей в день",
-            "detail": f"{unnatural} неестественных ошибок за неделю — по {portion} в день",
+            "est_minutes": estimates["daily-task"],
         },
     ]
+    if portion > 0:
+        detail = (
+            f"{unnatural} неестественных промахов за последние {window_days} дней "
+            f"({games_txt}) — по {portion} в день"
+        )
+        if isinstance(window_bad, int) and window_bad > 0:
+            detail += f" из {window_bad} плохих ходов в окне"
+        tasks.append(
+            {
+                "key": "drills",
+                "text": f"Реши {portion} дрелей в день",
+                "detail": detail,
+                "est_minutes": estimates["drills"],
+            }
+        )
     if weak_opening:
         name = str(weak_opening.get("opening") or "—")
-        epg = weak_opening.get("errors_per_game")
+        epg = weak_opening.get("errors_per_game_shrunk", weak_opening.get("errors_per_game"))
         epg_txt = f"{float(epg):.2f}" if isinstance(epg, (int, float)) else "—"
+        opening_detail = (
+            f"сжатая оценка: {epg_txt} ошибок на партию "
+            f"(приор k=5, {int(weak_opening.get('games') or 0)} партий)"
+        )
         tasks.append(
             {
                 "key": "opening",
                 "text": f"Разобрать 2 партии в дебюте «{name}»",
-                "detail": f"худший дебют: {epg_txt} ошибок на партию",
+                "detail": opening_detail,
+                "est_minutes": estimates["opening"],
             }
         )
     else:
         tasks.append(
             {
                 "key": "opening",
-                "text": "Разобрать 2 партии в слабейшем дебюте",
-                "detail": "нет данных по дебютам — возьми любые 2 проигранные",
+                "text": "Дебютный фокус не выбран",
+                "detail": "нет дебюта с достаточной выборкой и плохой формой — данных для рекомендации нет",
+                "est_minutes": estimates["opening"],
             }
         )
     tasks.append(
@@ -2858,13 +2963,7 @@ def _build_week_tasks(
             "key": "phase",
             "text": f"Разобрать 3 партии с ошибками в {phase_prep}",
             "detail": f"фокус недели: {phase_ru} ({focus_reason})",
-        }
-    )
-    tasks.append(
-        {
-            "key": "time",
-            "text": f"Занимайся {minutes} мин в день ({minutes * 7} мин за неделю)",
-            "detail": "время из твоей цели: минута в день лучше часа раз в неделю",
+            "est_minutes": estimates["phase"],
         }
     )
     return tasks
@@ -2874,49 +2973,76 @@ def _build_human_summary(
     focus_phase: str,
     phases: list[tuple[str, dict[str, Any]]],
     weak_opening: dict[str, Any] | None,
-    humanity: dict[str, Any] | None,
+    drills_window: dict[str, Any] | None,
     drills_today: int,
 ) -> str:
-    """Человеческий итог недели шаблонами, без LLM (3–5 предложений)."""
+    """Человеческий итог недели шаблонами, без LLM (3–5 предложений).
+
+    Про неестественные промахи говорится по окну последних
+    ``_DRILLS_WINDOW_DAYS`` дней (не all-time), с числом партий/плохих
+    ходов и честным «нет данных» при пустом окне.
+    """
     phase_ru = _PLAN_FOCUS_RU.get(focus_phase, focus_phase)
     parts: list[str] = []
     stats = dict(phases).get(focus_phase) if phases else None
-    if stats:
+    if stats and int(stats.get("count") or 0) >= _MIN_PHASE_ERRORS:
         count = int(stats.get("count") or 0)
         avg = float(stats.get("avg_drop") or 0.0)
         parts.append(
-            f"Главная дыра — {phase_ru}: {count} ошибок, средняя потеря {avg:.1f}%."
+            f"Главная дыра — {phase_ru}: {count} ошибок за окно последних "
+            f"проанализированных партий, средняя потеря {avg:.1f}%."
         )
     else:
-        parts.append(f"На неделе качаем {phase_ru}: данных пока мало, собираем базу.")
+        parts.append(f"На неделе качаем {phase_ru}: данных за окно мало, собираем базу.")
     if weak_opening:
         name = str(weak_opening.get("opening") or "—")
-        epg = weak_opening.get("errors_per_game")
+        epg = weak_opening.get("errors_per_game_shrunk", weak_opening.get("errors_per_game"))
         epg_txt = f"{float(epg):.2f}" if isinstance(epg, (int, float)) else "—"
-        parts.append(f"Худший дебют — {name}: {epg_txt} ошибок на партию.")
-    total = 0
-    unnatural = 0
-    if isinstance(humanity, dict):
-        total = int(humanity.get("total") or 0)
-        unnatural = int(humanity.get("unnatural") or 0)
-    if total <= 0:
-        parts.append("Нет данных о человечности ошибок — запусти оценку ошибок, чтобы делать вывод.")
+        games_n = int(weak_opening.get("games") or 0)
+        parts.append(
+            f"Слабый дебют — {name}: {epg_txt} ошибок на партию "
+            f"(сжатая оценка, {games_n} партий)."
+        )
+    window = drills_window if isinstance(drills_window, dict) else {}
+    window_days = int(window.get("days") or _DRILLS_WINDOW_DAYS)
+    window_games = int(window.get("games") or 0)
+    unnatural = int(window.get("unnatural") or 0)
+    total_bad = int(window.get("total_bad") or 0)
+    if total_bad <= 0:
+        if window.get("source") == "humanity":
+            parts.append(
+                f"За последние {window_days} дней плохих ходов в окне ({window_games} партий) "
+                "не найдено — выводов о человечности не делаем."
+            )
+        else:
+            parts.append(
+                f"Нет данных для оценки неестественности за последние {window_days} дней "
+                "(нужна оценка ошибок) — выводов не делаем."
+            )
     else:
-        share = round(unnatural / total * 100, 1)
+        share = round(unnatural / total_bad * 100, 1)
         if share >= 40.0:
             parts.append(
-                f"Много случайных ходов — {share}% неестественных из {total}: "
+                f"Много случайных ходов за последние {window_days} дней — "
+                f"{share}% неестественных из {total_bad} ({window_games} партий в окне): "
                 "играй медленнее, считай до конца."
             )
         else:
             parts.append(
-                f"Ошибки в основном естественные ({share}% неестественных из {total}) — "
+                f"За последние {window_days} дней ошибки в основном естественные "
+                f"({share}% неестественных из {total_bad}, {window_games} партий в окне) — "
                 "работаем над счётом."
             )
-    parts.append(
-        f"Вывод на неделю: качаем {phase_ru} — {drills_today} дрелей в день "
-        "плюс разбор партий из списка выше."
-    )
+    if drills_today > 0:
+        parts.append(
+            f"Вывод на неделю: качаем {phase_ru} — {drills_today} дрелей в день "
+            f"(по окну {window_days} дней) плюс разбор партий из списка выше."
+        )
+    else:
+        parts.append(
+            f"Вывод на неделю: качаем {phase_ru}; дрелей не назначаю — "
+            f"за последние {window_days} дней неестественных промахов не найдено."
+        )
     return " ".join(parts)
 
 
@@ -3034,25 +3160,32 @@ def _plan_week_payload(db: Database, nick: str, data_dir: Any) -> dict[str, Any]
     phases = _week_phases(plan)
     focus_phase, focus_reason = _resolve_week_focus(goal, plan)
 
-    weak_openings = []
-    if isinstance(plan, dict):
-        weak_openings = (plan.get("repertoire") or {}).get("weak_openings") or []
-    weak_opening = weak_openings[0] if weak_openings else None
+    weak_opening = None
+    weak_openings = _weak_opening_rows(plan, limit=1)
+    if weak_openings:
+        weak_opening = weak_openings[0]
 
     drills_total = 0
-    unnatural = 0
-    humanity = None
     if isinstance(plan, dict):
         drills = plan.get("drills") or {}
         try:
             drills_total = int(drills.get("total") or 0)
         except (TypeError, ValueError):
             drills_total = 0
-        try:
-            unnatural = int(drills.get("unnatural") or 0)
-        except (TypeError, ValueError):
-            unnatural = 0
-        humanity = plan.get("humanity")
+    # Дрели — по окну последних _DRILLS_WINDOW_DAYS дней, не all-time.
+    try:
+        drills_window = shared_data.recent_drills_unnatural(
+            db, nick, days=_DRILLS_WINDOW_DAYS, root=data_dir
+        )
+    except Exception:
+        drills_window = {
+            "days": _DRILLS_WINDOW_DAYS,
+            "games": 0,
+            "unnatural": 0,
+            "total_bad": 0,
+            "source": "no-humanity-items",
+        }
+    unnatural = int(drills_window.get("unnatural") or 0)
     drills_today = _week_drills_portion(unnatural)
 
     try:
@@ -3079,22 +3212,34 @@ def _plan_week_payload(db: Database, nick: str, data_dir: Any) -> dict[str, Any]
     )
     evidence = _week_evidence(db, nick, focus_phase, weak_opening_name)
 
+    # Планируемый бюджет: 0.8 от минуты пользователя — не больше.
+    week_tasks = _build_week_tasks(
+        minutes, unnatural, weak_opening, focus_phase, focus_reason, drills_window
+    )
+
     return {
         "goal": goal["goal"],
         "minutes_per_day": minutes,
         "focus": {"phase": focus_phase, "reason": focus_reason},
         "evidence": evidence,
-        "week_tasks": _build_week_tasks(
-            minutes, unnatural, weak_opening, focus_phase, focus_reason
-        ),
+        "week_tasks": week_tasks,
+        "week_budget_minutes": int(minutes) * 8 // 10,
         "today": {
             "task_done": task_done,
             "time_sec": time_sec,
             "drills_today": drills_today,
             "drills_total": drills_total,
+            # Честная метка окна: откуда взяты дрели (audit M5/M8).
+            "drills_window": {
+                "days": int(drills_window.get("days") or _DRILLS_WINDOW_DAYS),
+                "games": int(drills_window.get("games") or 0),
+                "unnatural": unnatural,
+                "total_bad": int(drills_window.get("total_bad") or 0),
+                "source": str(drills_window.get("source") or "no-humanity-items"),
+            },
         },
         "human_summary": _build_human_summary(
-            focus_phase, phases, weak_opening, humanity, drills_today
+            focus_phase, phases, weak_opening, drills_window, drills_today
         ),
     }
 
@@ -3121,15 +3266,22 @@ def _week_snapshot_payload(
     goal = _load_plan_goal(db, nick)
     focus_phase, _ = _resolve_week_focus(goal, plan)
 
+    try:
+        # drills_target — дневная норма из свежего окна, как в /api/plan/week.
+        unnatural = int(
+            shared_data.recent_drills_unnatural(
+                db, nick, days=_DRILLS_WINDOW_DAYS, root=data_dir
+            ).get("unnatural")
+            or 0
+        )
+    except Exception:
+        unnatural = 0
+
     weak_openings: list[dict[str, Any]] = []
     motifs: list[dict[str, Any]] = []
-    unnatural = 0
     if isinstance(plan, dict):
-        for item in (
-            (plan.get("repertoire") or {}).get("weak_openings") or []
-        )[:3]:
-            if not isinstance(item, dict):
-                continue
+        # Снимок фиксирует только подтверждённо слабые дебюты (audit M4).
+        for item in _weak_opening_rows(plan, limit=3):
             try:
                 games_n = int(item.get("games") or 0)
             except (TypeError, ValueError):
@@ -3161,10 +3313,6 @@ def _week_snapshot_payload(
             )
             if len(motifs) >= 3:
                 break
-        try:
-            unnatural = int((plan.get("drills") or {}).get("unnatural") or 0)
-        except (TypeError, ValueError):
-            unnatural = 0
     return {
         "window_n": summary["window_n"],
         "focus_phase": focus_phase,
@@ -3360,48 +3508,49 @@ def _plan_llm_input(db: Database, nick: str, data_dir: Any) -> dict[str, Any]:
     focus_phase, focus_reason = _resolve_week_focus(goal, plan)
     weak_openings: list[dict[str, Any]] = []
     drills_total = 0
-    drills_unnatural = 0
     humanity = None
     score_pct = None
     avg_win_loss = None
     if plan is not None:
-        raw_weak = (plan.get("repertoire") or {}).get("weak_openings") or []
-        for item in raw_weak[:6]:
-            if not isinstance(item, dict):
-                continue
-            games = item.get("games")
-            points = item.get("points_pct")
-            errors = item.get("errors_per_game")
+        for item in _weak_opening_rows(plan, limit=3):
             try:
-                games_n = int(games) if games is not None else 0
-                points_n = float(points) if points is not None else 0.0
-                errors_n = float(errors) if errors is not None else 0.0
+                errors_n = float(
+                    item.get(
+                        "errors_per_game_shrunk", item.get("errors_per_game") or 0.0
+                    )
+                )
             except (TypeError, ValueError):
-                games_n, points_n, errors_n = 0, 0.0, 0.0
-            if games_n < 2 and points_n >= 70 and errors_n < 1.5:
-                continue
+                errors_n = 0.0
             weak_openings.append(
                 {
                     "opening": str(item.get("opening") or "—"),
                     "errors_per_game": round(errors_n, 2),
                 }
             )
-            if len(weak_openings) >= 3:
-                break
         drills = plan.get("drills") or {}
         try:
             drills_total = int(drills.get("total") or 0)
         except (TypeError, ValueError):
             drills_total = 0
-        try:
-            drills_unnatural = int(drills.get("unnatural") or 0)
-        except (TypeError, ValueError):
-            drills_unnatural = 0
         humanity = plan.get("humanity")
         if isinstance(plan.get("score_pct"), (int, float)):
             score_pct = round(float(plan["score_pct"]), 1)
         if isinstance(plan.get("avg_win_loss"), (int, float)):
             avg_win_loss = round(float(plan["avg_win_loss"]), 2)
+
+    try:
+        drills_window = shared_data.recent_drills_unnatural(
+            db, nick, days=_DRILLS_WINDOW_DAYS, root=data_dir
+        )
+    except Exception:
+        drills_window = {
+            "days": _DRILLS_WINDOW_DAYS,
+            "games": 0,
+            "unnatural": 0,
+            "total_bad": 0,
+            "source": "no-humanity-items",
+        }
+    drills_unnatural = int(drills_window.get("unnatural") or 0)
 
     level = _plan_player_level(db, nick)
 
@@ -3428,6 +3577,8 @@ def _plan_llm_input(db: Database, nick: str, data_dir: Any) -> dict[str, Any]:
         "unnatural_verdict": _plan_unnatural_verdict(humanity),
         "drills_total": drills_total,
         "drills_unnatural": drills_unnatural,
+        "drills_window_days": int(drills_window.get("days") or _DRILLS_WINDOW_DAYS),
+        "drills_window_games": int(drills_window.get("games") or 0),
         "score_pct": score_pct,
         "avg_win_loss": avg_win_loss,
         "week_tasks": _build_week_tasks(
@@ -3436,6 +3587,7 @@ def _plan_llm_input(db: Database, nick: str, data_dir: Any) -> dict[str, Any]:
             weak_openings[0] if weak_openings else None,
             focus_phase,
             focus_reason,
+            drills_window,
         ),
         "prompt_version": 2,
     }
@@ -3514,7 +3666,7 @@ def _plan_llm_messages(entry: dict[str, Any]) -> list[ChatMessage]:
             if isinstance(t, dict) and t.get("text")
         ) + ".",
         f"Человечность: {entry.get('unnatural_verdict')}.",
-        f"Дрели: всего {entry.get('drills_total')}, неестественных {entry.get('drills_unnatural')}.",
+        f"Дрели: всего в кеше {entry.get('drills_total')}; неестественных за последние {entry.get('drills_window_days') or _DRILLS_WINDOW_DAYS} дней ({entry.get('drills_window_games') or 0} партий в окне): {entry.get('drills_unnatural')}.",
         f"Счёт: {score if score is not None else '—'}%; средняя потеря: {loss if loss is not None else '—'}%.",
         "Ответ — только объяснение, почему такой план, без нового списка задач.",
     ]

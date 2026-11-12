@@ -754,13 +754,23 @@ function onboardingStepsHtml(plan, dayplan) {
     </div>`;
 }
 
+// Зеркало backend-предиката is_weak_opening (app/repertoire.py, audit M4):
+// известное название; >= 4 партий; счёт < 50% или сжатая оценка ошибок
+// на партию >= 1.0 (bad_moves / (games + 5), приор k=5). «Без названия» — никогда.
 function isWeakOpening(o) {
+  const name = String((o && o.opening) || '').trim().toLowerCase();
+  if (!name || name === 'без названия' || name === 'unknown') return false;
   const games = Number(o && o.games) || 0;
+  if (games < 4) return false;
   const points = Number(o && o.points_pct);
-  const errors = Number(o && o.errors_per_game) || 0;
-  if (games >= 2) return true;
-  if (Number.isFinite(points) && points < 70) return true;
-  return errors >= 1.5;
+  const shrunkRaw = o && o.errors_per_game_shrunk;
+  let shrunk = Number(shrunkRaw);
+  if (!Number.isFinite(shrunk)) {
+    const epg = Number(o && o.errors_per_game) || 0;
+    shrunk = epg * games / (games + 5);
+  }
+  if (Number.isFinite(points) && points < 50) return true;
+  return shrunk >= 1.0;
 }
 
 async function viewDashboard(app) {
@@ -800,7 +810,7 @@ async function viewDashboard(app) {
 
   const scorePct = plan.score_pct != null ? fmt(plan.score_pct) + '%' : '—';
   const avgWinLoss = plan.avg_win_loss != null ? fmt(plan.avg_win_loss, 2) : '—';
-  const weakCount = plan.repertoire.weak_openings.length;
+  const weakCount = (plan.repertoire.weak_openings || []).filter(isWeakOpening).length;
 
   let humanityHtml = '';
   if (plan.humanity) {
@@ -820,22 +830,23 @@ async function viewDashboard(app) {
   if (weakRows.length > 0) {
     weakOpeningsHtml = `
       <div class="table-wrap"><table>
-        <thead><tr><th>Дебют</th><th>ECO</th><th>Партий</th><th>Очков %</th><th>Ошибок/партию</th><th>Ср. потеря</th><th></th></tr></thead>
+        <thead><tr><th>Дебют</th><th>ECO</th><th>Партий</th><th>Очков %</th><th>Ошибок/партию (сжато)</th><th>Ср. потеря</th><th></th></tr></thead>
         <tbody>
           ${weakRows.slice(0, 6).map(o => `
             <tr>
               <td>${esc(o.opening)}</td><td>${esc(o.eco)}</td>
               <td class="num">${o.games}</td>
               <td class="num">${fmt(o.points_pct)}%</td>
-              <td class="num">${fmt(o.errors_per_game, 2)}</td>
+              <td class="num">${fmt(o.errors_per_game_shrunk != null ? o.errors_per_game_shrunk : o.errors_per_game, 2)}</td>
               <td class="num">${fmt(o.avg_drop)}%</td>
               <td class="center"><button type="button" class="btn btn-secondary" data-train-opening="${esc(o.eco || '')}" data-train-color="${esc(o.color || 'white')}" data-train-name="${esc(o.opening || '')}" style="font-size:12px;padding:4px 10px">Тренировать</button></td>
             </tr>`).join('')}
         </tbody>
       </table></div>`;
   } else {
-    weakOpeningsHtml = '<p style="color:var(--c-text-muted)">Дебютов нет — запусти анализ.</p>';
+    weakOpeningsHtml = '<p style="color:var(--c-text-muted)">Нет дебюта с достаточной выборкой (минимум 4 партии и счёт ниже 50% либо ≥ 1.0 ошибок на партию после сжатия) — данных для рекомендации нет.</p>';
   }
+  weakOpeningsHtml += `<p style="color:var(--c-text-muted);font-size:12px;margin:6px 0 0">Окно: последние ${esc(String(plan.games || 0))} проанализированных партий из кеша · фильтр: ≥ 4 партий на дебют, «Без названия» исключено, ошибки сжаты приором k=5.</p>`;
 
   let trendHtml = '';
   if (progress && progress.trend && progress.trend.sufficient) {
@@ -1261,7 +1272,7 @@ async function viewPlan(app) {
     </div>
     <div class="card">
       <div class="card-header"><span class="card-title">Слабые дебюты</span></div>
-      ${(() => { const rows = (plan.repertoire.weak_openings || []).filter(isWeakOpening); return rows.length ? `<div class="table-wrap"><table><thead><tr><th>Дебют</th><th>ECO</th><th>Партий</th><th>Очков %</th><th>Ошибок/партию</th><th>Ср. потеря</th></tr></thead><tbody>${rows.slice(0, 6).map(o => `<tr><td>${esc(o.opening)}</td><td>${esc(o.eco)}</td><td class="num">${o.games}</td><td class="num">${fmt(o.points_pct)}%</td><td class="num">${fmt(o.errors_per_game, 2)}</td><td class="num">${fmt(o.avg_drop)}%</td></tr>`).join('')}</tbody></table></div>` : '<p style="color:var(--c-text-muted)">Мало данных: нет дебюта с достаточной выборкой или плохими очками.</p>'; })()}
+      ${(() => { const rows = (plan.repertoire.weak_openings || []).filter(isWeakOpening); return rows.length ? `<div class="table-wrap"><table><thead><tr><th>Дебют</th><th>ECO</th><th>Партий</th><th>Очков %</th><th>Ошибок/партию (сжато)</th><th>Ср. потеря</th></tr></thead><tbody>${rows.slice(0, 6).map(o => `<tr><td>${esc(o.opening)}</td><td>${esc(o.eco)}</td><td class="num">${o.games}</td><td class="num">${fmt(o.points_pct)}%</td><td class="num">${fmt(o.errors_per_game_shrunk != null ? o.errors_per_game_shrunk : o.errors_per_game, 2)}</td><td class="num">${fmt(o.avg_drop)}%</td></tr>`).join('')}</tbody></table></div><p style="color:var(--c-text-muted);font-size:12px;margin:6px 0 0">Фильтр: ≥ 4 партий на дебют, «Без названия» исключено, ошибки/партию сжаты приором k=5.</p>` : '<p style="color:var(--c-text-muted)">Нет дебюта с достаточной выборкой (минимум 4 партии и счёт ниже 50% либо ≥ 1.0 ошибок на партию после сжатия) — рекомендаций нет.</p>'; })()}
     </div>
     <div class="grid grid-2">
       <div class="card">
@@ -4648,7 +4659,7 @@ const MIDDLEGAME_MIN_PLAN = 20;
 const MIDDLEGAME_MAX_PLIES = 60;
 const MIDDLEGAME_STRENGTH_LABELS = { equal: 'равный', plus100: '+100', plus200: '+200', hybrid: 'Maia+' };
 const MIDDLEGAME_VERDICTS = {
-  good: { label: 'План доказан', badge: 'badge-good' },
+  good: { label: 'План сработал', badge: 'badge-good' },
   partial: { label: 'Частично', badge: 'badge-neutral' },
   wrong: { label: 'План не сработал', badge: 'badge-bad' },
 };

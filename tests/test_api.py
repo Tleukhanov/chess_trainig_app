@@ -2021,7 +2021,7 @@ class PlanWeekTests(ApiTestBase):
                         opponent="Rival",
                         opening="Ruy Lopez",
                         eco="C70",
-                        created_at=100,
+                        created_at=int(time.time() * 1000),
                     ),
                 ],
                 "tester",
@@ -2063,18 +2063,159 @@ class PlanWeekTests(ApiTestBase):
         self.assertIsInstance(data["week_tasks"], list)
         self.assertTrue(data["week_tasks"])
         for task in data["week_tasks"]:
-            self.assertEqual(set(task), {"key", "text", "detail"})
+            self.assertEqual(set(task), {"key", "text", "detail", "est_minutes"})
+            self.assertIsInstance(task["est_minutes"], int)
         self.assertEqual(
             set(data["today"]),
-            {"task_done", "time_sec", "drills_today", "drills_total"},
+            {"task_done", "time_sec", "drills_today", "drills_total", "drills_window"},
+        )
+        self.assertEqual(
+            set(data["today"]["drills_window"]),
+            {"days", "games", "unnatural", "total_bad", "source"},
         )
         self.assertIsInstance(data["human_summary"], str)
         self.assertTrue(data["human_summary"])
 
     def test_week_focus_auto_picks_weakest_phase(self):
         data = self._get_week()
-        # миттельшпиль −30 против дебюта −10: слабейшая фаза по avg_drop.
+        # В одной партии 1 ошибка в дебюте и 1 в миттельшпиле: меньше
+        # минимальных 3 ошибок на фазу → fallback «middlegame» с честным
+        # обоснованием «мало данных», а не шумный максимум.
         self.assertEqual(data["focus"]["phase"], "middlegame")
+        self.assertIn("мало данных", data["focus"]["reason"])
+
+    def _seed_week_multi(self) -> None:
+        """Три партии: у каждой грубая ошибка в миттельшпиле (−30)
+        и ошибка в дебюте (−10) — миттельшпиль набирает ≥ 3 ошибок."""
+        now_ms = int(time.time() * 1000)
+        for index in range(3):
+            sans = [
+                "e4", "e5", "Nf3", "Nc6", "Bb5", "a6", "Ba4", "Nf6",
+                "O-O", "Be7", "Re1", "b5", "Bb3", "d6",
+            ]
+            entries = []
+            for i, san in enumerate(sans):
+                if i == 4:
+                    entries.append(self._move(san, "mistake", 10.0, 55.0, 45.0, "Bc4"))
+                elif i == 12:
+                    entries.append(self._move(san, "blunder", 30.0, 60.0, 30.0, "Bc2"))
+                else:
+                    entries.append(self._move(san, "best", 0.0, 55.0, 55.0, san))
+            with Database(self.db_path) as db:
+                db.init_db()
+                db.save_games(
+                    [
+                        mkgame_moves(
+                            f"wk{index}",
+                            sans,
+                            user_color="white",
+                            result_for_user="loss",
+                            opponent="Rival",
+                            opening="Ruy Lopez",
+                            eco="C70",
+                            created_at=now_ms + index,
+                        ),
+                    ],
+                    "tester",
+                )
+                db.save_analysis(
+                    f"wk{index}",
+                    {
+                        "game_id": f"wk{index}",
+                        "user_color": "white",
+                        "result_for_user": "loss",
+                        "opponent": "Rival",
+                        "avg_win_loss": 20.0,
+                        "avg_win_before": 55.0,
+                        "blunders": [12],
+                        "mistakes": [4],
+                        "inaccuracies": [],
+                        "missed_wins": [],
+                        "time_pressure_blunders": [],
+                        "moves": entries,
+                    },
+                    depth=8,
+                )
+                db.set_current_user("tester")
+
+    def test_week_focus_picks_weakest_phase_with_enough_evidence(self):
+        self._seed_week_multi()
+        data = self.client.get("/api/plan/week")
+        self.assertEqual(data.status_code, 200)
+        payload = data.json()
+        self.assertEqual(payload["focus"]["phase"], "middlegame")
+        self.assertIn("3 ошибок", payload["focus"]["reason"])
+
+    def _seed_humanity(self, items) -> None:
+        path = self.data_dir / "tester" / "humanity.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "total_bad": len(items),
+                    "verdicts": {"natural": 0, "borderline": 0,
+                                 "unnatural": sum(1 for i in items if i["verdict"] == "unnatural")},
+                    "items": items,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+    def test_week_drills_use_recent_window_and_assign_when_present(self):
+        self._seed_week()  # партия wk1 создана «сейчас» → в 14-дневном окне
+        now_ms = int(time.time() * 1000)
+        self._seed_humanity(
+            [
+                {"game_id": "wk1", "ply": 12, "san": "Bb3",
+                 "classification": "blunder", "drop": 30.0,
+                 "beta": -4.0, "verdict": "unnatural"}
+                for _ in range(9)
+            ]
+            + [
+                # Старая партия не из окна — считаться не должна.
+                {"game_id": "ancient", "ply": 4, "san": "Nf3",
+                 "classification": "mistake", "drop": 12.0,
+                 "beta": -3.0, "verdict": "unnatural"},
+            ]
+        )
+        data = self.client.get("/api/plan/week")
+        self.assertEqual(data.status_code, 200)
+        payload = data.json()
+        self.assertEqual(payload["today"]["drills_window"]["unnatural"], 9)
+        self.assertEqual(payload["today"]["drills_window"]["games"], 1)
+        self.assertEqual(payload["today"]["drills_window"]["source"], "humanity")
+        self.assertEqual(payload["today"]["drills_today"], 2)  # ceil(9/7)
+        drills_task = next(
+            t for t in payload["week_tasks"] if t["key"] == "drills"
+        )
+        self.assertIn("9 неестественных промахов за последние 14 дней", drills_task["detail"])
+
+    def test_week_budget_within_80_percent_of_minutes(self):
+        self._seed_week()
+        now_ms = int(time.time() * 1000)
+        self._seed_humanity(
+            [
+                {"game_id": "wk1", "ply": 12, "san": "Bb3",
+                 "classification": "blunder", "drop": 30.0,
+                 "beta": -4.0, "verdict": "unnatural"}
+                for _ in range(9)
+            ]
+        )
+        for minutes in (5, 10, 15, 30, 60, 120, 240):
+            resp = self.client.post(
+                "/api/plan/goal",
+                data={"goal": "тест", "minutes": str(minutes), "focus": "auto"},
+            )
+            self.assertEqual(resp.status_code, 200)
+            payload = self.client.get("/api/plan/week").json()
+            total = sum(t["est_minutes"] for t in payload["week_tasks"])
+            budget = int(minutes) * 8 // 10
+            self.assertLessEqual(
+                total, budget,
+                f"budget exceeded at minutes={minutes}: {total} > {budget}",
+            )
+            self.assertEqual(payload["week_budget_minutes"], budget)
 
     def test_week_evidence_has_percent_and_example(self):
         data = self._get_week()
@@ -2097,9 +2238,12 @@ class PlanWeekTests(ApiTestBase):
 
     def test_week_drills_bound(self):
         data = self._get_week()
-        self.assertLessEqual(data["today"]["drills_today"], 20)
+        # Нет данных humanize за окно → честный ноль, а не искусственные 5 дрелей.
+        self.assertEqual(data["today"]["drills_today"], 0)
         self.assertEqual(data["today"]["drills_total"], 0)
-        self.assertEqual(data["today"]["drills_today"], 5)
+        self.assertEqual(data["today"]["drills_window"]["unnatural"], 0)
+        self.assertEqual(data["today"]["drills_window"]["days"], 14)
+        self.assertNotIn("drills", {t["key"] for t in data["week_tasks"]})
 
     def test_week_explicit_focus_wins(self):
         self._seed_week()
@@ -3565,8 +3709,19 @@ class DayPlanApiTests(ApiTestBase):
         super().setUp()
         self._set_current("tester")
 
+    def _seed_weak_opening_user(self) -> None:
+        """Четыре проигранные партии в одном дебюте: минимум для
+        предиката is_weak_opening (≥ 4 партий, счёт < 50%)."""
+        with Database(self.db_path) as db:
+            db.init_db()
+            games = [mkgame(f"dp{i}") for i in range(4)]
+            db.save_games(games, "tester")
+            for game in games:
+                db.save_analysis(game.id, {"summary": []}, depth=8)
+            db.set_current_user("tester")
+
     def test_dayplan_builds_and_repeat_is_stable(self) -> None:
-        self._seed_user("tester", "dp")
+        self._seed_weak_opening_user()
         first = self.client.get("/api/dayplan")
         self.assertEqual(first.status_code, 200, first.text)
         data = first.json()
@@ -3591,7 +3746,7 @@ class DayPlanApiTests(ApiTestBase):
         self.assertEqual(second.json(), data)
 
     def test_dayplan_toggle_updates_done_and_daily_progress(self) -> None:
-        self._seed_user("tester", "dp")
+        self._seed_weak_opening_user()
         data = self.client.get("/api/dayplan").json()
         day = data["date"]
         task_id = data["tasks"][0]["id"]
