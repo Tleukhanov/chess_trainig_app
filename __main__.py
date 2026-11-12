@@ -461,7 +461,7 @@ def _cmd_review(args: argparse.Namespace) -> int:
                     json_games.append(_review_json_entry(game, analysis, idx, {}, None))
                     continue
 
-                moments, summary = run_coach(
+                moments, summary, _meta = run_coach(
                     game, analysis, llm, max_moments=args.moments
                 )
                 print(header)
@@ -1298,7 +1298,7 @@ def _cmd_mentor(args: argparse.Namespace) -> int:
                 kwargs["base_url"] = args.base_url
             llm = LLMClient(timeout=args.timeout, **kwargs)
             print(f"Модель: {llm.model} · базовый URL: {llm.base_url}")
-            reply = run_mentor(llm, request)
+            reply, _mentor_meta = run_mentor(llm, request)
             text = format_mentor_reply(reply)
             print("=== ответ тренера ===")
             _print_wrapped(text, width=90, indent="")

@@ -249,10 +249,13 @@ class RunCoachTests(unittest.TestCase):
         fake = _FakeLLM(
             response='{"moments": {"2": "объяснение 2"}, "summary": "итог партии"}'
         )
-        moments, summary = run_coach(_game(), _synthetic_analysis(), fake)
-        self.assertEqual(
-            moments, {2: "объяснение 2", 6: "", 8: "", 10: ""}
-        )
+        moments, summary, meta = run_coach(_game(), _synthetic_analysis(), fake)
+        self.assertEqual(moments[2], "объяснение 2")
+        # Полуходы без объяснения модели заполнены фактами движка.
+        self.assertTrue(moments[6] and moments[8] and moments[10])
+        self.assertEqual(meta["moments_source"][2], "llm")
+        self.assertEqual(meta["moments_source"][6], "facts")
+        self.assertEqual(meta["summary_source"], "llm")
         self.assertEqual(summary, "итог партии")
 
     def test_calls_chat_with_json_mode(self) -> None:
@@ -268,15 +271,21 @@ class RunCoachTests(unittest.TestCase):
 
     def test_no_moments_returns_empty_without_chat(self) -> None:
         fake = _FakeLLM()
-        moments, summary = run_coach(_game(), _clean_analysis(), fake)
+        moments, summary, meta = run_coach(_game(), _clean_analysis(), fake)
         self.assertEqual(moments, {})
         self.assertIsNone(summary)
         self.assertEqual(fake.calls, [])
 
-    def test_llm_error_propagates(self) -> None:
+    def test_llm_error_falls_back_to_facts(self) -> None:
+        """Транспортный сбой — ограниченный повтор, затем факты движка."""
         fake = _FakeLLM(error=RuntimeError("LLM упал"))
-        with self.assertRaisesRegex(RuntimeError, "LLM упал"):
-            run_coach(_game(), _synthetic_analysis(), fake)
+        moments, summary, meta = run_coach(_game(), _synthetic_analysis(), fake)
+        self.assertEqual(len(fake.calls), 2)
+        self.assertEqual(meta["error"], "LLM упал")
+        self.assertEqual(meta["summary_source"], "facts")
+        self.assertTrue(all(src == "facts" for src in meta["moments_source"].values()))
+        self.assertTrue(all(moments.values()))
+        self.assertTrue(summary)
 
 
 if __name__ == "__main__":

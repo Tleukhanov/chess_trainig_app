@@ -59,7 +59,13 @@ from .intent_review import intent_cache_key, review_intents
 from .review import repeated_mistakes
 from .llm import ChatMessage, LLMClient, _is_local_host, clean_llm_text, looks_like_refusal, looks_like_thinking
 from .maia import MaiaLitePolicy
-from .mentor import build_mentor_request, format_mentor_reply, run_mentor
+from .mentor import (
+    build_mentor_facts,
+    build_mentor_request,
+    format_mentor_reply,
+    mentor_facts_brief,
+    run_mentor,
+)
 from .metrics import metric
 from .mistakes import cause_label, classify_cause, explain_cause
 from .opponent import build_confrontations, build_opponent_profile
@@ -565,20 +571,35 @@ def _player_name(player: dict | None) -> str:
     return str(name) if name else "—"
 
 
-def _review_entry(game, analysis, idx, moments: dict, summary: str | None) -> dict:
-    """Формирует запись «Одна партия» для разбора (поля как в CLI-выводе)."""
+def _review_entry(
+    game,
+    analysis,
+    idx,
+    moments: dict,
+    summary: str | None,
+    meta: dict[str, Any] | None = None,
+) -> dict:
+    """Формирует запись «Одна партия» для разбора (поля как в CLI-выводе).
+
+    ``meta`` — ``meta`` из :func:`app.coach.run_coach`: по нему моментам
+    и summary проставляется ``text_source``/``summary_source`` (``"llm"`` |
+    ``"facts"``), чтобы UI различал проверенную прозу модели и факты.
+    """
     moves = analysis.get("moves") or []
+    sources = (meta or {}).get("moments_source") or {}
     entry_moments = []
     for ply in idx:
         move = moves[ply] if ply < len(moves) else {}
         drop = move.get("drop")
+        text = moments.get(ply)
         entry_moments.append(
             {
                 "ply": ply + 1,
                 "san": move.get("san"),
                 "classification": move.get("classification"),
                 "drop": drop if isinstance(drop, (int, float)) else None,
-                "text": moments.get(ply),
+                "text": text,
+                "text_source": sources.get(ply, "llm") if text else None,
             }
         )
     return {
@@ -590,6 +611,7 @@ def _review_entry(game, analysis, idx, moments: dict, summary: str | None) -> di
         "avg_win_loss": metric(analysis, "avg_win_loss", default=None),
         "moments": entry_moments,
         "summary": summary,
+        "summary_source": (meta or {}).get("summary_source"),
     }
 
 
@@ -604,14 +626,25 @@ def _run_review_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None
 
         job.phase = "Разбор партий"
         llm = None
-        if not params["dry_run"]:
-            _ensure_llm_key()
-            llm = LLMClient()
+        llm_error: str | None = None
+        level = None
+        try:
+            if not params["dry_run"]:
+                _ensure_llm_key()
+                llm = LLMClient()
+        except Exception as exc:  # LLM недоступен — facts-only разбор
+            logger.info("review: LLM недоступен, показываю факты: %s", exc)
+            llm_error = str(exc)
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            level = _plan_player_level(db, job.user)
 
         games = []
         prompts = []
         for game, analysis in pairs:
-            messages, idx = build_request(game, analysis, params["moments"])
+            messages, idx = build_request(
+                game, analysis, params["moments"], level=level
+            )
             if not messages:
                 continue
             if params["dry_run"]:
@@ -621,15 +654,15 @@ def _run_review_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None
                 )
                 games.append(_review_entry(game, analysis, idx, {}, None))
                 continue
-            moments, summary = run_coach(
-                game, analysis, llm, max_moments=params["moments"]
+            moments, summary, meta = run_coach(
+                game, analysis, llm, max_moments=params["moments"], level=level
             )
             moments = {
                 ply: clean_llm_text(text) for ply, text in moments.items()
             }
             if summary:
                 summary = clean_llm_text(summary)
-            games.append(_review_entry(game, analysis, idx, moments, summary))
+            games.append(_review_entry(game, analysis, idx, moments, summary, meta))
 
         job.result = {"games": games}
         if params["dry_run"]:
@@ -637,7 +670,14 @@ def _run_review_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None
             job.result["prompts"] = prompts
             job.summary = f"Промптов собрано: {len(prompts)} для {len(games)} партий"
         else:
-            job.summary = f"Разобрано партий: {len(games)}"
+            if llm_error:
+                job.result["llm_error"] = llm_error
+                job.summary = (
+                    f"Разобрано партий: {len(games)} "
+                    "(LLM недоступен — показаны факты движка)"
+                )
+            else:
+                job.summary = f"Разобрано партий: {len(games)}"
         job.status = "done"
     except Exception as exc:
         job.status = "error"
@@ -656,6 +696,9 @@ def _run_mentor_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None
 
         job.phase = "Сборка плана"
         humanity_path = shared_data.humanity_path(nick, root=app.state.data_dir)
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            level = _plan_player_level(db, nick)
         plan_report = build_plan(
             pairs,
             user=nick,
@@ -683,6 +726,7 @@ def _run_mentor_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None
             plan_report,
             extra=params.get("notes") or "",
             progress=progress_report,
+            level=level,
         )
 
         if params["dry_run"]:
@@ -695,16 +739,39 @@ def _run_mentor_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None
             job.summary = "Mentor: собраны промпты без вызова LLM"
         else:
             job.phase = "Ответ тренера"
-            _ensure_llm_key()
-            llm = LLMClient()
-            reply = run_mentor(llm, request)
+            facts = build_mentor_facts(plan_report, progress_report)
+            brief = mentor_facts_brief(plan_report, progress_report)
+            facts_only = False
+            llm_error: str | None = None
+            model: str | None = None
+            try:
+                _ensure_llm_key()
+                llm = LLMClient()
+                model = llm.model
+                reply, meta = run_mentor(llm, request, facts=facts, brief=brief)
+                if meta.get("source") != "llm":
+                    facts_only = True
+                    model = None
+                    llm_error = meta.get("error") or "ответ модели не прошёл проверку фактов"
+            except Exception as exc:  # LLM недоступен — recoverable facts-only
+                logger.info("mentor: LLM недоступен, показываю факты: %s", exc)
+                facts_only = True
+                reply = brief
+                model = None
+                llm_error = str(exc)
             job.result = {
                 "user": plan_report.get("user"),
-                "model": llm.model,
+                "model": model,
                 "notes": params.get("notes") or "",
                 "reply": format_mentor_reply(clean_llm_text(reply)),
+                "facts_only": facts_only,
+                "llm_error": llm_error,
             }
-            job.summary = f"План тренера по {plan_report.get('games', 0)} партиям"
+            job.summary = (
+                f"План тренера по {plan_report.get('games', 0)} партиям (по фактам движка)"
+                if facts_only
+                else f"План тренера по {plan_report.get('games', 0)} партиям"
+            )
         job.status = "done"
     except Exception as exc:
         job.status = "error"
@@ -714,14 +781,27 @@ def _run_mentor_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None
 
 
 def _run_task_explain_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None:
-    """Фоновый поток: LLM-объяснение «Задачи дня» → таблица task_explanations."""
+    """Фоновый поток: LLM-объяснение «Задачи дня» → таблица task_explanations.
+
+    LLM опционален: при недоступности/невалидном ответе задача не падает —
+    job завершается ``done`` с ``facts_only: true`` и ``explanation: null``,
+    а UI показывает facts-only разбор задачи (``explanation_facts``).
+    """
     try:
-        _ensure_llm_key()
         payload = params["payload"]
         job.phase = "Объяснение задачи"
-        text = _task_explain_llm(payload)
-        if not text:
-            raise RuntimeError("LLM вернул пустое объяснение")
+        try:
+            _ensure_llm_key()
+            text = _task_explain_llm(payload)
+            if not text:
+                raise RuntimeError("LLM вернул пустое объяснение")
+        except Exception as exc:  # LLM недоступен — recoverable facts-only
+            logger.info("task explain: LLM недоступен, показываю факты: %s", exc)
+            job.result = {"explanation": None, "facts_only": True, "reason": str(exc)}
+            job.summary = "LLM недоступен — показан разбор по фактам движка"
+            job.status = "done"
+            job.finished = time.time()
+            return
         with Database(app.state.db_path) as db:
             db.init_db()
             db.save_task_explanation(
@@ -731,7 +811,7 @@ def _run_task_explain_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -
                 payload["ply"],
                 text,
             )
-        job.result = {"explanation": text}
+        job.result = {"explanation": text, "facts_only": False}
         job.summary = "Объяснение задачи готово"
         job.status = "done"
     except Exception as exc:
@@ -1060,26 +1140,30 @@ def _opening_resolve_elos(
     return int(my_elo), int(opp_elo)
 
 
-_OPENING_REPORT_SYSTEM = """Ты — шахматный тренер по дебюту для сильного любителя. Говори по-русски, коротко и конкретно.
-Опирайся ТОЛЬКО на переданные факты: ходы дебюта, оценки win%, классификации и лучшие ходы движка. НЕ выдумывай варианты, угрозы и оценки, которых нет в данных.
-Ответь строго одним JSON-объектом такой структуры:
-{
-  "summary": "краткий обзор: вышел ли ты из дебюта нормально (2-3 предложения)",
-  "opening": "название дебюта",
-  "moments": [
-    {"ply": <номер полухода>, "san": "<ход>", "kind": "good|better|bad", "text": "почему", "better": "<лучший ход или —>"}
-  ],
-  "opponent": "как играл соперник в заданном стиле (1-2 предложения)",
-  "recommendation": "что тренировать и по репертуару (1-2 предложения)"
-}
-В "moments" — ТОЛЬКО твои неточности, ошибки и зевки (classification inaccuracy/mistake/blunder), 1-4 штуки. НЕ включай хорошие и лучшие ходы. Поле "better" бери строго из фактов движка. В "text" — одно конкретное предложение: какой ресурс/угроза/план упущен, без повторения цифр. Если ошибок нет — "moments": []. Только русский язык, без английского и без разбора по шагам."""
-
-
-def _opening_fmt_win(value: Any) -> str:
-    """Форматирует win% одним знаком или '—' для None/нечисла."""
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        return "—"
-    return f"{float(value):.1f}"
+def _theory_ideas_facts(line: list[Any]) -> dict[str, Any]:
+    """Facts-объект для идей теории: ходы линии и статистика Explorer."""
+    sans: list[str] = []
+    numbers: list[float] = []
+    for item in line or []:
+        if isinstance(item, str):
+            item = {"san": item}
+        if not isinstance(item, dict):
+            continue
+        san = item.get("san")
+        if san:
+            sans.append(str(san))
+        for key in ("games", "white", "draws", "black"):
+            value = item.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                numbers.append(float(value))
+    name, eco = classify_opening(sans)
+    return facttext.new_facts(
+        sans=sans,
+        numbers=numbers,
+        openings=[name] if name else (),
+        ecos=[eco] if eco else (),
+        strings=[s for s in (name, eco) if s],
+    )
 
 
 def _opening_user_entries(
@@ -1206,37 +1290,6 @@ def _deepen_opening_errors(
             engine.__exit__(None, None, None)
 
 
-def _opening_analyze_messages(entry: dict[str, Any]) -> list[ChatMessage]:
-    """Промпт LLM-отчёта по дебюту: факты построчно + требование JSON."""
-    lines = [
-        f"Дебют: {entry['opening_name'] or '—'} ({entry['eco'] or '—'}).",
-        f"Ты играл за {entry['color_ru']}; соперник — человеко-подобный стиль "
-        f"«{entry['style_label']}» ({entry['style_desc']}).",
-        f"Рейтинги: ты ~{entry['my_elo']}, соперник "
-        f"{'Maia+ (гибрид, ~2200-2400)' if entry['opp_elo'] == -1 else '~' + str(entry['opp_elo'])}. "
-        f"Сыграно полуходов: {entry['plies']}.",
-        "Ходы дебюта: " + (" ".join(entry["moves"]) or "—"),
-        "",
-        "Твои ходы (полуход, ход, win% до→после, потеря, классификация, лучший ход):",
-    ]
-    if entry["user_entries"]:
-        for item in entry["user_entries"]:
-            lines.append(
-                f"- {item['ply']}. {item['san']} — "
-                f"{_opening_fmt_win(item['win_before'])}→{_opening_fmt_win(item['win_after'])}, "
-                f"потеря {_opening_fmt_win(item['drop'])} ({item['classification'] or '—'}), "
-                f"лучше: {item['best'] or '—'}"
-            )
-    else:
-        lines.append("- (нет данных движка по ходам пользователя)")
-    lines.append("")
-    lines.append("Ответ — только JSON по заданной структуре.")
-    return [
-        ChatMessage("system", _OPENING_REPORT_SYSTEM),
-        ChatMessage("user", "\n".join(lines)),
-    ]
-
-
 def _normalize_opening_moments(
     raw: Any, fallback_entries: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -1340,6 +1393,7 @@ def _llm_json_with_retries(
     error_prefix: str,
     temperature: float = 0.4,
     max_tokens: int | None = None,
+    validator: Any | None = None,
 ) -> dict[str, Any]:
     """JSON-ответ LLM с тремя попытками.
 
@@ -1347,6 +1401,10 @@ def _llm_json_with_retries(
     возвращают пустоту (``finish_reason=length``), а отключение reasoning у
     провайдера тоже может не сработать. Порядок: обычный запрос → без reasoning
     → снова обычный с жёстким запретом текста вокруг JSON.
+
+    ``validator`` — необязательный callable(dict) -> None; любое исключение
+    от него трактуется как неудачная попытка (с подсказкой в следующей),
+    после трёх неудач — ``RuntimeError`` с префиксом ``error_prefix``.
     """
     llm = LLMClient()
     user_hint = "\nБез пошагового разбора. Сразу один JSON-объект."
@@ -1367,7 +1425,12 @@ def _llm_json_with_retries(
         ),
     ]
     last_error: RuntimeError | None = None
+    violation_hint = ""
     for attempt_messages, kwargs in attempts:
+        if violation_hint:
+            attempt_messages = attempt_messages[:-1] + [
+                ChatMessage("user", attempt_messages[-1].content + violation_hint)
+            ]
         try:
             text = clean_llm_text(
                 llm.chat(
@@ -1381,20 +1444,21 @@ def _llm_json_with_retries(
             data = _extract_json(text) if isinstance(text, str) else None
         except RuntimeError as exc:
             last_error = exc
+            violation_hint = ""
             continue
+        if isinstance(data, dict) and validator is not None:
+            try:
+                validator(data)
+            except ValueError as exc:
+                last_error = RuntimeError(f"ответ модели не прошёл проверку фактов: {exc}")
+                violation_hint = _violations_hint(
+                    [str(exc)] if str(exc) else ["ответ без опоры на факты"]
+                )
+                continue
         if isinstance(data, dict):
             return data
     detail = f" (последняя ошибка: {last_error})" if last_error else ""
     raise RuntimeError(f"{error_prefix}: 3 попытки не дали JSON{detail}")
-
-
-def _opening_report_llm(entry: dict[str, Any]) -> dict[str, Any]:
-    """LLM-отчёт по дебюту как JSON-словарь (3 попытки, см. хелпер)."""
-    return _llm_json_with_retries(
-        _opening_analyze_messages(entry),
-        error_prefix="LLM не вернул JSON-отчёт по дебюту",
-        max_tokens=_REPORT_MAX_TOKENS,
-    )
 
 
 def _build_opening_report(
@@ -1727,47 +1791,20 @@ def _ensure_worst_moment(
     return report
 
 
-def _middlegame_fact_text(
-    engine_facts: list[dict[str, Any]], session: mg.MiddlegameSession
-) -> tuple[str, str]:
-    """Фактический разбор плана и урок: только ходы игрока и линии движка."""
-    user_is_white = session.side == "white"
-    errors = [
-        fact
-        for fact in engine_facts
-        if isinstance(fact, dict)
-        and ((int(fact.get("ply", 0)) % 2 == 1) == user_is_white)
-        and float(fact.get("delta") or 0) >= 5
-    ]
-    if not errors:
-        return "Ошибок с потерей ≥5% win по движку нет.", "Движок не видит потерь в этой партии."
-    errors.sort(key=lambda fact: int(fact.get("ply") or 0))
-    parts = []
-    for fact in errors[:4]:
-        line = " ".join(str(move) for move in (fact.get("pv") or [])[:4])
-        parts.append(
-            f"{fact.get('san')} — потеря {float(fact.get('delta') or 0):.1f}%, "
-            f"лучше {fact.get('best_san') or '—'}"
-            + (f" ({line})" if line else "")
-        )
-    worst = max(errors, key=lambda fact: float(fact.get("delta") or 0))
-    worst_line = " ".join(str(move) for move in (worst.get("pv") or [])[:4])
-    lesson = (
-        f"Главный ресурс по движку — {worst.get('best_san') or '—'}"
-        + (f": {worst_line}" if worst_line else "")
-        + "."
-    )
-    return "; ".join(parts) + ".", lesson
+def _middlegame_report_llm(prompt: str, validator: Any | None = None) -> dict[str, Any]:
+    """LLM-отчёт по миттельшпилю (3 попытки, см. хелпер).
 
-
-def _middlegame_report_llm(prompt: str) -> dict[str, Any]:
-    """LLM-отчёт по миттельшпилю (3 попытки, см. хелпер)."""
+    ``validator`` — необязательный callable(dict); при неуспехе — повторы
+    с подсказкой, после трёх неудач RuntimeError (вызывающий код
+    откатится на facts-only отчёт).
+    """
     _ensure_llm_key()
     return _llm_json_with_retries(
         [ChatMessage("user", prompt)],
         error_prefix="LLM не вернул JSON-отчёт по миттельшпилю",
         temperature=0.3,
         max_tokens=_REPORT_MAX_TOKENS,
+        validator=validator,
     )
 
 
@@ -1795,20 +1832,54 @@ def _run_middlegame_analyze_job(
 
         job.phase = "Отчёт тренера"
         _persist_job(app.state.db_path, job, session_id=session_id)
+        position_obj = mg.POSITION_BY_KEY.get(session.position_key)
+        user_is_white = session.side == "white"
+        facts_for_llm = mg.build_report_facts(session, engine_facts, position_obj)
+
+        def _validate_summary(data: dict[str, Any]) -> None:
+            summary = data.get("summary") if isinstance(data, dict) else None
+            if isinstance(summary, str) and summary.strip():
+                facttext.assert_facts(summary.strip(), facts_for_llm)
+
         prompt = mg.build_report_prompt(
             session,
             engine_facts=engine_facts,
-            position=mg.POSITION_BY_KEY.get(session.position_key),
+            position=position_obj,
         )
-        report = mg.ground_report(
-            mg.normalize_report(_middlegame_report_llm(prompt)),
-            engine_facts,
-            fen=session.fen,
-            moves=list(session.moves),
-        )
-        report = _ensure_worst_moment(report, session, engine_facts)
+        plan_comment, lesson = mg.facts_plan_comment(engine_facts, user_is_white)
+        facts_only = False
+        summary_kind = "llm_opinion"
+        llm_error: str | None = None
+        try:
+            report = mg.ground_report(
+                mg.normalize_report(
+                    _middlegame_report_llm(prompt, validator=_validate_summary)
+                ),
+                engine_facts,
+                fen=session.fen,
+                moves=list(session.moves),
+            )
+            report = _ensure_worst_moment(report, session, engine_facts)
+        except Exception as exc:  # LLM недоступен — recoverable facts-only
+            logger.info("middlegame: LLM недоступен, показываю факты: %s", exc)
+            report = mg.build_facts_report(session, engine_facts, position_obj)
+            facts_only = True
+            summary_kind = "engine_facts"
+            llm_error = str(exc)
+        if not (isinstance(report.get("summary"), str) and report["summary"].strip()) \
+                or report.get("summary") == "Итог не сформирован.":
+            # Пустой/дефолтный summary модели — заменяем фактами движка.
+            facts_report = mg.build_facts_report(session, engine_facts, position_obj)
+            report["summary"] = facts_report["summary"]
+            summary_kind = "engine_facts"
+        # Вердикт — только от движка: LLM в этом поле не участвует.
+        report["verdict"] = mg.engine_verdict(engine_facts, user_is_white)
+        report["verdict_source"] = "engine"
+        report["facts_only"] = facts_only
+        report["summary_kind"] = summary_kind
+        if llm_error:
+            report["llm_error"] = llm_error
         # Комментарий к плану и урок — только факты, без «активизируй фигуры».
-        plan_comment, lesson = _middlegame_fact_text(engine_facts, session)
         report["plan_comment"] = plan_comment
         report["lesson"] = lesson
 
@@ -1819,7 +1890,11 @@ def _run_middlegame_analyze_job(
             fresh.status = "analyzed"
             db.update_middlegame_session(fresh)
         job.result = {"report": report}
-        job.summary = f"Отчёт по миттельшпилю готов ({len(moves)} полуходов)"
+        job.summary = (
+            f"Отчёт по миттельшпилю готов ({len(moves)} полуходов, факты движка)"
+            if facts_only
+            else f"Отчёт по миттельшпилю готов ({len(moves)} полуходов)"
+        )
         job.status = "done"
         _persist_job(app.state.db_path, job, session_id=session_id)
     except Exception as exc:
@@ -2335,6 +2410,17 @@ def _pick_daily_task(
     return chosen
 
 
+def _task_explanation_ok(payload: dict[str, Any], text: Any) -> bool:
+    """True, если закешированное LLM-объяснение проходит проверку фактов."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    try:
+        facttext.assert_facts(text, _task_explain_facts(payload))
+    except facttext.FactCheckError:
+        return False
+    return True
+
+
 def _is_bad_explanation(text: Any) -> bool:
     """True, если объяснение — мусор: thinking-разбор, safety-отказ или огрызок.
 
@@ -2390,10 +2476,28 @@ def _task_payload(
         cursor.push(line_move)
         best_line_fens.append(cursor.fen())
     explanation = db.get_task_explanation(item["task_key"])
-    if explanation is not None and _is_bad_explanation(explanation):
-        # Отравленный кэш (reasoning-разбор/safety-заглушка/огрызок вместо ответа):
-        # игнорируем, кнопка «Объяснить» снова доступна, успешный повтор перезапишет
-        # мусор через UPSERT save_task_explanation. Строки из БД не удаляем.
+    if explanation is not None and (
+        _is_bad_explanation(explanation)
+        or not _task_explanation_ok(
+            {
+                "san_played": played_san,
+                "best_san": best,
+                "best_line": [str(s) for s in (move.get("best_line") or [])],
+                "win_before": move.get("win_before"),
+                "win_after": move.get("win_after"),
+                "drop": move.get("drop"),
+                "ply": ply,
+                "opening": game.opening,
+                "eco": game.eco,
+                "opponent": game.opponent,
+            },
+            explanation,
+        )
+    ):
+        # Отравленный кэш (мусор или текст без опоры на факты):
+        # игнорируем, кнопка «Объяснить» снова доступна, успешный повтор
+        # перезапишет мусор через UPSERT save_task_explanation.
+        # Строки из БД не удаляем.
         explanation = None
     result = {
         "date": day,
@@ -2811,6 +2915,44 @@ def _fmt_win(value: Any) -> str:
     return f"{value:.1f}"
 
 
+def _task_explain_facts(payload: dict[str, Any]) -> dict[str, Any]:
+    """Facts-объект для объяснения задачи (для ``assert_facts``)."""
+    sans = [payload.get("san_played"), payload.get("best_san")]
+    sans += list(payload.get("best_line") or [])
+    win_before = payload.get("win_before")
+    win_after = payload.get("win_after")
+    drop = payload.get("drop")
+
+    def _num(value: Any) -> float | None:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+        return None
+
+    numbers = [v for v in (_num(win_before), _num(win_after), _num(drop)) if v is not None]
+    ply = payload.get("ply")
+    max_ply = int(ply) if isinstance(ply, int) and ply > 0 else None
+    opening = payload.get("opening") or None
+    eco = payload.get("eco") or None
+    strings = [str(value) for value in (opening, eco, payload.get("opponent")) if value]
+    return facttext.new_facts(
+        sans=[s for s in sans if s],
+        numbers=numbers,
+        openings=[opening] if opening else (),
+        ecos=[eco] if eco else (),
+        strings=strings,
+        max_ply=max_ply,
+    )
+
+
+def _violations_hint(violations: list[str]) -> str:
+    joined = "; ".join(violations) or "нет опоры на факты"
+    return (
+        "\nПредыдущий ответ содержал факты без опоры в данных: "
+        + joined
+        + ". Перепиши так, чтобы остались ТОЛЬКО факты из данных выше."
+    )
+
+
 def _task_explain_messages(payload: dict[str, Any]) -> list[ChatMessage]:
     """Промпт LLM-объяснения задачи (по-русски, только факты из данных)."""
     color = "белые" if payload["user_color"] == "white" else "чёрные"
@@ -2839,27 +2981,56 @@ def _task_explain_messages(payload: dict[str, Any]) -> list[ChatMessage]:
 
 
 def _task_explain_llm(payload: dict[str, Any]) -> str:
-    """Один вызов LLM для объяснения задачи (с повтором при плохом ответе).
+    """LLM-объяснение задачи с проверкой фактов (не более 2 попыток).
 
     thinking-блоки вырезаются, thinking-разбор/safety-заглушка/огрызок
-    вместо ответа — это ошибка (job уйдёт в error, а не сохранит мусор в БД).
+    вместо ответа — это ошибка. Ответ дополнительно проверяется
+    детерминированным ``assert_facts``; при нарушении — одна повторная
+    попытка с подсказкой, затем RuntimeError (вызывающий код покажет
+    facts-only разбор вместо непроверенного текста модели).
     """
     llm = LLMClient()
     messages = _task_explain_messages(payload)
-    text = clean_llm_text(llm.chat(messages, temperature=0.4))
-    if text and not _is_bad_explanation(text):
+    facts = _task_explain_facts(payload)
+    last_violations: list[str] = []
+    for attempt in range(2):
+        try:
+            text = clean_llm_text(llm.chat(messages, temperature=0.4))
+        except RuntimeError as exc:
+            if attempt:
+                raise
+            messages = [
+                messages[0],
+                ChatMessage(
+                    "user",
+                    messages[1].content + "\nБез разбора. Сразу объяснение по-русски.",
+                ),
+            ]
+            continue
+        if not text or _is_bad_explanation(text):
+            messages = [
+                messages[0],
+                ChatMessage(
+                    "user",
+                    messages[1].content + "\nБез разбора. Сразу объяснение по-русски.",
+                ),
+            ]
+            continue
+        try:
+            facttext.assert_facts(text, facts)
+        except facttext.FactCheckError as exc:
+            last_violations = list(dict.fromkeys(exc.violations))
+            messages = [
+                messages[0],
+                ChatMessage(
+                    "user",
+                    messages[1].content + _violations_hint(last_violations),
+                ),
+            ]
+            continue
         return text
-    retry = [
-        messages[0],
-        ChatMessage(
-            "user",
-            messages[1].content + "\nБез разбора. Сразу объяснение по-русски.",
-        ),
-    ]
-    second = clean_llm_text(llm.chat(retry, temperature=0.4))
-    if not second or _is_bad_explanation(second):
-        raise RuntimeError("Модель не дала объяснение задачи (повтор не помог)")
-    return second
+    detail = f" (нарушения: {'; '.join(last_violations)})" if last_violations else ""
+    raise RuntimeError(f"Модель не дала проверяемое объяснение задачи{detail}")
 
 # --- Цель и недельный план ------------------------------------------------
 
@@ -3950,29 +4121,163 @@ def _plan_chat_ok(text: str, advanced: bool) -> bool:
     return True
 
 
-def _plan_llm_chat(messages: list[ChatMessage], advanced: bool = False) -> str:
-    """Один вызов LLM для плана (с повтором при thinking-мусоре).
+def _plan_llm_facts(entry: dict[str, Any]) -> dict[str, Any]:
+    """Facts-объект для комментария к недельному плану (assert_facts)."""
+    numbers: list[float] = []
+    for key in (
+        "minutes",
+        "drills_total",
+        "drills_unnatural",
+        "drills_window_days",
+        "drills_window_games",
+        "score_pct",
+        "avg_win_loss",
+        "rating",
+        "target_rating",
+        "weeks_left",
+    ):
+        value = entry.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            numbers.append(float(value))
 
-    thinking-блоки вырезаются, служебный разбор вместо плана — это ошибка
-    (job уйдёт в error, мусор в meta не пишется).
-    """
-    llm = LLMClient()
-    text = clean_llm_text(llm.chat(messages, temperature=0.4))
-    if _plan_chat_ok(text, advanced):
-        return text
-    retry = [
-        messages[0],
-        ChatMessage(
-            "user",
-            messages[1].content + "\nБез разбора. Сразу готовый план по-русски.",
-        ),
+    weak = entry.get("weak_openings") or []
+    weak_names: list[str] = []
+    for item in weak:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("opening")
+        if name:
+            weak_names.append(str(name))
+        errors = item.get("errors_per_game")
+        if isinstance(errors, (int, float)) and not isinstance(errors, bool):
+            numbers.append(float(errors))
+
+    evidence = entry.get("evidence") or {}
+    if isinstance(evidence, dict):
+        for key in ("games_total", "games_with_error", "share_pct"):
+            value = evidence.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                numbers.append(float(value))
+        for key in ("worst", "opening_worst"):
+            item = evidence.get(key)
+            if not isinstance(item, dict):
+                continue
+            drop = item.get("drop")
+            if isinstance(drop, (int, float)) and not isinstance(drop, bool):
+                numbers.append(float(drop))
+
+    sans: list[str] = []
+    openings = list(weak_names)
+    for key in ("worst", "opening_worst"):
+        item = evidence.get(key) if isinstance(evidence, dict) else None
+        if isinstance(item, dict):
+            for san_key in ("san", "move_label"):
+                san = item.get(san_key)
+                if san:
+                    sans.append(str(san))
+            opening = item.get("opening")
+            if opening:
+                openings.append(str(opening))
+
+    goal = entry.get("goal")
+    strings = [str(goal)] if goal else []
+    strings += weak_names
+    if isinstance(evidence, dict):
+        for key in ("worst", "opening_worst"):
+            item = evidence.get(key)
+            if isinstance(item, dict):
+                for text_key in ("game_id", "move_label", "opening"):
+                    value = item.get(text_key)
+                    if value:
+                        strings.append(str(value))
+
+    return facttext.new_facts(
+        sans=sans,
+        numbers=numbers,
+        openings=openings,
+        strings=strings,
+    )
+
+
+def _plan_llm_facts_brief(entry: dict[str, Any]) -> str:
+    """Факты-only комментарий к плану: те же строки-факты, без LLM."""
+    lines = [
+        "LLM недоступен или ответ не прошёл проверку фактов — ниже только",
+        "проверяемые данные недели (без комментария модели):",
+        _evidence_line(entry.get("evidence")),
     ]
-    second = clean_llm_text(llm.chat(retry, temperature=0.4))
-    if _plan_chat_ok(second, advanced):
-        return second
-    if advanced and second and _plan_has_basic_stuff(second):
-        raise RuntimeError("LLM вернул базовые темы вместо продвинутого плана")
-    raise RuntimeError("LLM вернул служебный разбор вместо плана")
+    weak = entry.get("weak_openings") or []
+    weak_txt = "; ".join(
+        f"{w.get('opening')} ({w.get('errors_per_game')} ошибок/партию)"
+        for w in weak
+        if isinstance(w, dict) and w.get("opening")
+    )
+    if weak_txt:
+        lines.append(f"Топ слабых дебютов: {weak_txt}.")
+    loss = entry.get("avg_win_loss")
+    score = entry.get("score_pct")
+    lines.append(
+        f"Счёт: {score if score is not None else '—'}%; "
+        f"средняя потеря win%: {loss if loss is not None else '—'}."
+    )
+    return "\n".join(lines)
+
+
+def _plan_llm_chat(
+    messages: list[ChatMessage],
+    advanced: bool = False,
+    facts: dict[str, Any] | None = None,
+    *,
+    brief: str | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """LLM-план недели с проверкой фактов (не более 2 попыток).
+
+    thinking-блоки вырезаются, служебный разбор и детсад для 1800+ — брак.
+    Ответ дополнительно проверяется детерминированным ``assert_facts``; при
+    нарушении — одна повторная попытка с подсказкой, затем ``brief``
+    (facts-only) вместо непроверенного текста модели. Возвращает
+    ``(текст, meta)``; ``meta["source"]`` — ``"llm"`` | ``"facts"``.
+    """
+    meta: dict[str, Any] = {"source": "llm", "violations": [], "error": None}
+    llm = LLMClient()
+    messages_now = list(messages)
+    text = ""
+    try:
+        for attempt in range(2):
+            text = clean_llm_text(llm.chat(messages_now, temperature=0.4))
+            violations: list[str] = []
+            if not _plan_chat_ok(text, advanced):
+                violations = ["служебный разбор или базовая теория вместо плана"]
+            elif facts is not None:
+                try:
+                    facttext.assert_facts(text, facts)
+                except facttext.FactCheckError as exc:
+                    violations = list(dict.fromkeys(exc.violations))
+            if not violations:
+                return text, meta
+            meta["violations"] = violations
+            if attempt == 0:
+                messages_now = [
+                    messages_now[0],
+                    ChatMessage(
+                        "user",
+                        messages_now[1].content + _violations_hint(violations),
+                    ),
+                ]
+    except RuntimeError as exc:
+        meta["error"] = str(exc)
+        if brief:
+            meta["source"] = "facts"
+            return brief, meta
+        raise
+    if advanced and text and _plan_has_basic_stuff(text):
+        meta["error"] = "LLM вернул базовые темы вместо продвинутого плана"
+    elif not meta["error"]:
+        meta["error"] = "ответ модели не прошёл проверку фактов"
+    if brief:
+        meta["source"] = "facts"
+        return brief, meta
+    raise RuntimeError(meta["error"])
 
 
 def _run_plan_llm_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> None:
@@ -3990,16 +4295,25 @@ def _run_plan_llm_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> No
             job.summary = "План недели: собраны промпты без вызова LLM"
         else:
             job.phase = "План недели"
-            _ensure_llm_key()
             rating = params["input"].get("rating")
             advanced = (
                 isinstance(rating, int)
                 and not isinstance(rating, bool)
                 and rating >= 1800
             )
-            text = _plan_llm_chat(messages, advanced=advanced)
+            facts = _plan_llm_facts(params["input"])
+            brief = _plan_llm_facts_brief(params["input"])
+            try:
+                _ensure_llm_key()
+                text, meta = _plan_llm_chat(
+                    messages, advanced=advanced, facts=facts, brief=brief
+                )
+            except Exception as exc:  # LLM недоступен — recoverable facts-only
+                logger.info("plan llm: LLM недоступен, показываю факты: %s", exc)
+                text, meta = brief, {"source": "facts", "violations": [], "error": str(exc)}
             if not text:
                 raise RuntimeError("LLM вернул пустой план")
+            facts_only = meta.get("source") != "llm"
             created = _today()
             record = {
                 "text": text,
@@ -4007,6 +4321,8 @@ def _run_plan_llm_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> No
                 "input_hash": params["input_hash"],
                 "weeks_left": params["input"].get("weeks_left"),
                 "prompt_version": params["input"].get("prompt_version"),
+                "facts_only": facts_only,
+                "llm_error": meta.get("error"),
             }
             with Database(app.state.db_path) as db:
                 db.init_db()
@@ -4019,9 +4335,15 @@ def _run_plan_llm_job(app: FastAPI, job: CoachJob, params: dict[str, Any]) -> No
                     "text": text,
                     "created_at": created,
                     "weeks_left": record["weeks_left"],
+                    "facts_only": facts_only,
+                    "llm_error": meta.get("error"),
                 }
             }
-            job.summary = "Комментарий тренера готов"
+            job.summary = (
+                "Комментарий тренера (факты недели, без LLM)"
+                if facts_only
+                else "Комментарий тренера готов"
+            )
         job.status = "done"
     except Exception as exc:
         job.status = "error"
@@ -4050,6 +4372,8 @@ def _load_plan_llm(db: Database, nick: str) -> dict[str, Any] | None:
         "weeks_left": data.get("weeks_left"),
         "input_hash": data.get("input_hash"),
         "prompt_version": data.get("prompt_version"),
+        "facts_only": bool(data.get("facts_only")),
+        "llm_error": data.get("llm_error"),
     }
 
 # --- Мини-трекер времени ---------------------------------------------------
@@ -4705,6 +5029,8 @@ def create_api(
                     "text": saved["text"],
                     "created_at": saved.get("created_at"),
                     "weeks_left": saved.get("weeks_left"),
+                    "facts_only": bool(saved.get("facts_only")),
+                    "llm_error": saved.get("llm_error"),
                 },
             }
         _check_job_limits(user["nick"])
@@ -5051,6 +5377,9 @@ def create_api(
         """LLM-объяснение идеи линии: факты Explorer/ECO, без выдумок.
 
         Если идеи выключены или LLM недоступен — ``ideas: null`` и 200.
+        Ответ модели дополнительно проверяется ``assert_facts``: при
+        нарушениях ``ideas: null`` и ``rejected: true`` (клиент покажет
+        данные книги вместо непроверенного текста).
         """
         user = _current_user(app.state.db_path, request)
         if not user:
@@ -5064,6 +5393,13 @@ def create_api(
             )
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
+        if isinstance(text, str) and text.strip():
+            facts = _theory_ideas_facts(body.line)
+            try:
+                facttext.assert_facts(text.strip(), facts)
+            except facttext.FactCheckError as exc:
+                logger.info("theory ideas отклонены по фактам: %s", exc)
+                return {"ideas": None, "cached": cached, "rejected": True}
         return {"ideas": text, "cached": cached}
 
     @app.get("/api/games")
@@ -5710,7 +6046,7 @@ def create_api(
             lambda db: _task_payload(db, user["nick"]), app.state.db_path
         )
         cached = payload.get("explanation")
-        if cached and not _is_bad_explanation(cached):
+        if cached and not _is_bad_explanation(cached) and _task_explanation_ok(payload, cached):
             return {"cached": True, "explanation": cached}
         _check_job_limits(user["nick"])
         job = CoachJob(

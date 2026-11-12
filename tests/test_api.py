@@ -1296,7 +1296,10 @@ class LlmToolApiTests(ApiTestBase):
     def test_review_run_creates_job(self):
         with patch.dict(os.environ, {"LLM_API_KEY": "test-key"}), \
                 patch("app.api.run_coach",
-                      return_value=({3: "не увидел угрозу на f6"}, "потерял инициативу")):
+                      return_value=({3: "не увидел угрозу на f6"}, "потерял инициативу",
+                                    {"moments_source": {3: "llm"},
+                                     "summary_source": "llm",
+                                     "retries": 0, "violations": [], "error": None})):
             resp = self.client.post("/api/review/run", data={"max": "3"})
             self.assertEqual(resp.status_code, 200)
             job = self._wait_job(resp.json()["job_id"])
@@ -1343,13 +1346,19 @@ class LlmToolApiTests(ApiTestBase):
         self.assertEqual(resp.status_code, 404)
         self.assertIn("проанализированных", resp.json()["detail"])
 
-    def test_review_no_llm_key_job_error(self):
+    def test_review_no_llm_key_facts_only(self):
+        """Нет ключа — recoverable facts-only разбор, не success-shaped error."""
         with patch.dict(os.environ, {"LLM_API_KEY": ""}):
             resp = self.client.post("/api/review/run", data={"max": "3"})
             self.assertEqual(resp.status_code, 200)
             job = self._wait_job(resp.json()["job_id"])
-        self.assertEqual(job["status"], "error")
-        self.assertIn("LLM_API_KEY", job["error"])
+        self.assertEqual(job["status"], "done", job.get("error"))
+        self.assertIn("LLM_API_KEY", job["result"]["llm_error"])
+        game = job["result"]["games"][0]
+        self.assertTrue(game["moments"])
+        for moment in game["moments"]:
+            self.assertEqual(moment["text_source"], "facts")
+        self.assertEqual(game["summary_source"], "facts")
 
     # --- mentor ---
 
@@ -1361,7 +1370,9 @@ class LlmToolApiTests(ApiTestBase):
             Итог через месяц: ...
         """)
         with patch.dict(os.environ, {"LLM_API_KEY": "test-key"}), \
-                patch("app.api.run_mentor", return_value=reply) as rm:
+                patch("app.api.run_mentor",
+                      return_value=(reply, {"source": "llm", "retries": 0,
+                                            "violations": [], "error": None})) as rm:
             resp = self.client.post(
                 "/api/mentor/run", data={"notes": "Хочу эндшпиль"}
             )
@@ -1681,14 +1692,17 @@ class TaskApiTests(ApiTestBase):
             self.assertEqual(data["explanation"], good)
             llm2.assert_not_called()
 
-    def test_explain_no_llm_key_job_error(self):
+    def test_explain_no_llm_key_facts_only(self):
+        """Нет ключа — задача не падает: facts-only, UI покажет факты."""
         self._seed_tasks()
         with patch.dict(os.environ, {"LLM_API_KEY": ""}):
             resp = self.client.post("/api/task/explain")
             self.assertEqual(resp.status_code, 200)
             job = self._wait_job(resp.json()["job_id"])
-        self.assertEqual(job["status"], "error")
-        self.assertIn("LLM_API_KEY", job["error"])
+        self.assertEqual(job["status"], "done", job.get("error"))
+        self.assertTrue(job["result"]["facts_only"])
+        self.assertIsNone(job["result"]["explanation"])
+        self.assertIn("LLM_API_KEY", job["result"]["reason"])
 
     def test_explain_poison_cache_ignored_and_overwritten(self):
         """thinking-мусор в БД: today врёт explained=false, повтор лечит."""
@@ -1711,9 +1725,9 @@ class TaskApiTests(ApiTestBase):
         with patch.dict(os.environ, {"LLM_API_KEY": "test-key"}), \
                 patch("app.api._task_explain_llm",
                       return_value=(
-                          "Твой ход Nf3 — неточность: ты отдал центр без борьбы. "
-                          "Сильнее было c4 с давлением на поле d5. "
-                          "В похожих позициях сначала занимай центр пешками."
+                          "Твой ход Bb5 — зевок: ты отдал инициативу без борьбы. "
+                          "Сильнее было Bc4 с давлением. "
+                          "В похожих позициях сначала занимай центр."
                       )) as llm:
             resp = self.client.post("/api/task/explain")
             self.assertEqual(resp.status_code, 200)
@@ -2274,7 +2288,7 @@ class PlanLlmTests(ApiTestBase):
         "Неделя 1: упор на эндшпили + твоё самое слабое место\n"
         "Режим: обычный\n"
         "Норма дня (30 мин):\n"
-        "- Задачи — 10 мин (20 качественных)\n"
+        "- Задачи — 10 мин (10 качественных)\n"
         "- Эндшпиль — 10 мин (ладейные окончания)\n"
         "- Партии — 10 мин (1 партия в день)\n"
         "Итог недели: держим темп, считаем до конца."
@@ -2550,7 +2564,8 @@ class PlanLlmTests(ApiTestBase):
             self.client.get("/api/plan/llm").json(), {"text": None}
         )
 
-    def test_generate_thinking_goes_error(self):
+    def test_generate_thinking_facts_fallback(self):
+        """Служебный разбор вместо плана — facts-only ответ, не error."""
         self._add_user()
         thinking = (
             "THINKING ANALYZE CONSTRAINTS STEP 1 FACTS FROM DATA "
@@ -2562,8 +2577,11 @@ class PlanLlmTests(ApiTestBase):
             resp = self.client.post("/api/plan/generate", data={})
             self.assertEqual(resp.status_code, 200)
             job = self._wait_job(resp.json()["job_id"])
-        self.assertEqual(job["status"], "error")
-        self.assertIn("разбор", job["error"])
+        self.assertEqual(job["status"], "done", job.get("error"))
+        self.assertTrue(job["result"]["plan"]["facts_only"])
+        got = self.client.get("/api/plan/llm").json()
+        self.assertTrue(got["facts_only"])
+        self.assertIn("LLM недоступен", got["text"])
 
     def test_stale_plan_comment_is_hidden(self):
         """Старый кэш «плана» не показывается после смены промпта."""
@@ -2733,7 +2751,7 @@ class PlanLlmTests(ApiTestBase):
             )
 
     def test_generate_basic_topics_rejected_for_advanced(self):
-        """Рейтинг 2100 + детсад в плане → job error «базовые темы», в meta пусто."""
+        """Рейтинг 2100 + детсад в плане → факты недели (facts_only), не брак и не error."""
         self._add_user()
         self._seed_rating(2100)
         with patch.dict(os.environ, {"LLM_API_KEY": "test-key"}), \
@@ -2742,11 +2760,11 @@ class PlanLlmTests(ApiTestBase):
             resp = self.client.post("/api/plan/generate", data={})
             self.assertEqual(resp.status_code, 200)
             job = self._wait_job(resp.json()["job_id"])
-        self.assertEqual(job["status"], "error")
-        self.assertIn("базовые темы", job.get("error") or "")
-        self.assertEqual(
-            self.client.get("/api/plan/llm").json(), {"text": None}
-        )
+        self.assertEqual(job["status"], "done", job.get("error"))
+        self.assertTrue(job["result"]["plan"]["facts_only"])
+        got = self.client.get("/api/plan/llm").json()
+        self.assertTrue(got["facts_only"])
+        self.assertIn("базовые темы", got["llm_error"])
 
     def test_generate_basic_topics_allowed_below_1800(self):
         """Рейтинг 1500: тот же текст — годный план, сохраняется."""

@@ -620,7 +620,8 @@ class MiddlegameAnalyzeTests(MiddlegameApiTestBase):
         third = llm.chat.call_args_list[2]
         self.assertIsNone(third.kwargs.get("reasoning_max_tokens"))
 
-    def test_analyze_llm_failure_keeps_session(self):
+    def test_analyze_llm_failure_falls_back_to_facts(self):
+        """Мусор от LLM — recoverable facts-only отчёт, сессия analysed."""
         self._register(self.client, "tester")
         self._seed_session("s1", "tester", plies=4)
         llm = MagicMock()
@@ -630,13 +631,58 @@ class MiddlegameAnalyzeTests(MiddlegameApiTestBase):
                 patch("app.api._unload_maia"):
             job = self._wait_job(self._analyze("s1"))
 
-        self.assertEqual(job["status"], "error")
-        self.assertIn("JSON", job["error"])
+        self.assertEqual(job["status"], "done", job.get("error"))
+        report = job["result"]["report"]
+        self.assertTrue(report["facts_only"])
+        self.assertEqual(report["summary_kind"], "engine_facts")
+        self.assertEqual(report["verdict"], "good")
+        self.assertEqual(report["verdict_source"], "engine")
         with Database(self.db_path) as db:
             db.init_db()
             row = db.get_middlegame_session("s1")
-        self.assertEqual(row.status, "playing")
-        self.assertIsNone(row.report)
+        self.assertEqual(row.status, "analyzed")
+        self.assertIsNotNone(row.report)
+        self.assertTrue(row.report["facts_only"])
+
+    def test_analyze_llm_summary_with_foreign_facts_falls_back(self):
+        """Summary с чужими числами/SAN отклоняется — отчёт фактами движка."""
+        self._register(self.client, "tester")
+        self._seed_session("s1", "tester", plies=4)
+        data = json.loads(_REPORT_JSON)
+        data["summary"] = "Огромный перевес +9.99, дальше Qh5 решает"
+        llm = MagicMock()
+        llm.chat.return_value = json.dumps(data, ensure_ascii=False)
+        with patch("app.api.Engine", FakeEngine), \
+                patch("app.api.LLMClient", return_value=llm), \
+                patch("app.api._unload_maia"):
+            job = self._wait_job(self._analyze("s1"))
+
+        self.assertEqual(job["status"], "done", job.get("error"))
+        report = job["result"]["report"]
+        self.assertTrue(report["facts_only"])
+        self.assertEqual(report["summary_kind"], "engine_facts")
+        self.assertEqual(report["verdict"], "good")
+        self.assertEqual(report["verdict_source"], "engine")
+        self.assertNotIn("+9.99", report["summary"])
+
+    def test_analyze_verdict_from_engine_not_llm(self):
+        """LLM вердикт игнорируется: verdict всегда из дельт движка."""
+        self._register(self.client, "tester")
+        self._seed_session("s1", "tester", plies=4)
+        data = json.loads(_REPORT_JSON)
+        data["verdict"] = "wrong"  # LLM утверждает обратное движку
+        llm = MagicMock()
+        llm.chat.return_value = json.dumps(data, ensure_ascii=False)
+        with patch("app.api.Engine", FakeEngine), \
+                patch("app.api.LLMClient", return_value=llm), \
+                patch("app.api._unload_maia"):
+            job = self._wait_job(self._analyze("s1"))
+
+        self.assertEqual(job["status"], "done", job.get("error"))
+        report = job["result"]["report"]
+        # FakeEngine даёт нулевые потери — движок говорит good, не wrong.
+        self.assertEqual(report["verdict"], "good")
+        self.assertEqual(report["verdict_source"], "engine")
 
     def test_analyze_no_moves_409(self):
         self._register(self.client, "tester")

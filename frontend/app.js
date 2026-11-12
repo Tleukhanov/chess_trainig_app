@@ -38,7 +38,8 @@ const state = {
   taskExploreBusy: false,
   taskExploreError: null,
   taskExploreToken: 0,
-  taskExplanation: null,
+  taskLlmExplanation: null,
+  taskLlmNote: null,
   taskExplaining: false,
   taskJobId: null,
   taskError: null,
@@ -71,6 +72,7 @@ const state = {
   openingTheoryIdeasDone: false,
   openingTheoryIdeasCached: false,
   openingTheoryIdeasError: null,
+  openingTheoryIdeasRejected: false,
   middlegameSession: null,
   middlegameMeta: null,
   middlegameStrength: 'equal',
@@ -358,7 +360,7 @@ function renderUserbox() {
       syncAdminNav();
       Object.assign(state, {
         gameId: null, gameData: null, task: null, taskKey: null, taskResult: null,
-        taskRevealed: false, taskExplanation: null, planLlmJobId: null,
+        taskRevealed: false, taskLlmExplanation: null, taskLlmNote: null, planLlmJobId: null,
         planLlmGenerating: false, tool: 'repertoire', gamesFilter: 'all',
         openingSession: null, openingFens: null, openingLastReply: null, openingJobId: null,
         middlegameSession: null, middlegameMeta: null, middlegameJobId: null,
@@ -1151,8 +1153,9 @@ async function viewPlan(app) {
     llmHtml = `<div class="card"><div class="card-header"><span class="card-title">Комментарий тренера</span><span class="badge badge-neutral">пояснение</span></div>
       <p style="color:var(--c-text-muted);font-size:13px;margin:0">генерирую…</p></div>`;
   } else if (llmData && llmData.text) {
-    llmHtml = `<div class="card"><div class="card-header"><span class="card-title">Комментарий тренера</span><span class="badge badge-neutral">пояснение</span></div>
-      <p style="color:var(--c-text-muted);font-size:13px;margin-top:0">Это объяснение к недельному плану, а не отдельный список задач.</p>
+    const llmFactsOnly = !!llmData.facts_only;
+    llmHtml = `<div class="card"><div class="card-header"><span class="card-title">Комментарий тренера</span><span class="badge ${llmFactsOnly ? 'badge-blue' : 'badge-neutral'}" title="${llmFactsOnly ? 'Текст собран из фактов недели, без LLM' : 'Текст LLM проверен по фактам недели'}">${llmFactsOnly ? 'факты недели' : 'пояснение'}</span></div>
+      <p style="color:var(--c-text-muted);font-size:13px;margin-top:0">${llmFactsOnly ? 'LLM недоступен или ответ не прошёл проверку фактов — ниже только проверяемые данные недели без комментария модели.' : 'Это объяснение к недельному плану, а не отдельный список задач.'}</p>
       <details class="plan-comment"><summary>Почему такой план</summary><div class="mentor-reply">${coachCommentHtml(llmData.text, weekData && weekData.evidence)}</div></details>
       ${state.planLlmError ? `<div class="alert alert-error" style="margin-top:8px">${esc(state.planLlmError)}</div>` : ''}
       <div style="margin-top:8px"><button class="btn btn-secondary" id="plan-llm-refresh" style="font-size:12px;padding:4px 10px">Обновить комментарий</button></div></div>`;
@@ -2712,14 +2715,14 @@ async function loadTask(app, repeat) {
     state.taskJobId = null;
     state.taskRevealed = !!task.done;
     // Не показываем решение и линию до ответа/«Показать решение».
-    state.taskExplanation = task.done
-      ? (task.explanation_facts || task.explanation || null)
-      : null;
+    // LLM-объяснение — только из кеша, факты движка идут отдельной карточкой.
+    state.taskLlmExplanation = task.done ? (task.explanation || null) : null;
+    state.taskLlmNote = null;
     state.taskLine = null;
     if (state.taskPlayTimer) { clearInterval(state.taskPlayTimer); state.taskPlayTimer = null; }
     resetTaskExplore();
-  } else if (!state.taskExplanation && (task.explanation_facts || task.explanation)) {
-    state.taskExplanation = task.explanation_facts || task.explanation;
+  } else if (!state.taskLlmExplanation && task.done && task.explanation) {
+    state.taskLlmExplanation = task.explanation;
   }
   state.task = task;
   drawTask(app);
@@ -2730,7 +2733,7 @@ async function loadTask(app, repeat) {
 }
 
 function taskExplainControlsHtml() {
-  if (state.taskExplanation) return '';
+  if (state.taskLlmExplanation) return '';
   if (state.taskExplaining) {
     return '<p style="color:var(--c-text-muted);font-size:13px;margin:0">Объясняю…</p>';
   }
@@ -2890,12 +2893,19 @@ function drawTask(app) {
       </div>`;
   }
 
-  const explanationHtml = state.taskExplanation
-    ? `<div class="card"><div class="card-header"><span class="card-title">Почему так</span></div><div class="mentor-reply">${esc(state.taskExplanation)}</div></div>`
+  const taskFacts = (state.task && state.task.explanation_facts) || '';
+  const factsHtml = (state.taskRevealed && taskFacts)
+    ? `<div class="card"><div class="card-header"><span class="card-title">Почему так</span><span class="badge badge-blue" title="Текст собран из фактов движка, без LLM">факты движка</span></div><div class="mentor-reply">${esc(taskFacts)}</div></div>`
+    : '';
+  const llmExplanationHtml = state.taskLlmExplanation
+    ? `<div class="card"><div class="card-header"><span class="card-title">Объяснение LLM</span><span class="badge badge-neutral" title="Числа и ходы проверены по фактам движка">проверено по фактам</span></div><div class="mentor-reply">${esc(state.taskLlmExplanation)}</div></div>`
+    : '';
+  const llmNoteHtml = state.taskLlmNote
+    ? `<div class="alert alert-warn" style="margin-top:8px">${esc(state.taskLlmNote)}</div>`
     : '';
 
   const revealedNoAnswer = state.taskRevealed && !state.taskResult && !task.done;
-  const revealedExplainHtml = (revealedNoAnswer && !state.taskExplanation)
+  const revealedExplainHtml = (revealedNoAnswer && !state.taskLlmExplanation)
     ? `<div class="card"><div class="card-header"><span class="card-title">Объяснение LLM</span></div>${taskExplainControlsHtml()}</div>`
     : '';
 
@@ -2932,8 +2942,10 @@ function drawTask(app) {
         ${state.taskError ? `<div class="alert alert-error">${esc(state.taskError)}</div>` : ''}
         ${panel}
         ${state.taskRevealed ? taskSolutionHtml(task) : ''}
+        ${factsHtml}
         ${revealedExplainHtml}
-        ${explanationHtml}
+        ${llmExplanationHtml}
+        ${llmNoteHtml}
       </div>
     </div>`;
 
@@ -2950,7 +2962,7 @@ function drawTask(app) {
     showSolution.addEventListener('click', e => {
       e.preventDefault();
       state.taskRevealed = true;
-      state.taskExplanation = (state.task && state.task.explanation_facts) || state.taskExplanation;
+      state.taskLlmExplanation = (state.task && state.task.explanation) || state.taskLlmExplanation;
       drawTask(app);
     });
   }
@@ -3216,7 +3228,7 @@ async function submitTaskAnswer(app, san) {
     const res = await apiPost('/api/task/answer', fd);
     state.taskResult = res;
     state.taskRevealed = true;
-    state.taskExplanation = (state.task && state.task.explanation_facts) || state.taskExplanation;
+    state.taskLlmExplanation = (state.task && state.task.explanation) || state.taskLlmExplanation;
     state.taskLine = null;
     if (state.taskPlayTimer) { clearInterval(state.taskPlayTimer); state.taskPlayTimer = null; }
     resetTaskExplore();
@@ -3253,7 +3265,8 @@ async function taskExplain(app) {
   if (res.cached) {
     state.taskExplaining = false;
     state.taskJobId = null;
-    state.taskExplanation = (state.task && state.task.explanation_facts) || res.explanation;
+    state.taskLlmExplanation = res.explanation;
+    state.taskLlmNote = null;
     drawTask(app);
     return;
   }
@@ -3274,6 +3287,7 @@ function taskPollExplanation(app, jobId) {
       state.taskExplaining = false;
       state.taskJobId = null;
       state.taskError = 'Не удалось получить объяснение';
+      state.taskLlmNote = 'LLM недоступен — показан разбор по фактам движка.';
       drawTask(app);
       return;
     }
@@ -3282,9 +3296,14 @@ function taskPollExplanation(app, jobId) {
       state.timers.task = null;
       state.taskExplaining = false;
       state.taskJobId = null;
-      state.taskExplanation = (state.task && state.task.explanation_facts)
-        || (job.result && job.result.explanation)
-        || '';
+      const res = job.result || {};
+      if (res.facts_only || !res.explanation) {
+        state.taskLlmExplanation = null;
+        state.taskLlmNote = 'LLM недоступен или ответ не прошёл проверку фактов — показан разбор по фактам движка.';
+      } else {
+        state.taskLlmExplanation = res.explanation;
+        state.taskLlmNote = null;
+      }
       drawTask(app);
     } else if (job.status === 'error') {
       clearInterval(state.timers.task);
@@ -3626,6 +3645,7 @@ function resetOpeningTheory() {
   state.openingTheoryIdeasDone = false;
   state.openingTheoryIdeasCached = false;
   state.openingTheoryIdeasError = null;
+  state.openingTheoryIdeasRejected = false;
 }
 
 function stopOpeningTheoryPlay() {
@@ -3788,6 +3808,9 @@ function openingTheoryCardHtml() {
     if (state.openingTheoryIdeasError) {
       ideasHtml += `<div class="alert alert-error" style="margin-top:8px">${esc(state.openingTheoryIdeasError)}</div>`;
     }
+    if (state.openingTheoryIdeasRejected) {
+      ideasHtml += '<p class="theory-card-note" style="margin-top:8px">Ответ LLM отклонён проверкой фактов — показаны только данные книги.</p>';
+    }
     if (state.openingTheoryIdeas) {
       ideasHtml += `<div class="theory-ideas">
         <div class="theory-ideas-source">${esc(openingTheoryIdeasNote())}</div>
@@ -3845,6 +3868,7 @@ async function loadOpeningTheory(app) {
     state.openingTheoryIdeasDone = false;
     state.openingTheoryIdeasCached = false;
     state.openingTheoryIdeasError = null;
+    state.openingTheoryIdeasRejected = false;
   } catch (err) {
     if (isSessionError(err)) { handleSessionExpired(); return; }
     state.openingTheory = null;
@@ -3866,6 +3890,7 @@ async function loadOpeningTheoryIdeas(app) {
     .filter(m => m && m.san && m.fen);
   state.openingTheoryIdeasLoading = true;
   state.openingTheoryIdeasError = null;
+  state.openingTheoryIdeasRejected = false;
   drawOpening(app);
   try {
     const data = await api('/api/theory/ideas', {
@@ -3876,6 +3901,7 @@ async function loadOpeningTheoryIdeas(app) {
     if (state.openingTheory !== t) return;
     state.openingTheoryIdeas = data && typeof data.ideas === 'string' && data.ideas ? data.ideas : null;
     state.openingTheoryIdeasCached = !!(data && data.cached);
+    state.openingTheoryIdeasRejected = !!(data && data.rejected);
     state.openingTheoryIdeasDone = true;
   } catch (err) {
     if (isSessionError(err)) { handleSessionExpired(); return; }
@@ -5623,7 +5649,12 @@ function middlegameReportHtml(report, source, plan) {
   }).join('') : '<p style="color:var(--c-text-muted)">Моментов нет.</p>';
   return `
     <div class="card">
-      <div class="card-header"><span class="card-title">Отчёт тренера</span><span class="badge ${verdict.badge}">${esc(verdict.label)}</span></div>
+      <div class="card-header"><span class="card-title">Отчёт тренера</span><span class="badge ${verdict.badge}" title="Вердикт рассчитан движком Stockfish по потерям win%, LLM вердикт не определяет">${esc(verdict.label)}</span></div>
+      ${report.facts_only
+        ? '<div class="alert alert-warn" style="margin-top:8px">LLM недоступен или ответ не прошёл проверку фактов — отчёт собран из данных Stockfish (без текста модели).</div>'
+        : report.summary_kind === 'engine_facts'
+          ? '<p style="color:var(--c-text-muted);font-size:12px;margin:8px 0 0">Саммари — по фактам Stockfish.</p>'
+          : '<p style="color:var(--c-text-muted);font-size:12px;margin:8px 0 0">Саммари — мнение тренера по фактам движка, не вывод движка.</p>'}
       ${report.summary ? `<div class="mentor-reply">${esc(report.summary)}</div>` : ''}
       ${report.plan_comment ? `<h3 style="font-size:14px;margin:12px 0 6px">Ошибки по движку</h3><div class="mentor-reply">${esc(report.plan_comment)}</div>` : ''}
       <h3 style="font-size:14px;margin:12px 0 8px">Ключевые моменты</h3>
@@ -6492,7 +6523,9 @@ function renderReview(d) {
           <code>${esc(m.san || '—')}</code>
           <span class="badge ${cls === 'blunder' ? 'badge-bad' : cls === 'mistake' ? 'badge-neutral' : 'badge-good'}">${esc(cls)}</span>
           <span style="color:var(--c-text-muted);font-size:12px">полуход ${m.ply || '—'}${m.drop != null ? ` · потеря win% ${fmt(m.drop)}` : ''}</span>
-          <div style="margin-top:2px">${m.text ? esc(m.text) : '<span style="color:var(--c-text-muted)">(нет объяснения)</span>'}</div>
+          <div style="margin-top:2px">${m.text
+            ? esc(m.text) + (m.text_source === 'facts' ? ' <span class="badge badge-blue" title="Факты движка — текст LLM заменён проверяемым">факты</span>' : '')
+            : '<span style="color:var(--c-text-muted)">(нет объяснения)</span>'}</div>
         </div>`;
     }).join('');
     return `
@@ -6503,12 +6536,13 @@ function renderReview(d) {
         </div>
         <p style="color:var(--c-text-muted);font-size:13px;margin:0 0 8px">${esc(g.opening || '—')}${g.avg_win_loss != null ? ` · ср. потеря win% ${fmt(g.avg_win_loss)}` : ''}</p>
         ${moments || '<p style="color:var(--c-text-muted)">Ключевых моментов нет.</p>'}
-        ${g.summary ? `<p style="margin-top:8px"><strong>Итог:</strong> ${esc(g.summary)}</p>` : ''}
+        ${g.summary ? `<p style="margin-top:8px"><strong>Итог:</strong>${g.summary_source === 'facts' ? ' <span class="badge badge-blue" title="Итоги собраны из фактов движка">факты</span>' : ''} ${esc(g.summary)}</p>` : ''}
       </div>`;
   }).join('');
 
   box.innerHTML = `
     ${d.dry_run ? '<div class="alert alert-info">Режим dry-run: LLM не вызывался — ниже готовые промпты.</div>' : ''}
+    ${d.llm_error ? `<div class="alert alert-warn">LLM недоступен — показаны факты движка (${esc(d.llm_error)}).</div>` : ''}
     ${games.length ? gameCards : '<div class="card"><p style="color:var(--c-text-muted)">Разбора нет: в отобранных партиях не нашлось ключевых моментов (blunder/mistake).</p></div>'}
     ${d.dry_run && promptBlocks ? `<div class="card" style="margin-top:12px"><div class="card-header"><span class="card-title">Готовые промпты</span></div>${promptBlocks}</div>` : ''}`;
 }
@@ -6524,12 +6558,16 @@ function renderMentor(d) {
       <div class="card"><div class="card-header"><span class="card-title">Промпты тренера</span></div>${prompts || '<p style="color:var(--c-text-muted)">Промптов нет.</p>'}</div>`;
     return;
   }
+  const factsOnly = !!d.facts_only;
   box.innerHTML = `
     <div class="card">
       <div class="card-header">
         <span class="card-title">План тренера${d.user ? ` · ${esc(d.user)}` : ''}</span>
-        ${d.model ? `<span class="badge badge-blue">${esc(d.model)}</span>` : ''}
+        ${factsOnly
+          ? '<span class="badge badge-blue" title="Текст собран из фактов движка, без LLM">факты движка</span>'
+          : `<span class="badge badge-good" title="Текст LLM проверен по фактам движка">LLM${d.model ? ` · ${esc(d.model)}` : ''}</span>`}
       </div>
+      ${factsOnly ? '<div class="alert alert-warn" style="margin-top:8px">LLM недоступен или ответ не прошёл проверку фактов — ниже только проверяемые данные по твоим партиям без комментария модели.</div>' : ''}
       ${d.notes ? `<div class="alert alert-warn">Учтены заметки: ${esc(d.notes)}</div>` : ''}
       <div class="mentor-reply">${esc(d.reply || '(пустой ответ тренера)')}</div>
     </div>`;
@@ -6811,7 +6849,7 @@ async function viewUsers(app) {
     state.authMode = 'login';
     Object.assign(state, {
       gameId: null, gameData: null, task: null, taskKey: null, taskResult: null,
-      taskRevealed: false, taskExplanation: null, planLlmJobId: null,
+      taskRevealed: false, taskLlmExplanation: null, taskLlmNote: null, planLlmJobId: null,
       planLlmGenerating: false, tool: 'repertoire', gamesFilter: 'all',
       openingSession: null, openingFens: null, openingLastReply: null, openingJobId: null,
       middlegameSession: null, middlegameMeta: null, middlegameJobId: null,
@@ -6857,7 +6895,7 @@ async function viewUsers(app) {
         state.authMode = 'login';
         Object.assign(state, {
           gameId: null, gameData: null, task: null, taskKey: null, taskResult: null,
-          taskRevealed: false, taskExplanation: null, planLlmJobId: null,
+          taskRevealed: false, taskLlmExplanation: null, taskLlmNote: null, planLlmJobId: null,
           planLlmGenerating: false, tool: 'repertoire', gamesFilter: 'all',
           openingSession: null, openingFens: null, openingLastReply: null, openingJobId: null,
           middlegameSession: null, middlegameMeta: null, middlegameJobId: null,
