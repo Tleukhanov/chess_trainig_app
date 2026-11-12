@@ -1,6 +1,6 @@
 {
   "name": "Chess Trainer",
-  "description": "Personal chess trainer: Lichess games, Stockfish analysis, LLM coaching, drills, repertoire and a Maia-2 opening trainer.",
+  "description": "LEGACY Heroku starting point — NOT the current deployment. Target baseline is a VPS 2 vCPU / 4 GB RAM with a persistent disk for data/ (see README). Kept for reference only; do not use for new installs. Personal chess trainer: Lichess games, Stockfish analysis, LLM coaching, drills, repertoire and a Maia-2 opening trainer.",
   "stack": "heroku-24",
   "buildpacks": [
     {

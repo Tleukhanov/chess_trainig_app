@@ -12,7 +12,7 @@ LLM, без движка на чтении и без сети.
 удобный срез дерева для UI: «первый ход → ответ противника → твой ответ».
 
 Ограничения (не превращать в теорию):
-- это частота из vorlieгных партий, а не эталонная теория;
+- это частота из ваших партий, а не эталонная теория;
 - граф не рекомендует ход, которого игрок никогда не играл;
 - для веток с count < 5 оценки считаются слабыми и судьба ветки не скрывается.
 """
@@ -205,7 +205,9 @@ def build_opening_book(
     )
 
     # Главной линией считаем путь максимальных частот: жадно идём по самым
-    # частым детям с tie-break по avg loss и точному SAN (детерминированно).
+    # частым детям; при равенстве частот — лексикографически меньший SAN
+    # (то же правило tie-break, что и в ``_majority_opening``, ``top_children``
+    # и сортировке первых ходов). Никаких других критериев нет.
     main_line: list[str] = []
     prefix: tuple[str, ...] = ()
     current_games = games
@@ -284,7 +286,8 @@ def build_opening_book(
         # линию нужно вернуть ход белых.
         if color == "black" and rows and rows[0].moves:
             opp_counts = Counter(game.moves[0] for game in rows if game.moves)
-            opp_move = max(opp_counts.items(), key=lambda item: (item[1], item[0]))[0]
+            # То же правило tie-break: частота (убыв.), затем SAN (лексикографически).
+            opp_move = sorted(opp_counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
             local_games = [game for game in rows if game.moves and game.moves[0] == opp_move]
             local_main = [opp_move, san]
         else:

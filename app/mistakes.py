@@ -66,6 +66,10 @@ PHASE_ENDGAME = "endgame"
 
 PHASES: tuple[str, ...] = (PHASE_OPENING, PHASE_MIDDLEGAME, PHASE_ENDGAME)
 
+# Цейтнот в анализе помечается в app.analyzer по остатку на часах < 30.0 с
+# (``MoveAnalysis.time_pressure``). Отдельного порога по потере win% у этого
+# модуля нет: классификация опирается на флаг из анализа.
+
 # app.patterns.phase() исторически возвращает "midgame" — принимаем как синоним.
 _PHASE_ALIASES: dict[str, str] = {
     PHASE_OPENING: PHASE_OPENING,
@@ -74,8 +78,6 @@ _PHASE_ALIASES: dict[str, str] = {
     PHASE_ENDGAME: PHASE_ENDGAME,
 }
 
-TIME_PRESSURE_CLOCK = 20.0
-TIME_PRESSURE_DROP = 10.0
 TACTICAL_DROP = 20.0
 
 _UNKNOWN_CAUSE_TEXT = "причина не определена — разовый промах"

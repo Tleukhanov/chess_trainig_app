@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.9.22 — 2026-11-12
+
+Release hygiene (audit M9). No feature work, no algorithm changes, no data migration.
+
+- Docs: honest test counts — with `LLM_API_KEY` set, 1069 tests pass (4 skipped,
+  including 20 new release-hygiene tests); without it, 6 `tests/test_middlegame_api.py`
+  tests fail (1063 pass). Previous unqualified "all tests pass" wording removed;
+  verified compatibility is claimed only for the keyed run.
+- Deployment docs: target baseline is a VPS (2 vCPU / 4 GB RAM) with a persistent
+  disk for `data/`. `Procfile`/`Aptfile`/`app.json` are marked as legacy Heroku
+  leftovers — not the current deployment, not recommended; they were kept, not
+  deleted, and no secrets were added.
+- README states the project is private, has no public self-serve support, and no
+  LICENSE (owner decision: closed/commercial direction, not open source).
+- `opencode.json` (local dev-only MCP config, no secrets) removed from the repo.
+- `PLAN_M9.md`: leaked machine-specific absolute path removed (now repo-relative).
+- Report fixes: move numbers printed as chess notation with color marker
+  (`10. Qd2` / `13... bxa3`) instead of raw `ply + 1`; missed-wins entries gain a
+  `move` field (raw `ply` kept for compatibility); "плохих ходов" column name
+  (was "ходов"); "Цейтнот: нет данных" instead of a misleading "(0%)" when no
+  time-pressure moves were played (`tp_blunder_rate_pct` is now `None` then);
+  average win% loss/before in report and plan now skip games with missing values
+  instead of substituting 0.
+- `app/plan.py`: branch entries gain explicit `path_ok_rate` (line strength,
+  i.e. path-wide); the legacy `ok_rate` key is kept and equals it.
+- `app/repertoire.py`: weak-opening rows now encode `color` explicitly as
+  `white`/`black`/`mixed` (`mixed` = both colors aggregated in one row), with
+  `white_games`/`black_games` counters; previously a silent "majority color" label.
+- `app/opening_book.py`: main-line tie-break comment/code aligned with the
+  module's frequency-then-SAN rule.
+- `app/mistakes.py`: dead `TIME_PRESSURE_CLOCK`/`TIME_PRESSURE_DROP` removed
+  (time pressure is marked in `app.analyzer` by < 30.0 s clock).
+- `app/accuracy.py`: docstring corrected — tactics without motifs is `None`, not 0.
+- `app/games.py`: a nick matching neither player now logs a WARNING instead of
+  silently attributing moves to white; still falls back to white because all
+  downstream consumers require a binary color — pass `user_color` explicitly when
+  importing PGNs.
+- New `tests/test_release_hygiene.py` covers the CLI/report fixes: chess-notation
+  move labels, missing-metric handling (no fake 0), time-pressure "нет данных",
+  плохих ходов header, `path_ok_rate`/`ok_rate` compatibility, opening-stats color
+  encoding, user-color fallback warning, and the opening-book tie-break rule.
+- Frontend asset URLs bumped to `?v=0.9.22` (cache-busting only).
+- Test condition: 1069 pass with `LLM_API_KEY=test LLM_MODEL=openai/gpt-4o-mini`;
+  without the key, the 6 middlegame API tests listed above fail.
+
 ## 0.9.21 — 2026-11-08
 
 - Added a real opening repertoire built from your own games: first move,

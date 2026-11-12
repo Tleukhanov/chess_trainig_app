@@ -91,7 +91,11 @@ def _opening_task(day: str, row: dict[str, Any]) -> dict[str, Any] | None:
     eco = str(row.get("eco") or "").strip() or None
     color = str(row.get("color") or "").strip().lower()
     if color not in _COLOR_RU:
-        color = "white"
+        # «mixed» (оба цвета сведены в одну строку): тренируем тот цвет,
+        # партий которым больше; при равенстве — white, как раньше.
+        white_games = _num(row.get("white_games"))
+        black_games = _num(row.get("black_games"))
+        color = "white" if white_games >= black_games else "black"
     games = int(_num(row.get("games")))
     points = _num(row.get("points_pct"))
     errors = _num(row.get("errors_per_game"))

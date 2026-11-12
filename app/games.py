@@ -5,6 +5,7 @@ from __future__ import annotations
 import calendar
 import datetime
 import json
+import logging
 import re
 import time
 import urllib.error
@@ -22,6 +23,7 @@ from .openings import classify_opening
 
 USER_AGENT = "chess-trainer/0.1 (+https://github.com/Tleukhanov/chess_trainig_app)"
 _CLOCK_RE = re.compile(r"\[%clk\s+([0-9:.]+)\]")
+_LOG = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,12 +59,30 @@ class Game:
 
 
 def _determine_user_color(username: str, white_name: str | None, black_name: str | None) -> str:
-    """Определяет цвет пользователя, сверяя его ник с именами игроков (без учёта регистра)."""
+    """Определяет цвет пользователя, сверяя его ник с именами игроков (без учёта регистра).
+
+    Если ник не совпадает ни с одним игроком или не задан, цвет определить
+    нельзя: вниз по потоку все потребители требуют бинарного ``white``/``black``.
+    Поэтому возвращается ``white`` как «лучший текущий вариант» — но молча
+    это не происходит: пишется WARNING с ником и заголовками, чтобы
+    misattribution на чистом PGN была видна в логах. Для точной атрибуции
+    импортируйте партию через ``parse_pgn_games(..., user_color=...)``.
+    """
     user = (username or "").strip().lower()
-    if white_name and white_name.strip().lower() == user:
+    white = (white_name or "").strip().lower()
+    black = (black_name or "").strip().lower()
+    if user and white and white == user:
         return "white"
-    if black_name and black_name.strip().lower() == user:
+    if user and black and black == user:
         return "black"
+    _LOG.warning(
+        "не удалось определить цвет пользователя %r (white=%r, black=%r); "
+        "атрибуция ходов будет выполнена для белых; "
+        "передайте user_color явно при импорте PGN",
+        username,
+        white_name,
+        black_name,
+    )
     return "white"
 
 

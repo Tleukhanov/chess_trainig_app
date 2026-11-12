@@ -211,6 +211,11 @@ def opening_stats(
     """Сводка по дебютам: ошибки пользователя, очки и потери win.%.
 
     Параметр ``user`` не используется — оставлен для совместимости CLI.
+    Строки агрегируют партии ОБОИХ цветов по названию дебюта; поле
+    ``color`` — явное кодирование разбивки: ``white`` / ``black`` — все
+    партии строки сыграны этим цветом, ``mixed`` — партии обоих цветов
+    сведены в одну строку (числа относятся к обоим цветам вместе).
+    Точные счётчики по цветам — в полях ``white_games`` и ``black_games``.
     Сортировка: сначала по ошибкам на партию (убыв.), затем по числу партий.
     """
     groups: dict[tuple[str, str | None], dict[str, Any]] = {}
@@ -259,6 +264,18 @@ def opening_stats(
     for group in groups.values():
         games = group["games"]
         bad = group["bad_moves"]
+        white_games = group["white_games"]
+        black_games = group["black_games"]
+        if white_games and black_games:
+            color = "mixed"
+        elif white_games:
+            color = "white"
+        elif black_games:
+            color = "black"
+        else:
+            # Цвет не определён ни в одной партии строки: честно «mixed»,
+            # а не молчаливое «white».
+            color = "mixed"
         points_pct = (group["wins"] + 0.5 * group["draws"]) / games * 100.0 if games else 0.0
         rows.append(
             {
@@ -271,7 +288,9 @@ def opening_stats(
                 "bad_moves": bad,
                 "errors_per_game": round(bad / games, 2) if games else 0.0,
                 "avg_drop": round(group["sum_drop"] / bad, 2) if bad else 0.0,
-                "color": "white" if group["white_games"] >= group["black_games"] else "black",
+                "color": color,
+                "white_games": white_games,
+                "black_games": black_games,
             }
         )
     rows.sort(key=lambda row: (-row["errors_per_game"], -row["games"]))

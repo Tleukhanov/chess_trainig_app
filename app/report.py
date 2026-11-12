@@ -25,6 +25,23 @@ _DEFAULT_OPENING = "—"
 _RESULT_RU = {"win": "победа", "draw": "ничья", "loss": "поражение"}
 
 
+def _move_label(ply: int, san: Any = None) -> str:
+    """Нотация хода в шахматном виде: «10. Qd2» (белые) / «13... bxa3» (чёрные).
+
+    ``ply`` — нулевой индекс полухода в партии (как во всех кешах анализа);
+    наружу для человека отдаём номер хода ``ply // 2 + 1`` с маркером цвета.
+    """
+    number = ply // 2 + 1
+    marker = "." if ply % 2 == 0 else "..."
+    san_text = san if isinstance(san, str) else ""
+    return f"{number}{marker} {san_text}".rstrip()
+
+
+def _fmt_metric(value: float | None, digits: int = 1) -> str:
+    """Число метрики или «—», если данных нет (никогда не печатаем выдуманный 0)."""
+    return f"{value:.{digits}f}" if isinstance(value, (int, float)) else "—"
+
+
 def _plural(num: int, one: str, few: str, many: str) -> str:
     """Русское склонение существительных после числительных."""
     n = abs(num) % 100
@@ -165,10 +182,13 @@ def build_report(pairs: list[tuple[Game, dict]], user: str) -> dict[str, Any]:
     missed_wins: list[dict[str, Any]] = []
 
     for game, analysis in pairs:
-        avg_win_loss = metric(analysis, "avg_win_loss")
-        avg_win_before = metric(analysis, "avg_win_before")
-        avg_win_loss_values.append(avg_win_loss)
-        avg_win_before_values.append(avg_win_before)
+        # Отсутствующие метрики пропускаем, а не подменяем нулём.
+        avg_win_loss = metric(analysis, "avg_win_loss", None)
+        avg_win_before = metric(analysis, "avg_win_before", None)
+        if avg_win_loss is not None:
+            avg_win_loss_values.append(avg_win_loss)
+        if avg_win_before is not None:
+            avg_win_before_values.append(avg_win_before)
 
         blunders = analysis.get("blunders") or []
         mistakes = analysis.get("mistakes") or []
@@ -209,6 +229,7 @@ def build_report(pairs: list[tuple[Game, dict]], user: str) -> dict[str, Any]:
                 {
                     "game_id": game.id,
                     "ply": ply,
+                    "move": _move_label(ply, move.get("san")),
                     "san": move.get("san"),
                     "win_before": move.get("win_before"),
                     "win_after": move.get("win_after"),
@@ -223,26 +244,31 @@ def build_report(pairs: list[tuple[Game, dict]], user: str) -> dict[str, Any]:
             return 0.0
         return float(before) - float(after)
 
-    worst_games.sort(key=lambda item: item["avg_win_loss"], reverse=True)
+    # Партии без значения avg_win_loss — в конец, а не в ноль.
+    worst_games.sort(
+        key=lambda item: (item["avg_win_loss"] is not None, item["avg_win_loss"] if item["avg_win_loss"] is not None else 0.0),
+        reverse=True,
+    )
     worst_games = worst_games[:_WORST_GAMES_LIMIT]
     missed_wins.sort(key=_win_loss, reverse=True)
     missed_wins = missed_wins[:_MISSED_WIN_LIMIT]
 
-    openings: dict[str, list[tuple[float, float]]] = defaultdict(list)
+    openings: dict[str, list[tuple[float, float | None]]] = defaultdict(list)
     for game, analysis in pairs:
         name = game.opening or game.eco or _DEFAULT_OPENING
         openings[name].append(
-            (game.user_result_points(), metric(analysis, "avg_win_loss"))
+            (game.user_result_points(), metric(analysis, "avg_win_loss", None))
         )
 
     opening_rows: list[dict[str, Any]] = []
     for name, entries in openings.items():
+        losses = [loss_ for _, loss_ in entries if loss_ is not None]
         opening_rows.append(
             {
                 "name": name,
                 "games": len(entries),
                 "score_pct": sum(points_ for points_, _ in entries) / len(entries) * 100.0,
-                "avg_win_loss": sum(loss_ for _, loss_ in entries) / len(entries),
+                "avg_win_loss": (sum(losses) / len(losses)) if losses else None,
             }
         )
     opening_rows.sort(key=lambda item: (-item["games"], item["name"]))
@@ -251,7 +277,6 @@ def build_report(pairs: list[tuple[Game, dict]], user: str) -> dict[str, Any]:
     themes = _theme_stats(pairs)
 
     blunders_per_game = blunders_total / total_games if total_games else 0.0
-    tp_blunder_rate = (tp_blunders_total / tp_moves_total * 100.0) if tp_moves_total else 0.0
 
     return {
         "user": user,
@@ -267,12 +292,12 @@ def build_report(pairs: list[tuple[Game, dict]], user: str) -> dict[str, Any]:
             "avg_win_loss": (
                 round(sum(avg_win_loss_values) / len(avg_win_loss_values), 2)
                 if avg_win_loss_values
-                else 0.0
+                else None
             ),
             "avg_win_before": (
                 round(sum(avg_win_before_values) / len(avg_win_before_values), 2)
                 if avg_win_before_values
-                else 0.0
+                else None
             ),
             "blunders_per_game": round(blunders_per_game, 2),
         },
@@ -288,7 +313,9 @@ def build_report(pairs: list[tuple[Game, dict]], user: str) -> dict[str, Any]:
         "time_pressure": {
             "moves_count": tp_moves_total,
             "blunders_in_tp": tp_blunders_total,
-            "tp_blunder_rate_pct": round(tp_blunder_rate, 1),
+            "tp_blunder_rate_pct": (
+                round(tp_blunders_total / tp_moves_total * 100.0, 1) if tp_moves_total else None
+            ),
         },
         "openings": opening_rows,
         "phases": weakness["phases"],
@@ -322,8 +349,8 @@ def format_report(report: dict[str, Any]) -> str:
 
     avg = report["avg"]
     lines.append(
-        f"Качество: {METRIC_LABELS['avg_win_loss']} = {avg['avg_win_loss']:.1f}, "
-        f"{METRIC_LABELS['avg_win_before']} = {avg['avg_win_before']:.1f}%, "
+        f"Качество: {METRIC_LABELS['avg_win_loss']} = {_fmt_metric(avg.get('avg_win_loss'))}, "
+        f"{METRIC_LABELS['avg_win_before']} = {_fmt_metric(avg.get('avg_win_before'))}%, "
         f"зевков в среднем на партию = {avg['blunders_per_game']:.2f}"
     )
 
@@ -343,8 +370,8 @@ def format_report(report: dict[str, Any]) -> str:
             opponent = item["opponent"] or "—"
             lines.append(
                 f"  {item['game_id']}  vs {opponent}  {_RESULT_RU.get(item['result'], item['result'])}  "
-                f"потеря win%={item['avg_win_loss']:.1f}  "
-                f"win% перед ходом={item['avg_win_before']:.1f}%"
+                f"потеря win%={_fmt_metric(item.get('avg_win_loss'))}  "
+                f"win% перед ходом={_fmt_metric(item.get('avg_win_before'))}%"
             )
     else:
         lines.append("Плохие партии: нет данных.")
@@ -358,19 +385,25 @@ def format_report(report: dict[str, Any]) -> str:
             before_txt = f"{before:.0f}%" if before is not None else "?"
             after_txt = f"{after:.0f}%" if after is not None else "?"
             best = f"  лучше было {item.get('best_move_san')}" if item.get("best_move_san") else ""
+            move_label = item.get("move") or _move_label(item.get("ply", 0), item.get("san"))
             lines.append(
-                f"  {item['game_id']}  ход {item['ply'] + 1}  {item.get('san')}  "
+                f"  {item['game_id']}  {move_label}  "
                 f"(было {before_txt} -> стало {after_txt}){best}"
             )
     else:
         lines.append("Упущенные выигрыши: нет.")
 
     tp = report["time_pressure"]
-    line_word = _plural(tp["moves_count"], "ход", "хода", "ходов")
-    lines.append(
-        f"Цейтнот: {tp['moves_count']} {line_word} под давлением, "
-        f"из них {tp['blunders_in_tp']} зевков ({tp['tp_blunder_rate_pct']:.0f}%)."
-    )
+    if tp["moves_count"]:
+        line_word = _plural(tp["moves_count"], "ход", "хода", "ходов")
+        rate = tp.get("tp_blunder_rate_pct")
+        rate_txt = f"{rate:.0f}%" if rate is not None else "—"
+        lines.append(
+            f"Цейтнот: {tp['moves_count']} {line_word} под давлением, "
+            f"из них {tp['blunders_in_tp']} зевков ({rate_txt})."
+        )
+    else:
+        lines.append("Цейтнот: нет данных (ходов с остатком < 30 с не найдено).")
 
     openings = report["openings"]
     if openings:
@@ -381,9 +414,10 @@ def format_report(report: dict[str, Any]) -> str:
             )
         )
         for item in openings:
+            avg_txt = _fmt_metric(item.get("avg_win_loss"))
             lines.append(
-                "  {:<36} {:>5} {:>7.0f}% {:>11.1f}".format(
-                    item["name"], item["games"], item["score_pct"], item["avg_win_loss"]
+                "  {:<36} {:>5} {:>7.0f}% {:>11}".format(
+                    item["name"], item["games"], item["score_pct"], avg_txt
                 )
             )
     else:
@@ -421,13 +455,13 @@ def format_report(report: dict[str, Any]) -> str:
         if phases:
             lines.append("  Слабости по фазам:")
             lines.append(
-                "    {:<12} {:>6} {:>6} {:>6} {:>14}".format(
-                    "Фаза", "ходов", "зевки", "ошибки", "средн. потери%"
+                "    {:<12} {:>14} {:>6} {:>6} {:>14}".format(
+                    "Фаза", "плохих ходов", "зевки", "ошибки", "средн. потери%"
                 )
             )
             for ph_name, stats in phases.items():
                 lines.append(
-                    "    {:<12} {:>6} {:>6} {:>6} {:>13.1f}".format(
+                    "    {:<12} {:>14} {:>6} {:>6} {:>13.1f}".format(
                         PHASE_LABELS.get(ph_name, ph_name),
                         stats["count"],
                         stats["blunders"],
