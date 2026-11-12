@@ -153,6 +153,17 @@ def _daily_task(day: str, task: dict[str, Any]) -> dict[str, Any]:
         value = task.get(key)
         if value not in (None, ""):
             action[key] = value
+    attempt = task.get("attempt")
+    if isinstance(attempt, bool):
+        attempt = None
+    if not isinstance(attempt, int):
+        try:
+            parsed = int(attempt)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            parsed = None
+        attempt = parsed if parsed and parsed > 0 else None
+    if attempt is not None:
+        action["attempt"] = attempt
     classification = str(task.get("classification") or "").strip()
     drop = task.get("drop")
     why_parts: list[str] = []
@@ -163,12 +174,14 @@ def _daily_task(day: str, task: dict[str, Any]) -> dict[str, Any]:
     opening = str(task.get("opening") or "").strip()
     if opening:
         why_parts.append(opening)
+    if attempt is not None and attempt > 1:
+        why_parts.append(f"попытка {attempt}")
     why = (
         "Свежая ошибка из твоей партии: " + ", ".join(why_parts) + "."
         if why_parts
         else "Одна ошибка из твоих партий — найди лучший ход."
     )
-    return _make(
+    task_out = _make(
         day,
         "task",
         "Задача дня: найди лучший ход",
@@ -176,6 +189,9 @@ def _daily_task(day: str, task: dict[str, Any]) -> dict[str, Any]:
         action,
         done=bool(task.get("done")),
     )
+    if attempt is not None:
+        task_out["attempt"] = attempt
+    return task_out
 
 
 def _review_task(day: str, plan: dict[str, Any]) -> dict[str, Any]:

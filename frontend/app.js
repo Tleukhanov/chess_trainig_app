@@ -1227,7 +1227,9 @@ async function viewPlan(app) {
     const rows = [];
     if (taskToday) {
       const done = !!taskToday.done;
-      rows.push(`<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:6px 0"><span class="badge ${done ? 'badge-good' : 'badge-neutral'}">${done ? 'выполнено' : 'осталось'}</span><span style="flex:1;min-width:180px">Задача дня${done ? ' — решена' : ' — не решена'}</span><button class="btn btn-secondary" data-plan-act="task" style="font-size:12px;padding:4px 10px">Открыть</button></div>`);
+      const attempt = Number(taskToday.attempt) > 0 ? Number(taskToday.attempt) : null;
+      const attemptBadge = attempt ? ` · попытка ${attempt}` : '';
+      rows.push(`<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:6px 0"><span class="badge ${done ? 'badge-good' : 'badge-neutral'}">${done ? 'выполнено' : 'осталось'}</span><span style="flex:1;min-width:180px">Задача дня${attemptBadge}${done ? ' — решена' : ' — не решена'}</span><button class="btn btn-secondary" data-plan-act="task" style="font-size:12px;padding:4px 10px">Открыть</button></div>`);
     }
     if (track) {
       rows.push(`<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:6px 0"><span class="badge badge-blue">время</span><span style="flex:1;min-width:180px">Время сегодня: ${_fmtDur(track.total_sec)}</span><button class="btn btn-secondary" data-plan-act="users" style="font-size:12px;padding:4px 10px">Профили</button></div>`);
@@ -2677,6 +2679,10 @@ async function viewDrillsWithParams(app, params) {
 // --- Задача дня ---
 
 async function viewTask(app) {
+  return loadTask(app, false);
+}
+
+async function loadTask(app, repeat) {
   if (!state.user) {
     app.innerHTML = '<div class="onboarding card"><div class="empty-icon">♟</div><h1>Задача дня</h1><p>Профиль не выбран — выбери его на странице Профили.</p><a href="#" class="btn btn-primary" data-view="users">Профили</a></div>';
     bindLinks(app);
@@ -2685,12 +2691,15 @@ async function viewTask(app) {
 
   let task;
   try {
-    task = await api('/api/task/today');
+    task = await api('/api/task/today' + (repeat ? '?repeat=1' : ''));
   } catch (err) {
+    const suppressed = /уже решались/i.test(String(err.message || ''));
     app.innerHTML = `
       <div class="card-header"><h1>Задача дня</h1></div>
-      <div class="onboarding card"><div class="empty-icon">♟</div><h1>Задач нет</h1><p>${esc(err.message)}</p><a href="#" class="btn btn-primary" data-view="coach">Запустить анализ</a></div>`;
+      <div class="onboarding card"><div class="empty-icon">♟</div><h1>${suppressed ? 'Все позиции решались недавно' : 'Задач нет'}</h1><p>${esc(err.message)}</p>${suppressed ? '<button type="button" class="btn btn-secondary" id="task-repeat-request-empty">Повторить решённую ранее</button>' : '<a href="#" class="btn btn-primary" data-view="coach">Запустить анализ</a>'}</div>`;
     bindLinks(app);
+    const repeatEmpty = document.getElementById('task-repeat-request-empty');
+    if (repeatEmpty) repeatEmpty.addEventListener('click', () => loadTask(app, true));
     return;
   }
 
@@ -2847,23 +2856,27 @@ function drawTask(app) {
   let panel = '';
   if (state.taskResult) {
     const ok = state.taskResult.correct;
+    const answerAttempt = Number(state.taskResult.attempt) > 0 ? `<div style="font-size:13px;color:var(--c-text-muted);margin-top:4px">попытка ${esc(String(state.taskResult.attempt))}</div>` : '';
     panel = `
       <div class="card">
         <div class="card-header"><span class="card-title">Ответ</span>
           <span class="badge ${ok ? 'badge-good' : 'badge-bad'}">${ok ? 'верно ✓' : 'неверно'}</span></div>
+        ${answerAttempt}
         ${taskExplainControlsHtml()}
       </div>`;
   } else if (task.done) {
+    const doneAttempt = Number(task.attempt) > 0 ? `<div style="font-size:13px;color:var(--c-text-muted);margin-top:4px">попытка ${esc(String(task.attempt))}</div>` : '';
     panel = `
       <div class="card">
         <div class="card-header"><span class="card-title">Ответ</span>
           <span class="badge badge-good">решено сегодня ✓</span></div>
+        ${doneAttempt}
         ${taskExplainControlsHtml()}
       </div>`;
   } else {
     panel = `
       <div class="card">
-        <div class="card-header"><span class="card-title">Твой ход</span></div>
+        <div class="card-header"><span class="card-title">Твой ход</span>${task.attempt ? `<span class="badge badge-neutral">попытка ${esc(String(task.attempt))}</span>` : ''}</div>
         <form id="task-answer-form" class="form-row" style="gap:8px;align-items:flex-end">
           <div class="form-group" style="flex:1;min-width:160px;margin-bottom:0">
             <label for="task-answer">Ход (SAN)</label>
@@ -2872,7 +2885,8 @@ function drawTask(app) {
           </div>
           <button class="btn btn-primary" style="height:38px">Ответить</button>
         </form>
-        <div style="margin-top:8px"><a href="#" id="task-show-solution" class="btn btn-link">Показать решение</a></div>
+        <div style="margin-top:8px"><a href="#" id="task-show-solution" class="btn btn-link">Показать решение</a>
+        <button type="button" id="task-repeat-request" class="btn btn-link" title="Игнорировать окно подавления решённых позиций и показать повтор по явному запросу">Повторить решённую ранее</button></div>
       </div>`;
   }
 
@@ -2902,6 +2916,10 @@ function drawTask(app) {
           <span class="badge badge-blue">${esc(task.date)}</span>
           <span class="badge badge-neutral">${esc(task.opening || '—')}${task.eco ? ` ${esc(task.eco)}` : ''}</span>
           <span class="badge badge-neutral">ты: ${colorLabel}</span>
+          ${Number(task.attempt) > 0 ? `<span class="badge badge-neutral" title="Попытка ${esc(String(task.attempt))} по этой позиции">попытка ${esc(String(task.attempt))}</span>` : ''}
+          ${task.solved_before && !task.repeat_requested ? '<span class="badge badge-neutral" title="Позиция уже решалась ранее">решал ранее</span>' : ''}
+          ${task.repeat_requested ? '<span class="badge badge-blue" title="Повтор показан по явному запросу">повтор по запросу</span>' : ''}
+          ${Number(task.suppressed_count) > 0 ? `<span class="badge badge-neutral" title="Позиции, решённые за последние ${esc(String(task.repeat_window_days || 7))} дн., скрыты K-дневным окном">скрыто решённых: ${esc(String(task.suppressed_count))}</span>` : ''}
           ${explore ? '<span class="badge badge-blue">свободный разбор</span>' : ''}
           ${clsBadge}
         </div>
@@ -2934,6 +2952,13 @@ function drawTask(app) {
       state.taskRevealed = true;
       state.taskExplanation = (state.task && state.task.explanation_facts) || state.taskExplanation;
       drawTask(app);
+    });
+  }
+  const repeatRequest = document.getElementById('task-repeat-request');
+  if (repeatRequest) {
+    repeatRequest.addEventListener('click', e => {
+      e.preventDefault();
+      loadTask(app, true);
     });
   }
   const explainBtn = document.getElementById('task-explain');
@@ -5620,7 +5645,18 @@ async function viewCoach(app) {
 
   let reportHtml = '';
   if (report) {
+    const stale = report.needs_refresh || null;
+    const staleCount = stale && Number(stale.count) > 0 ? Number(stale.count) : 0;
+    const staleTotal = stale && stale.total != null ? stale.total : report.games_analyzed;
+    const staleHtml = staleCount > 0 ? `
+      <div class="alert alert-warn" style="margin-bottom:12px">
+        <b>Устаревшие анализы: ${staleCount} из ${esc(String(staleTotal))}</b><br>
+        <span style="font-size:13px">Кеш без разметки тем ходов остаётся читаемым, но отчёты неполные. Обновление партии за партией выполняет Stockfish (глубина 10, 1 линия) — время пропорционально числу партий. Старые анализы заменятся только после успешного переанализирования; при ошибке движка прежний анализ сохранится, данные не удаляются. Анализы, общие с другим игроком, пропускаются.</span>
+        <div style="margin-top:8px"><button type="button" class="btn btn-secondary" id="stale-refresh-btn">Обновить устаревшие анализы (${staleCount})</button> <span style="font-size:12px;color:var(--c-text-muted)">Stockfish, глубина 10</span></div>
+        <div id="stale-refresh-slot"></div>
+      </div>` : '';
     reportHtml = `
+      ${staleHtml}
       <div class="grid grid-4" style="margin-bottom:12px">
         <div class="card stat"><div class="stat-value">${report.games_analyzed}</div><div class="stat-label">Проанализировано</div></div>
         <div class="card stat"><div class="stat-value">${fmt(report.score.score_pct)}%</div><div class="stat-label">Счёт</div></div>
@@ -5629,7 +5665,7 @@ async function viewCoach(app) {
       </div>
       ${report.worst_games.length ? `<div class="card" style="margin-top:12px"><h3 style="font-size:14px;margin-bottom:8px">Худшие партии</h3><div class="table-wrap"><table style="font-size:12px"><thead><tr><th>Партия</th><th>Соперник</th><th>Результат</th><th>Ср. потеря</th><th>Win% до</th><th>Грубых</th></tr></thead><tbody>${report.worst_games.slice(0, 5).map(g => `<tr><td>${esc(g.game_id.slice(0, 8))}</td><td>${esc(g.opponent)}</td><td>${esc(g.result)}</td><td class="num">${fmt(g.avg_win_loss)}%</td><td class="num">${fmt(g.avg_win_before)}%</td><td class="num">${g.blunders}</td></tr>`).join('')}</tbody></table></div></div>` : ''}
       ${report.missed_wins.length ? `<div class="card" style="margin-top:12px"><h3 style="font-size:14px;margin-bottom:8px">Упущенные выигрыши (топ-5)</h3><div class="table-wrap"><table style="font-size:12px"><thead><tr><th>Партия</th><th>Ход</th><th>SAN</th><th>Win% до</th><th>Win% после</th><th>Лучший ход</th></tr></thead><tbody>${report.missed_wins.slice(0, 5).map(m => `<tr><td>${esc(m.game_id.slice(0, 8))}</td><td>${m.ply}</td><td class="drill-san">${esc(m.san)}</td><td class="num">${fmt(m.win_before)}%</td><td class="num">${fmt(m.win_after)}%</td><td class="drill-best">${esc(m.best_move_san)}</td></tr>`).join('')}</tbody></table></div></div>` : ''}
-      ${report.themes && report.themes.moves_annotated ? `<div class="card theme-report" style="margin-top:12px"><h3 style="font-size:14px;margin-bottom:8px">Темы ходов</h3><div class="table-wrap"><table style="font-size:12px"><thead><tr><th>Тема</th><th>Возможностей</th><th>Сыграно</th><th>Не сыграно</th><th>Ошибок</th><th>Ср. потеря</th><th>Неоднозначных</th></tr></thead><tbody>${['tactics','positional','attack'].map(t => { const slot = report.themes[t] || {}; const examples = (slot.examples || []).map(e => `<button type="button" class="btn btn-link" data-theme-game="${esc(e.game_id)}" data-theme-ply="${esc(String(e.ply))}">${esc(e.san || '')} · −${fmt(e.drop)}%</button>`).join(' '); return `<tr><td><strong>${esc(slot.label || t)}</strong>${examples ? `<div style="display:block;margin-top:4px;max-width:220px">${examples}</div><div style="color:var(--c-text-muted);font-size:11px">нажми, чтобы открыть позицию</div>` : ''}</td><td class="num">${slot.opportunities ?? 0}</td><td class="num">${slot.executed ?? 0}</td><td class="num">${slot.missed ?? 0}</td><td class="num">${slot.errors ?? 0}</td><td class="num">${slot.avg_win_loss != null ? fmt(slot.avg_win_loss) + '%' : '—'}</td><td class="num">${slot.unknown ?? 0}</td></tr>`; }).join('')}</tbody></table></div><div style="color:var(--c-text-muted);font-size:12px;margin-top:8px">Классификация детерминированная (Stockfish/PV и правила), не LLM. Неоднозначные позиции не усредняются в процент.</div></div>` : ''}
+      ${report.themes && report.themes.moves_annotated ? `<div class="card theme-report" style="margin-top:12px"><h3 style="font-size:14px;margin-bottom:8px">Темы ходов</h3><div class="table-wrap"><table style="font-size:12px"><thead><tr><th>Тема</th><th>Возможностей</th><th>Сыграно</th><th>Не сыграно</th><th>Ошибок</th><th>Ср. потеря</th><th>Неоднозначных</th></tr></thead><tbody>${['tactics','positional','attack'].map(t => { const slot = report.themes[t] || {}; const examples = (slot.examples || []).map(e => `<button type="button" class="btn btn-link" data-theme-game="${esc(e.game_id)}" data-theme-ply="${esc(String(e.ply))}">${esc(e.san || '')} · −${fmt(e.drop)}%</button>`).join(' '); return `<tr><td><strong>${esc(slot.label || t)}</strong>${examples ? `<div style="display:block;margin-top:4px;max-width:220px">${examples}</div><div style="color:var(--c-text-muted);font-size:11px">нажми, чтобы открыть позицию</div>` : ''}</td><td class="num">${slot.opportunities ?? 0}</td><td class="num">${slot.executed ?? 0}</td><td class="num">${slot.missed ?? 0}</td><td class="num">${slot.errors ?? 0}</td><td class="num">${slot.avg_win_loss != null ? fmt(slot.avg_win_loss) + '%' : '—'}</td><td class="num">${slot.unknown ?? 0}</td></tr>`; }).join('')}</tbody></table></div><div style="color:var(--c-text-muted);font-size:12px;margin-top:8px">Классификация детерминированная (Stockfish/PV и правила), не LLM. Неоднозначные позиции не усредняются в процент.</div></div>` : `<div class="card theme-report" style="margin-top:12px"><h3 style="font-size:14px;margin-bottom:8px">Темы ходов</h3><div style="color:var(--c-text-muted);font-size:13px">Нет размеченных анализов: старая разметка без тем ходов.${staleCount > 0 ? ` Устаревших анализов: ${staleCount} — обновление построит разметку (блок выше).` : ' Запусти анализ партии заново.'}</div></div>`}
       <div class="card" style="margin-top:12px"><h3 style="font-size:14px;margin-bottom:8px">Тайм-тробль</h3><div class="grid grid-3"><div class="stat"><div class="stat-value">${report.time_pressure.moves_count}</div><div class="stat-label">Ходов в ТТ</div></div><div class="stat"><div class="stat-value">${report.time_pressure.blunders_in_tp}</div><div class="stat-label">Грубых в ТТ</div></div><div class="stat"><div class="stat-value">${fmt(report.time_pressure.tp_blunder_rate_pct)}%</div><div class="stat-label">% грубых в ТТ</div></div></div></div>`;
   } else {
     reportHtml = '<p style="color:var(--c-text-muted)">Пока нет отчёта. Запусти анализ выше.</p>';
@@ -5681,6 +5717,70 @@ async function viewCoach(app) {
       });
     });
   });
+
+  const staleBtn = document.getElementById('stale-refresh-btn');
+  if (staleBtn && report) {
+    const stale = report.needs_refresh || {};
+    const staleCount = Math.max(0, Number(stale.count) || 0);
+    staleBtn.addEventListener('click', () => {
+      const slot = document.getElementById('stale-refresh-slot');
+      if (!slot || slot.innerHTML) return;
+      const staleWord = (n) => {
+        const d = n % 10, h = n % 100;
+        if (h > 10 && h < 20) return 'партий';
+        if (d === 1) return 'партия';
+        if (d >= 2 && d <= 4) return 'партии';
+        return 'партий';
+      };
+      slot.innerHTML = `
+        <div style="margin-top:10px;padding:10px;border:1px dashed var(--c-border);border-radius:8px">
+          <b>Подтверди обновление</b>
+          <p style="font-size:13px;margin:6px 0">Будет переанализировано: ${staleCount} ${staleWord(staleCount)}. Stockfish (глубина 10, 1 линия), время пропорционально числу партий. Старые анализы заменятся только после успешного переанализирования; при ошибке движка прежний анализ сохранится целиком. Общие с другим игроком анализы пропускаются. Исходные данные не удаляются.</p>
+          <div class="form-row" style="gap:8px"><button type="button" class="btn btn-primary" id="stale-refresh-confirm">Обновить</button><button type="button" class="btn btn-link" id="stale-refresh-cancel">Отмена</button></div>
+          <div class="alert alert-error" id="stale-refresh-err" style="display:none;margin-top:8px"></div>
+          <div class="alert alert-success" id="stale-refresh-ok" style="display:none;margin-top:8px"></div>
+        </div>`;
+      const cancel = document.getElementById('stale-refresh-cancel');
+      if (cancel) cancel.addEventListener('click', () => { slot.innerHTML = ''; });
+      const confirmBtn = document.getElementById('stale-refresh-confirm');
+      if (confirmBtn) confirmBtn.addEventListener('click', async () => {
+        const errBox = document.getElementById('stale-refresh-err');
+        const okBox = document.getElementById('stale-refresh-ok');
+        if (errBox) errBox.style.display = 'none';
+        confirmBtn.disabled = true;
+        confirmBtn.textContent = 'Обновляю…';
+        try {
+          const res = await api('/api/report/refresh', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ confirm: true, limit: Math.min(20, Math.max(1, staleCount)) }),
+          });
+          const refreshed = (res.refreshed || []).length;
+          const failed = (res.failed || []).length;
+          const skipped = (res.skipped || []).length;
+          const remaining = res.needs_refresh ? res.needs_refresh.count : '?';
+          if (okBox) {
+            okBox.textContent = `Обновлено: ${refreshed}. Ошибок: ${failed}. Пропущено общих с другим игроком: ${skipped}. Осталось устаревших: ${remaining}.${failed ? ' Старые анализы при ошибках сохранены.' : ''}`;
+            okBox.style.display = 'block';
+          }
+          confirmBtn.textContent = 'Готово';
+          const more = document.getElementById('stale-refresh-btn');
+          if (more) more.disabled = true;
+          if (failed && Array.isArray(res.failed) && errBox) {
+            errBox.innerHTML = res.failed.map(f => `${esc(String(f.game_id || '').slice(0, 8))}: ${esc(f.error || 'ошибка')}`).join('<br>');
+            errBox.style.display = 'block';
+          }
+        } catch (err) {
+          if (errBox) {
+            errBox.textContent = err.message;
+            errBox.style.display = 'block';
+          }
+          confirmBtn.disabled = false;
+          confirmBtn.textContent = 'Обновить';
+        }
+      });
+    });
+  }
 
   document.getElementById('coach-form').addEventListener('submit', async e => {
     e.preventDefault();

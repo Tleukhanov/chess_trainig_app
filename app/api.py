@@ -39,7 +39,7 @@ from . import middlegame as mg
 from . import reading
 from . import theory
 from . import timeutil
-from .analyzer import Engine, win_percent
+from .analyzer import Engine, analysis_needs_refresh, win_percent
 from .coach import _extract_json, build_request, run_coach
 from .config import settings
 from .dayplan import build_tasks
@@ -813,6 +813,20 @@ class DayPlanToggleBody(BaseModel):
     date: str
     task_id: str
     done: bool = True
+
+
+class ReportRefreshBody(BaseModel):
+    """Тело POST /api/report/refresh: явное подтверждение и отбор партий.
+
+    ``confirm`` обязателен: обновление пересобирает анализы заново
+    (Stockfish, время пропорционально числу партий). ``game_ids`` — точный
+    список партий (только свои проанализированные); отсутствие списка —
+    все устаревшие анализы. ``limit`` — потолок партий за один вызов.
+    """
+
+    confirm: bool = False
+    game_ids: list[str] | None = None
+    limit: int = 10
 
 
 # --- Шахматные утилиты: свободный разбор позиции (stateless) -----------------
@@ -2043,6 +2057,176 @@ def _task_done_key(date: str, user: str) -> str:
     return f"daily_done_{date}_{user}"
 
 
+_TASK_REPEAT_WINDOW_DAYS_DEFAULT = 7
+_TASK_HISTORY_CAP = 500
+_TASK_RECENCY_HALF_LIFE_DAYS = 30.0
+
+
+def _task_history_key(user: str) -> str:
+    """Ключ meta: история попыток задач игрока (JSON-список, новые в конце)."""
+    return f"task_history_{(user or '').strip()}"
+
+
+def _task_repeat_window_days() -> int:
+    """K-дневное окно подавления решённых позиций (0 — отключить).
+
+    Задаётся переменной окружения ``TASK_REPEAT_WINDOW_DAYS``; по умолчанию
+    7 дней. Значения вне 0..365 зажимаются.
+    """
+    raw = os.environ.get("TASK_REPEAT_WINDOW_DAYS", "").strip()
+    if not raw:
+        return _TASK_REPEAT_WINDOW_DAYS_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError:
+        return _TASK_REPEAT_WINDOW_DAYS_DEFAULT
+    return max(0, min(365, value))
+
+
+def _load_task_history(db: Database, user: str) -> list[dict[str, Any]]:
+    """История попыток из meta; битые данные → пустая история, не падаем."""
+    raw = db.get_meta(_task_history_key(user))
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+    history: list[dict[str, Any]] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        task_key = item.get("task_key")
+        date = item.get("date")
+        if not isinstance(task_key, str) or not task_key:
+            continue
+        if not isinstance(date, str) or not date:
+            continue
+        try:
+            attempt = int(item.get("attempt") or 0)
+            ts = int(item.get("ts") or 0)
+        except (TypeError, ValueError):
+            attempt, ts = 0, 0
+        history.append(
+            {
+                "task_key": task_key,
+                "date": date,
+                "correct": bool(item.get("correct")),
+                "attempt": attempt,
+                "ts": ts,
+            }
+        )
+    return history
+
+
+def _record_task_attempt(
+    db: Database, user: str, task_key: str, date: str, correct: bool
+) -> int:
+    """Записывает попытку по задаче; возвращает её номер (1 — первая).
+
+    История per-position: номер попытки копится по ``task_key`` и не
+    сбрасывается ежедневно. Список в meta ограничен последними
+    ``_TASK_HISTORY_CAP`` записями — старые попытки очищаются, чтобы
+    конфиг не разрастался.
+    """
+    history = _load_task_history(db, user)
+    prior = [
+        int(item.get("attempt") or 0)
+        for item in history
+        if item["task_key"] == task_key
+    ]
+    attempt = 1 + (max(prior) if prior else 0)
+    history.append(
+        {
+            "task_key": task_key,
+            "date": date,
+            "correct": bool(correct),
+            "attempt": attempt,
+            "ts": int(time.time() * 1000),
+        }
+    )
+    if len(history) > _TASK_HISTORY_CAP:
+        history = history[-_TASK_HISTORY_CAP:]
+    db.set_meta(_task_history_key(user), json.dumps(history, ensure_ascii=False))
+    return attempt
+
+
+def _solve_suppress_cutoff(today: str, window_days: int) -> str | None:
+    """ISO-дата, строго старше которой решения ещё подавляются; None — выкл."""
+    if window_days <= 0:
+        return None
+    try:
+        day = datetime.date.fromisoformat(today) - datetime.timedelta(days=window_days)
+    except ValueError:
+        return None
+    return day.isoformat()
+
+
+def _suppressed_task_keys(
+    history: list[dict[str, Any]], today: str, window_days: int
+) -> set[str]:
+    """Ключи задач, решённых (correct) внутри окна последних K дней.
+
+    Подавление касается только верно решённых позиций: неверные ответы
+    не прячут позицию. ``date`` — ISO ``YYYY-MM-DD``, строки сравнимы лексикографически.
+    """
+    cutoff = _solve_suppress_cutoff(today, window_days)
+    if cutoff is None:
+        return set()
+    suppressed: set[str] = set()
+    for item in history:
+        if not item.get("correct"):
+            continue
+        if str(item.get("date") or "") > cutoff:
+            suppressed.add(item["task_key"])
+    return suppressed
+
+
+def _task_weight(item: dict[str, Any], now_ms: float | None = None) -> float:
+    """Вес кандидата в задачу дня: чем свежее партия и грубее ошибка, тем выше.
+
+    Recency задаётся half-life 30 дней; ``drop`` — множителем 1..100.
+    Старые/незначительные ошибки получают низкий, но не нулевой вес.
+    """
+    if now_ms is None:
+        now_ms = time.time() * 1000
+    move = item.get("move") if isinstance(item.get("move"), dict) else {}
+    drop_raw = move.get("drop")
+    try:
+        drop = float(drop_raw)
+    except (TypeError, ValueError):
+        drop = 5.0
+    drop = min(max(drop, 1.0), 100.0)
+    created = item.get("created_at") or 0
+    try:
+        created = float(created)
+    except (TypeError, ValueError):
+        created = 0.0
+    if created <= 0:
+        age_days = 3650.0
+    else:
+        age_days = max(0.0, (now_ms - created) / 86_400_000.0)
+    recency = 0.5 ** (age_days / _TASK_RECENCY_HALF_LIFE_DAYS)
+    return drop * recency
+
+
+def _seeded_weighted_choice(
+    fresh: list[dict[str, Any]], date: str, user: str, now_ms: float
+) -> dict[str, Any]:
+    """Детерминированный взвешенный выбор по seed (дата+user).
+
+    Не криптографическое решение, а стабильный способ показать свежую
+    грубую ошибку чаще, чем старую мелкую, не меняясь между запросами дня.
+    """
+    if len(fresh) == 1:
+        return fresh[0]
+    weights = [_task_weight(item, now_ms) for item in fresh]
+    seed = int(hashlib.sha256(f"{date}{user}".encode("utf-8")).hexdigest(), 16)
+    return random.Random(seed).choices(fresh, weights=weights, k=1)[0]
+
+
 def _task_pool(db: Database, user: str) -> list[dict[str, Any]]:
     """Пул кандидатов в задачу дня: ошибки (blunder/mistake) самого пользователя.
 
@@ -2085,12 +2269,21 @@ def _task_pool(db: Database, user: str) -> list[dict[str, Any]]:
     return pool
 
 
-def _pick_daily_task(db: Database, user: str, date: str) -> dict[str, Any]:
-    """Одна детерминированная задача на день: выбор фиксируется в meta.
+def _pick_daily_task(
+    db: Database, user: str, date: str, repeat: bool = False
+) -> dict[str, Any]:
+    """Одна задача на день: взвешенный выбор, фиксируется в meta.
 
-    Первый запрос за день выбирает задачу (sha256(дата+user) % len(pool))
-    и записывает её; повторные читают записанную. Если записанная задача
-    больше не найдена в пуле (удалили партию) — выбирается новая.
+    Кандидаты взвешиваются по свежести партии (half-life 30 дней) и размеру
+    ошибки (``drop``), выбор детерминирован seed'ом дата+user и записывается
+    в meta; повторные вызовы дня читают записанный. Решённые в течение
+    последних K дней (``TASK_REPEAT_WINDOW_DAYS``, по умолчанию 7) позиции
+    подавляются и не предлагаются снова, пока не истечёт окно; ``repeat=True``
+    — явный запрос повтора (окно игнорируется). Если подавлены все позиции,
+    возбуждается RuntimeError с подсказкой про ``repeat=1``: повторный показ
+    решённой позиции возможен только по явному запросу пользователя.
+    Если записанная задача больше не найдена в пуле (удалили партию) —
+    выбирается новая.
     """
     pool = _task_pool(db, user)
     if not pool:
@@ -2098,15 +2291,47 @@ def _pick_daily_task(db: Database, user: str, date: str) -> dict[str, Any]:
             f"Для {user} нет проанализированных ошибок — сначала запусти анализ "
             "(страница «Анализ»), тогда появится задача дня."
         )
+    now_ms = time.time() * 1000
+    history = _load_task_history(db, user)
+    window = _task_repeat_window_days()
+    suppressed = set() if repeat else _suppressed_task_keys(history, date, window)
+    suppressed_count = sum(1 for item in pool if item["task_key"] in suppressed)
     key = _task_choice_key(date, user)
     stored = db.get_meta(key)
+    chosen: dict[str, Any] | None = None
     if stored:
+        # Стабильность дня важнее подавления: если сегодняшнюю задачу уже
+        # выдавали (в том числе по repeat=1) и она всё ещё в пуле — возвращаем её
+        # даже если игрок только что её решил (иначе страница задачи «сломается»
+        # сразу после ответа).
         for item in pool:
             if item["task_key"] == stored:
-                return item
-    digest = int(hashlib.sha256(f"{date}{user}".encode("utf-8")).hexdigest(), 16)
-    chosen = pool[digest % len(pool)]
-    db.set_meta(key, chosen["task_key"])
+                chosen = item
+                break
+    if chosen is None:
+        fresh = [item for item in pool if item["task_key"] not in suppressed]
+        if not fresh:
+            # Все позиции решались недавно: повтор НЕ показываем без явного
+            # запроса (repeat=1), чтобы не маскировать решённую позицию под
+            # новую тему. Пустой день честнее «ещё одного повтора».
+            raise RuntimeError(
+                f"Все позиции в пуле ({suppressed_count} шт.) уже решались за "
+                f"последние {window} дн. — новых задач нет. "
+                "Явный повтор решённой позиции: /api/task/today?repeat=1 "
+                "(кнопка «Повторить решённую ранее» на странице задачи)."
+            )
+        chosen = _seeded_weighted_choice(fresh, date, user, now_ms)
+        db.set_meta(key, chosen["task_key"])
+    task_history = [item for item in history if item["task_key"] == chosen["task_key"]]
+    attempts = len(task_history)
+    chosen = dict(chosen)
+    chosen["attempt"] = attempts + 1
+    chosen["attempts"] = attempts
+    chosen["solved_before"] = any(item.get("correct") for item in task_history)
+    dates = [str(item.get("date") or "") for item in task_history]
+    chosen["last_attempt"] = max(dates) if dates else None
+    chosen["suppressed_count"] = suppressed_count
+    chosen["repeat_requested"] = bool(repeat)
     return chosen
 
 
@@ -2123,10 +2348,19 @@ def _is_bad_explanation(text: Any) -> bool:
     return len(text.strip()) < 80
 
 
-def _task_payload(db: Database, user: str, date: str | None = None) -> dict[str, Any]:
-    """JSON для /api/task/today: позиция до хода, решение и объяснение."""
+def _task_payload(
+    db: Database, user: str, date: str | None = None, repeat: bool = False
+) -> dict[str, Any]:
+    """JSON для /api/task/today: позиция до хода, решение и объяснение.
+
+    ``repeat=True`` — явный запрос повтора: окно подавления решённых позиций
+    игнорируется. Попытки отслеживаются per-position (``task_key``):
+    ``attempt`` — номер предстоящей попытки (1 = позиция видна впервые),
+    ``attempts`` — сколько попыток уже было, ``suppressed_count`` — сколько
+    позиций пула скрыто окном K дней.
+    """
     day = date or _today()
-    item = _pick_daily_task(db, user, day)
+    item = _pick_daily_task(db, user, day, repeat=repeat)
     game = item["game"]
     move = item["move"]
     ply = item["ply"]
@@ -2192,6 +2426,13 @@ def _task_payload(db: Database, user: str, date: str | None = None) -> dict[str,
         "explanation": explanation,
         "explained": explanation is not None,
         "done": db.get_meta(_task_done_key(day, user)) == "1",
+        "attempt": item.get("attempt", 1),
+        "attempts": item.get("attempts", 0),
+        "solved_before": bool(item.get("solved_before")),
+        "last_attempt": item.get("last_attempt"),
+        "suppressed_count": int(item.get("suppressed_count") or 0),
+        "repeat_requested": bool(item.get("repeat_requested")),
+        "repeat_window_days": _task_repeat_window_days(),
     }
     # Детерминированная версия для UI: не зависит от качества и наличия LLM.
     result["explanation_facts"] = facttext.task_text(result)
@@ -4214,6 +4455,105 @@ def create_api(
             raise HTTPException(404, "No report")
         return rep
 
+    @app.post("/api/report/refresh")
+    def api_report_refresh(request: Request, body: ReportRefreshBody):
+        """Переанализирует устаревшие анализы (нет разметки ``themes``).
+
+        Безопасный путь для старых кешей: только явное подтверждение
+        (``confirm=true``), партии текущего игрока, потолок ``limit`` за
+        вызов. Анализ заменяется только при успешном переанализировании;
+        при ошибке движка прежний успешный анализ остаётся нетронутым, а
+        ошибка попадает в ответ. Партией, которая есть у другого игрока
+        (общий кеш), не трогаем совсем. Старые данные не удаляются.
+        """
+        user = _current_user(app.state.db_path, request)
+        if not user:
+            raise HTTPException(404, "No current user")
+        if not body.confirm:
+            raise HTTPException(
+                400,
+                "Обновление нужно подтвердить явно: переанализ стоит Stockfish-времени "
+                "(глубина 10, ~несколько секунд на партию). Старый анализ заменится "
+                "только после успешного переанализирования. Повтори с confirm=true.",
+            )
+        try:
+            limit = int(body.limit)
+        except (TypeError, ValueError):
+            limit = 10
+        limit = max(1, min(20, limit))
+        if _running_jobs_count() > 0:
+            raise HTTPException(409, "Идёт фоновый анализ — дождись его окончания")
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            pairs = db.get_analyzed_games(user["nick"], limit=200)
+            if body.game_ids is not None:
+                wanted = {gid for gid in body.game_ids if isinstance(gid, str)}
+                target_all = [(g, a) for g, a in pairs if g.id in wanted]
+                found = {g.id for g, _ in target_all}
+                not_found = sorted(wanted - found)
+            else:
+                target_all = [(g, a) for g, a in pairs if analysis_needs_refresh(a)]
+                not_found = []
+            truncated = max(0, len(target_all) - limit)
+            target = target_all[:limit]
+            refreshed: list[str] = []
+            failed: list[dict[str, Any]] = []
+            skipped: list[dict[str, str]] = []
+            for game, _analysis in target:
+                if _analysis_has_foreign_copy(db, game.id, user["nick"]):
+                    skipped.append(
+                        {
+                            "game_id": game.id,
+                            "reason": "партия есть у другого игрока — общий кеш не перезаписываем",
+                        }
+                    )
+                    continue
+                if not game.moves:
+                    skipped.append({"game_id": game.id, "reason": "в партии нет ходов"})
+                    continue
+                try:
+                    with Engine(depth=10, multipv=1, time_ms=800) as engine:
+                        summary = engine.analyze_game(game).summary()
+                except Exception as exc:  # noqa: BLE001 — старая запись остаётся
+                    logger.warning("Refresh analysis failed for %s: %s", game.id, exc)
+                    failed.append({"game_id": game.id, "error": str(exc)})
+                    continue
+                try:
+                    db.save_analysis(game.id, summary, depth=10)
+                except Exception as exc:  # noqa: BLE001 — старая запись остаётся
+                    logger.warning("Refresh save failed for %s: %s", game.id, exc)
+                    failed.append(
+                        {"game_id": game.id, "error": f"анализ не сохранён: {exc}"}
+                    )
+                    continue
+                refreshed.append(game.id)
+            after = db.get_analyzed_games(user["nick"], limit=200)
+            stale_after = [
+                g.id for g, a in after if analysis_needs_refresh(a)
+            ]
+        return {
+            "requested": len(target),
+            "refreshed": refreshed,
+            "failed": failed,
+            "skipped": skipped,
+            "not_found": not_found,
+            "truncated": truncated,
+            "needs_refresh": {
+                "count": len(stale_after),
+                "total": len(after),
+                "game_ids": stale_after[:50],
+            },
+            "cost": (
+                "Каждая партия заново проанализирована Stockfish "
+                "(глубина 10, 1 линия): время пропорционально числу партий."
+            ),
+            "note": (
+                "Старый анализ заменяется только после успешного переанализирования; "
+                "при ошибке движка прежний кеш сохраняется без изменений. "
+                "Данные не удаляются."
+            ),
+        }
+
     @app.get("/api/plan/goal")
     def api_plan_goal_get(request: Request):
         user = _current_user(app.state.db_path, request)
@@ -5307,12 +5647,13 @@ def create_api(
 
     # --- Задача дня ---
     @app.get("/api/task/today")
-    def api_task_today(request: Request):
+    def api_task_today(request: Request, repeat: bool = False):
         user = _current_user(app.state.db_path, request)
         if not user:
             raise HTTPException(404, "No current user")
         return _call_data(
-            lambda db: _task_payload(db, user["nick"]), app.state.db_path
+            lambda db: _task_payload(db, user["nick"], repeat=repeat),
+            app.state.db_path,
         )
 
     @app.post("/api/task/answer")
@@ -5334,9 +5675,20 @@ def create_api(
                 best = None
             correct = best is not None and given == best
             # Задача считается решённой только при верном ответе; иначе
-            # пользователь может попробовать ещё раз.
+            # пользователь может попробовать ещё раз. Попытка пишется вне
+            # зависимости от верности; номер попытки копится по позиции.
             if correct:
                 db.set_meta(_task_done_key(payload["date"], user["nick"]), "1")
+            try:
+                attempt = _record_task_attempt(
+                    db, user["nick"], payload["task_key"], payload["date"], correct
+                )
+            except Exception:  # noqa: BLE001 — ответ важнее записи истории
+                logger.warning(
+                    "Не удалось записать попытку для %s", payload["task_key"],
+                    exc_info=True,
+                )
+                attempt = None
             return {
                 "correct": correct,
                 "expected": payload["best_san"],
@@ -5344,6 +5696,7 @@ def create_api(
                 "win_before": payload["win_before"],
                 "win_after": payload["win_after"],
                 "san_played": payload["san_played"],
+                "attempt": attempt,
             }
 
         return _call_data(_check, app.state.db_path)

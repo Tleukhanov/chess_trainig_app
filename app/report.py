@@ -1,8 +1,9 @@
 """Построение текстового отчёта по проанализированным партиям.
 
-Отчёт собирается из пар (Game, analysis), где analysis — плоский JSON,
+Пары (Game, analysis), где analysis — плоский JSON,
 возвращаемый ``GameAnalysis.summary()`` (см. app/analyzer.py). Модуль
-использует только стандартную библиотеку и не имеет других зависимостей.
+использует стандартную библиотеку и ``analysis_needs_refresh`` из
+``app.analyzer`` (пометка устаревших кешей для report API).
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from collections import defaultdict
 from datetime import datetime
 from typing import Any
 
+from .analyzer import analysis_needs_refresh
 from .games import Game
 from .metrics import METRIC_LABELS, metric
 from .patterns import PHASE_LABELS, weakness_stats
@@ -21,6 +23,7 @@ __all__ = ["build_report", "format_report"]
 
 _WORST_GAMES_LIMIT = 5
 _MISSED_WIN_LIMIT = 10
+_NEEDS_REFRESH_LIST_LIMIT = 50
 _DEFAULT_OPENING = "—"
 _RESULT_RU = {"win": "победа", "draw": "ничья", "loss": "поражение"}
 
@@ -275,6 +278,9 @@ def build_report(pairs: list[tuple[Game, dict]], user: str) -> dict[str, Any]:
 
     weakness = weakness_stats(pairs)
     themes = _theme_stats(pairs)
+    stale_games = [
+        game.id for game, analysis in pairs if analysis_needs_refresh(analysis)
+    ]
 
     blunders_per_game = blunders_total / total_games if total_games else 0.0
 
@@ -322,6 +328,11 @@ def build_report(pairs: list[tuple[Game, dict]], user: str) -> dict[str, Any]:
         "motifs": weakness["motifs"],
         "total_bad": weakness["total_bad"],
         "themes": themes,
+        "needs_refresh": {
+            "count": len(stale_games),
+            "total": total_games,
+            "game_ids": stale_games[:_NEEDS_REFRESH_LIST_LIMIT],
+        },
     }
 
 
@@ -446,7 +457,18 @@ def format_report(report: dict[str, Any]) -> str:
                 f"(неоднозначных пропущено: {slot['unknown']})"
             )
     else:
-        lines.append("Темы ходов: нет размеченных анализов (пересохрани анализ).")
+        lines.append("Темы ходов: нет размеченных анализов — обнови устаревшие анализы на странице «Анализ».")
+
+    stale = report.get("needs_refresh") or {}
+    stale_count = stale.get("count")
+    if isinstance(stale_count, int) and not isinstance(stale_count, bool) and stale_count > 0:
+        stale_total = stale.get("total", "?")
+        lines.append(
+            f"Устаревшие анализы без разметки тем: {stale_count} из {stale_total}. "
+            "Кеш читается как раньше; чтобы достроить темы, обнови анализы "
+            "на странице «Анализ» — старые заменятся только после успешного "
+            "переанализирования, при ошибке движка прежний анализ сохранится."
+        )
 
     total_bad = report.get("total_bad", 0)
     phases = report.get("phases") or {}

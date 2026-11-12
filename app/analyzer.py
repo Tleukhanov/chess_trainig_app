@@ -19,7 +19,7 @@ from .config import settings
 from .games import Game
 from .themes import classify_move_themes
 
-__all__ = ["Eval", "win_percent", "classify_move", "MoveAnalysis", "GameAnalysis", "Engine"]
+__all__ = ["Eval", "win_percent", "classify_move", "MoveAnalysis", "GameAnalysis", "Engine", "analysis_needs_refresh"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,6 +245,39 @@ def _finite(value: Any, default: float = 0.0) -> float:
 # а каждая позиция — это время и память. На слабом хостинге (512 МБ) длинные
 # партии без этого лимита роняют процесс.
 MAX_ANALYZE_PLIES = 120
+
+
+def analysis_needs_refresh(analysis: Any) -> bool:
+    """True, если кешированный анализ устарел и его стоит переанализировать.
+
+    «Устарел» здесь значит одно: нет разметки тем ходов (``themes``). Старые
+    хеши, сохранённые до появления ``app.themes``, не содержат поля ``themes``
+    ни у одного хода; такие анализы продолжают читаться и показываться как
+    раньше, но честнее пометить их и предложить обновление. Если хотя бы у
+    одного хода игрока нет ``themes`` (в том числе из-за сбоя разметки при
+    свежем анализе), анализ тоже считается требующим обновления: переанализ —
+    единственный путь достроить разметку. Исходный анализ при этом не теряется
+    (обновление заменяет его только при успешном переанализировании).
+    """
+    if not isinstance(analysis, dict):
+        return False
+    moves = analysis.get("moves")
+    if not isinstance(moves, list) or not moves:
+        return False
+    user_is_white = (analysis.get("user_color") or "white") == "white"
+    user_moves = 0
+    missing = 0
+    for ply, move in enumerate(moves):
+        if not isinstance(move, dict):
+            continue
+        if (ply % 2 == 0) != user_is_white:
+            continue
+        user_moves += 1
+        if not isinstance(move.get("themes"), dict):
+            missing += 1
+    if user_moves == 0:
+        return False
+    return missing > 0
 
 
 class Engine:
