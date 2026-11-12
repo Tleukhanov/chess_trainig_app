@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
@@ -149,7 +150,7 @@ class ApiTestBase(unittest.TestCase):
     def _register(
         self,
         nick: str,
-        password: str = "abcd",
+        password: str = "abcd12345",
         lichess: str | None = None,
         fide: str = "",
     ) -> None:
@@ -322,7 +323,10 @@ class UserApiTests(ApiTestBase):
 
     def test_delete_self_allowed(self):
         self._register("ada")
-        resp = self.client.post("/api/user/delete", data={"nick": "ada"})
+        resp = self.client.post(
+            "/api/user/delete",
+            data={"nick": "ada", "password": "abcd12345"},
+        )
         self.assertEqual(resp.status_code, 200)
         self.assertTrue(resp.json()["ok"])
         with Database(self.db_path) as db:
@@ -333,7 +337,10 @@ class UserApiTests(ApiTestBase):
     def test_delete_current_user_clears_current(self):
         self._register("ada")
         self._register("bob")
-        resp = self.client.post("/api/user/delete", data={"nick": "bob"})
+        resp = self.client.post(
+            "/api/user/delete",
+            data={"nick": "bob", "password": "abcd12345"},
+        )
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(self.client.get("/api/user/current").status_code, 404)
 
@@ -353,7 +360,10 @@ class UserApiTests(ApiTestBase):
         job = CoachJob(id="secretjob", user="ada", phase="Тест")
         job.status = "running"
         _JOBS["secretjob"] = job
-        resp = self.client.post("/api/user/delete", data={"nick": "ada"})
+        resp = self.client.post(
+            "/api/user/delete",
+            data={"nick": "ada", "password": "abcd12345"},
+        )
         self.assertEqual(resp.status_code, 200)
         with Database(self.db_path) as db:
             db.init_db()
@@ -376,7 +386,10 @@ class UserApiTests(ApiTestBase):
         private = self.data_dir / "ada"
         private.mkdir(parents=True, exist_ok=True)
         (private / "humanity.json").write_text('{"items":[{"secret":1}]}', encoding="utf-8")
-        resp = self.client.post("/api/user/delete", data={"nick": "ada"})
+        resp = self.client.post(
+            "/api/user/delete",
+            data={"nick": "ada", "password": "abcd12345"},
+        )
         self.assertEqual(resp.status_code, 200)
         self.assertFalse(private.exists())
         # Новый владелец того же ника не читает старые файлы.
@@ -445,7 +458,7 @@ class UserApiTests(ApiTestBase):
         try:
             resp = self.client.post(
                 "/api/auth/register",
-                data={"login": "reserved", "password": "abcd", "lichess": "X"},
+                data={"login": "reserved", "password": "abcd12345", "lichess": "X"},
             )
         finally:
             object.__setattr__(settings, "admin_nicks", old)
@@ -1747,47 +1760,22 @@ class TaskApiTests(ApiTestBase):
 
 
 class TrackApiTests(ApiTestBase):
-    """Тесты мини-трекера времени: /api/track/ping и /api/track/today.
+    """Тесты трекера времени: /api/track/today (без скрытого трекинга).
 
-    Время патчится через app.api._now — сеть и реальные часы не участвуют.
+    Скрытый ping удалён: «время сегодня» складывается из часов Lichess
+    в проанализированных партиях и ручного ввода /api/track/lichess_manual.
     """
 
     def setUp(self) -> None:
         super().setUp()
         self._set_current("tester")
 
-    def test_ping_accumulates_site_time(self):
-        clock = {"t": 5_000_000.0}
-        with patch("app.api._now", new=lambda: clock["t"]):
-            first = self.client.post("/api/track/ping")
-            self.assertEqual(first.status_code, 200)
-            self.assertEqual(first.json(), {"ok": True, "total": 0})
-
-            clock["t"] += 120
-            second = self.client.post("/api/track/ping")
-            self.assertEqual(second.json()["total"], 120)
-
-            data = self.client.get("/api/track/today").json()
-        self.assertEqual(data["date"], _today())
-        self.assertEqual(data["site_sec"], 120)
-        self.assertEqual(data["games_today"], 0)
-        self.assertEqual(data["lichess_sec"], 0)
-        self.assertEqual(data["total_sec"], 120)
-
-    def test_ping_gap_over_cap_not_credited(self):
-        clock = {"t": 5_000_000.0}
-        with patch("app.api._now", new=lambda: clock["t"]):
-            self.client.post("/api/track/ping")  # создаёт сессию
-
-            clock["t"] += 1000  # gap > 300с — не начисляем
-            resp = self.client.post("/api/track/ping")
-            self.assertEqual(resp.json()["total"], 0)
-
-            clock["t"] += 60  # last обновлён — этот gap начисляется
-            resp = self.client.post("/api/track/ping")
-            self.assertEqual(resp.json()["total"], 60)
-            data = self.client.get("/api/track/today").json()
-        self.assertEqual(data["site_sec"], 60)
+    def test_ping_endpoint_removed(self):
+        # Секретный трекинг удалён: /api/track/ping больше не существует.
+        resp = self.client.post("/api/track/ping")
+        self.assertIn(resp.status_code, (404, 405))
+        resp = self.client.get("/api/track/ping")
+        self.assertIn(resp.status_code, (404, 405))
 
     def test_today_counts_lichess_games(self):
         today_ms = int(time.time() * 1000)
@@ -1815,33 +1803,9 @@ class TrackApiTests(ApiTestBase):
         self.assertEqual(data["games_today"], 1)
         # убывания 600→598=2, 598→596=2, 596→590=6
         self.assertEqual(data["lichess_sec"], 10)
-        self.assertEqual(data["site_sec"], 0)
-        self.assertEqual(data["total_sec"], data["site_sec"] + data["lichess_sec"])
-
-    def test_total_sec_sums_site_and_lichess(self):
-        today_ms = int(time.time() * 1000)
-        with Database(self.db_path) as db:
-            db.init_db()
-            db.save_games(
-                [
-                    mkgame_moves(
-                        "tr3",
-                        ["e4"],
-                        created_at=today_ms,
-                        clocks=[600.0, 590.0],
-                    ),
-                ],
-                "tester",
-            )
-        clock = {"t": 5_000_000.0}
-        with patch("app.api._now", new=lambda: clock["t"]):
-            self.client.post("/api/track/ping")
-            clock["t"] += 90
-            self.client.post("/api/track/ping")
-            data = self.client.get("/api/track/today").json()
-        self.assertEqual(data["site_sec"], 90)
-        self.assertEqual(data["lichess_sec"], 10)
-        self.assertEqual(data["total_sec"], 100)
+        self.assertEqual(data["manual_sec"], 0)
+        self.assertEqual(data["total_sec"], data["lichess_sec"] + data["manual_sec"])
+        self.assertNotIn("site_sec", data)
 
     def test_empty_clocks_count_as_zero(self):
         today_ms = int(time.time() * 1000)
@@ -1857,20 +1821,7 @@ class TrackApiTests(ApiTestBase):
 
     def test_no_user_404(self):
         self._clear_auth()
-        self.assertEqual(self.client.post("/api/track/ping").status_code, 404)
         self.assertEqual(self.client.get("/api/track/today").status_code, 404)
-
-    def test_ping_stores_valid_json_meta(self):
-        clock = {"t": 5_000_000.0}
-        with patch("app.api._now", new=lambda: clock["t"]):
-            self.client.post("/api/track/ping")
-        with Database(self.db_path) as db:
-            db.init_db()
-            raw = db.get_meta(f"site_time_{_today()}_tester")
-        self.assertIsNotNone(raw)
-        stored = json.loads(raw)
-        self.assertEqual(stored["last"], 5_000_000.0)
-        self.assertEqual(stored["total"], 0)
 
     def test_manual_minutes_accumulate_and_add_to_total(self):
         before = self.client.get("/api/track/today").json()["total_sec"]
@@ -1893,7 +1844,7 @@ class TrackApiTests(ApiTestBase):
         self.assertEqual(data["total_sec"], before + 45 * 60)
         self.assertEqual(
             data["total_sec"],
-            data["site_sec"] + data["lichess_sec"] + data["manual_sec"],
+            data["lichess_sec"] + data["manual_sec"],
         )
 
     def test_manual_minutes_out_of_range_400(self):
@@ -1930,20 +1881,6 @@ class TrackApiTests(ApiTestBase):
         data = self.client.get("/api/track/today").json()
         self.assertEqual(data["manual_sec"], 10 * 60)
         self.assertEqual(data["total_sec"], before + 10 * 60)
-
-    def test_ping_updates_daily_log_minutes(self):
-        """total секунд трекера → целые минуты в daily_log за дату."""
-        clock = {"t": 5_000_000.0}
-        with patch("app.api._now", new=lambda: clock["t"]):
-            self.client.post("/api/track/ping")
-            clock["t"] += 150
-            self.client.post("/api/track/ping")
-        with Database(self.db_path) as db:
-            db.init_db()
-            log = db.get_daily_log("tester", _today())
-        self.assertIsNotNone(log)
-        self.assertEqual(log["minutes"], 2)  # 150 сек → 2 мин (округление)
-        self.assertEqual(log["tasks_total"], 0)
 
 
 class PlanGoalTests(ApiTestBase):
@@ -2753,7 +2690,7 @@ class AuthApiTests(ApiTestBase):
     def test_register_new_and_status(self):
         resp = self.client.post(
             "/api/auth/register",
-            data={"login": "neo", "password": "abcd", "lichess": "NeoChess"},
+            data={"login": "neo", "password": "abcd12345", "lichess": "NeoChess"},
         )
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json(), {"ok": True, "nick": "neo"})
@@ -2770,10 +2707,10 @@ class AuthApiTests(ApiTestBase):
 
     def test_register_validation(self):
         bad = [
-            {"login": "", "password": "abcd", "lichess": "X"},
-            {"login": "x" * 65, "password": "abcd", "lichess": "X"},
+            {"login": "", "password": "abcd12345", "lichess": "X"},
+            {"login": "x" * 65, "password": "abcd12345", "lichess": "X"},
             {"login": "neo", "password": "abc", "lichess": "X"},
-            {"login": "neo", "password": "abcd", "lichess": ""},
+            {"login": "neo", "password": "abcd12345", "lichess": ""},
         ]
         for data in bad:
             with self.subTest(data=data):
@@ -2783,7 +2720,7 @@ class AuthApiTests(ApiTestBase):
                 )
 
     def test_register_duplicate_409(self):
-        data = {"login": "neo", "password": "abcd", "lichess": "NeoChess"}
+        data = {"login": "neo", "password": "abcd12345", "lichess": "NeoChess"}
         self.assertEqual(self.client.post("/api/auth/register", data=data).status_code, 200)
         resp = self.client.post("/api/auth/register", data=data)
         self.assertEqual(resp.status_code, 409)
@@ -2797,7 +2734,7 @@ class AuthApiTests(ApiTestBase):
         with self._legacy_claim():
             resp = self.client.post(
                 "/api/auth/register",
-                data={"login": "OldNick", "password": "abcd", "lichess": "OldLichess"},
+                data={"login": "OldNick", "password": "abcd12345", "lichess": "OldLichess"},
             )
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json(), {"ok": True, "nick": "OldNick"})
@@ -2829,14 +2766,14 @@ class AuthApiTests(ApiTestBase):
             with self.subTest(login=bad):
                 resp = self.client.post(
                     "/api/auth/register",
-                    data={"login": bad, "password": "abcd", "lichess": "X"},
+                    data={"login": bad, "password": "abcd12345", "lichess": "X"},
                 )
                 self.assertEqual(resp.status_code, 400, resp.text)
 
     def test_login_wrong_and_unknown_401(self):
         self.client.post(
             "/api/auth/register",
-            data={"login": "neo", "password": "abcd", "lichess": "NeoChess"},
+            data={"login": "neo", "password": "abcd12345", "lichess": "NeoChess"},
         )
         fresh = self._fresh_client()
         resp = fresh.post(
@@ -2844,18 +2781,18 @@ class AuthApiTests(ApiTestBase):
         )
         self.assertEqual(resp.status_code, 401)
         resp = fresh.post(
-            "/api/auth/login", data={"login": "ghost", "password": "abcd"}
+            "/api/auth/login", data={"login": "ghost", "password": "abcd12345"}
         )
         self.assertEqual(resp.status_code, 401)
 
     def test_login_ok_and_logout(self):
         self.client.post(
             "/api/auth/register",
-            data={"login": "neo", "password": "abcd", "lichess": "NeoChess"},
+            data={"login": "neo", "password": "abcd12345", "lichess": "NeoChess"},
         )
         fresh = self._fresh_client()
         resp = fresh.post(
-            "/api/auth/login", data={"login": "neo", "password": "abcd"}
+            "/api/auth/login", data={"login": "neo", "password": "abcd12345"}
         )
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(fresh.get("/api/auth/status").json()["logged_in"], True)
@@ -2869,14 +2806,14 @@ class AuthApiTests(ApiTestBase):
     def test_inactive_blocks(self):
         self.client.post(
             "/api/auth/register",
-            data={"login": "neo", "password": "abcd", "lichess": "NeoChess"},
+            data={"login": "neo", "password": "abcd12345", "lichess": "NeoChess"},
         )
         with Database(self.db_path) as db:
             db.init_db()
             db.set_active("neo", False)
         fresh = self._fresh_client()
         resp = fresh.post(
-            "/api/auth/login", data={"login": "neo", "password": "abcd"}
+            "/api/auth/login", data={"login": "neo", "password": "abcd12345"}
         )
         self.assertEqual(resp.status_code, 403)
         # старая сессия тоже гаснет
@@ -2890,27 +2827,27 @@ class AuthApiTests(ApiTestBase):
     def test_password_change(self):
         self.client.post(
             "/api/auth/register",
-            data={"login": "neo", "password": "oldpw", "lichess": "NeoChess"},
+            data={"login": "neo", "password": "oldpassword", "lichess": "NeoChess"},
         )
         resp = self.client.post(
-            "/api/auth/password", data={"old": "wrong", "new": "newpw"}
+            "/api/auth/password", data={"old": "wrong", "new": "newpassword"}
         )
         self.assertEqual(resp.status_code, 401)
         resp = self.client.post(
-            "/api/auth/password", data={"old": "oldpw", "new": "newpw"}
+            "/api/auth/password", data={"old": "oldpassword", "new": "newpassword"}
         )
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json(), {"ok": True})
         fresh = self._fresh_client()
         self.assertEqual(
             fresh.post(
-                "/api/auth/login", data={"login": "neo", "password": "oldpw"}
+                "/api/auth/login", data={"login": "neo", "password": "oldpassword"}
             ).status_code,
             401,
         )
         self.assertEqual(
             fresh.post(
-                "/api/auth/login", data={"login": "neo", "password": "newpw"}
+                "/api/auth/login", data={"login": "neo", "password": "newpassword"}
             ).status_code,
             200,
         )
@@ -2931,7 +2868,7 @@ class AuthApiTests(ApiTestBase):
             db.set_active("OldNick", False)
         resp = self.client.post(
             "/api/auth/register",
-            data={"login": "OldNick", "password": "abcd", "lichess": "OldLichess"},
+            data={"login": "OldNick", "password": "abcd12345", "lichess": "OldLichess"},
         )
         self.assertEqual(resp.status_code, 403)
         self.assertEqual(resp.json()["detail"], "Доступ ограничен")
@@ -2940,13 +2877,13 @@ class AuthApiTests(ApiTestBase):
         """После смены пароля старая сессия больше не валидна."""
         self.client.post(
             "/api/auth/register",
-            data={"login": "neo", "password": "oldpw", "lichess": "NeoChess"},
+            data={"login": "neo", "password": "oldpassword", "lichess": "NeoChess"},
         )
         self.assertEqual(
             self.client.get("/api/auth/status").json()["logged_in"], True
         )
         resp = self.client.post(
-            "/api/auth/password", data={"old": "oldpw", "new": "newpw"}
+            "/api/auth/password", data={"old": "oldpassword", "new": "newpassword"}
         )
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(
@@ -2957,7 +2894,7 @@ class AuthApiTests(ApiTestBase):
     def test_lichess_change(self):
         self.client.post(
             "/api/auth/register",
-            data={"login": "neo", "password": "abcd", "lichess": "NeoChess"},
+            data={"login": "neo", "password": "abcd12345", "lichess": "NeoChess"},
         )
         resp = self.client.post("/api/auth/lichess", data={"lichess": "NewNick"})
         self.assertEqual(resp.status_code, 200)
@@ -2969,7 +2906,7 @@ class AuthApiTests(ApiTestBase):
     def test_coach_fetch_uses_lichess(self):
         self.client.post(
             "/api/auth/register",
-            data={"login": "coachuser", "password": "abcd", "lichess": "ForeignNick"},
+            data={"login": "coachuser", "password": "abcd12345", "lichess": "ForeignNick"},
         )
         with tempfile.NamedTemporaryFile() as fh, \
                 patch("app.api.fetch_user_games", return_value=[]) as fetch:
@@ -3755,6 +3692,170 @@ class AdminCohortTests(ApiTestBase):
         self.assertTrue(
             csv_resp.text.startswith("nick,rating_start,rating_end")
         )
+
+
+
+
+class PasswordPolicyTests(ApiTestBase):
+    """Минимальная длина нового пароля >= 8 на сервере."""
+
+    def test_register_short_password_rejected(self):
+        resp = self.client.post(
+            "/api/auth/register",
+            data={"login": "neo", "password": "1234567", "lichess": "NeoChess"},
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("8", resp.json()["detail"])
+
+    def test_register_eight_char_password_accepted(self):
+        resp = self.client.post(
+            "/api/auth/register",
+            data={"login": "neo", "password": "12345678", "lichess": "NeoChess"},
+        )
+        self.assertEqual(resp.status_code, 200)
+
+    def test_password_change_short_password_rejected(self):
+        self._register("neo")
+        resp = self.client.post(
+            "/api/auth/password", data={"old": "abcd12345", "new": "short7"}
+        )
+        self.assertEqual(resp.status_code, 400)
+        resp = self.client.post(
+            "/api/auth/password", data={"old": "abcd12345", "new": "longenough"}
+        )
+        self.assertEqual(resp.status_code, 200)
+
+
+class LoginRateLimitTests(ApiTestBase):
+    """Rate-limit логина: окно TTL, generic-ответы, очистка при успехе."""
+
+    def _register_and_forget(self, nick: str = "neo") -> None:
+        self._register(nick)
+        self.client.cookies.clear()
+
+    def test_repeated_failures_blocked_then_429_even_with_correct_password(self):
+        self._register_and_forget()
+        for _ in range(5):
+            resp = self.client.post(
+                "/api/auth/login", data={"login": "neo", "password": "wrongpass"}
+            )
+            self.assertEqual(resp.status_code, 401)
+        # Лимит исчерпан: даже верный пароль получает generic 429.
+        resp = self.client.post(
+            "/api/auth/login", data={"login": "neo", "password": "abcd12345"}
+        )
+        self.assertEqual(resp.status_code, 429)
+        self.assertIn("Слишком много", resp.json()["detail"])
+
+    def test_failed_counter_persisted_in_db_not_memory(self):
+        self._register_and_forget()
+        self.client.post(
+            "/api/auth/login", data={"login": "neo", "password": "wrongpass"}
+        )
+        digest = hashlib.sha256("neo".encode("utf-8")).hexdigest()[:32]
+        with Database(self.db_path) as db:
+            db.init_db()
+            raw_id = db.get_meta(f"login_fail_id:{digest}")
+            raw_ip = db.get_meta("login_fail_ip:testclient")
+        self.assertIsNotNone(raw_id)
+        self.assertIsNotNone(raw_ip)
+        self.assertEqual(json.loads(raw_id)["count"], 1)
+        self.assertEqual(json.loads(raw_ip)["count"], 1)
+
+    def test_successful_login_clears_counter(self):
+        self._register_and_forget()
+        for _ in range(4):
+            self.client.post(
+                "/api/auth/login", data={"login": "neo", "password": "wrongpass"}
+            )
+        resp = self.client.post(
+            "/api/auth/login", data={"login": "neo", "password": "abcd12345"}
+        )
+        self.assertEqual(resp.status_code, 200)
+        digest = hashlib.sha256("neo".encode("utf-8")).hexdigest()[:32]
+        with Database(self.db_path) as db:
+            db.init_db()
+            self.assertIsNone(db.get_meta(f"login_fail_id:{digest}"))
+            self.assertIsNone(db.get_meta("login_fail_ip:testclient"))
+        # Счётчик сброшен: снова можно ошибиться 5 раз до 429.
+        self.client.cookies.clear()
+        for _ in range(5):
+            self.client.post(
+                "/api/auth/login", data={"login": "neo", "password": "wrongpass"}
+            )
+        resp = self.client.post(
+            "/api/auth/login", data={"login": "neo", "password": "wrongpass"}
+        )
+        self.assertEqual(resp.status_code, 429)
+
+    def test_rate_limit_window_expires(self):
+        self._register_and_forget()
+        clock = {"t": 5_000_000.0}
+        with patch("app.api._now", new=lambda: clock["t"]):
+            for _ in range(5):
+                self.client.post(
+                    "/api/auth/login",
+                    data={"login": "neo", "password": "wrongpass"},
+                )
+            resp = self.client.post(
+                "/api/auth/login", data={"login": "neo", "password": "wrongpass"}
+            )
+            self.assertEqual(resp.status_code, 429)
+            clock["t"] += settings.login_rate_window_sec + 1
+            resp = self.client.post(
+                "/api/auth/login", data={"login": "neo", "password": "wrongpass"}
+            )
+            self.assertEqual(resp.status_code, 401)
+
+    def test_unknown_login_gets_same_generic_401(self):
+        self._register_and_forget()
+        resp = self.client.post(
+            "/api/auth/login", data={"login": "ghost", "password": "whatever1"}
+        )
+        self.assertEqual(resp.status_code, 401)
+        self.assertEqual(resp.json()["detail"], "Неверный логин или пароль")
+
+
+class DeleteAccountReauthTests(ApiTestBase):
+    """Удаление своего аккаунта: повторная авторизация паролем."""
+
+    def test_self_delete_requires_password(self):
+        self._register("ada")
+        resp = self.client.post("/api/user/delete", data={"nick": "ada"})
+        self.assertEqual(resp.status_code, 400)
+        # Аккаунт на месте.
+        self.assertEqual(self.client.get("/api/user/current").status_code, 200)
+
+    def test_self_delete_wrong_password_rejected(self):
+        self._register("ada")
+        resp = self.client.post(
+            "/api/user/delete",
+            data={"nick": "ada", "password": "not-the-password"},
+        )
+        self.assertEqual(resp.status_code, 401)
+        self.assertEqual(self.client.get("/api/user/current").status_code, 200)
+
+    def test_self_delete_with_password_succeeds_and_wipes_session(self):
+        self._register("ada")
+        resp = self.client.post(
+            "/api/user/delete",
+            data={"nick": "ada", "password": "abcd12345"},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self.client.get("/api/user/current").status_code, 404)
+
+    def test_admin_delete_other_account_does_not_require_password(self):
+        self._register("ada")
+        self._register("boss")
+        self._make_admin("boss")
+        resp = self.client.post("/api/user/delete", data={"nick": "ada"})
+        self.assertEqual(resp.status_code, 200)
+
+    def test_seeded_passwordless_self_delete_does_not_require_password(self):
+        self._seed_user("tester", "t")
+        self._set_current("tester")
+        resp = self.client.post("/api/user/delete", data={"nick": "tester"})
+        self.assertEqual(resp.status_code, 200)
 
 
 if __name__ == "__main__":

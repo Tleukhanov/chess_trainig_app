@@ -93,7 +93,6 @@ const state = {
   readingReview: null,
   readingBoardShown: false,
   authMode: 'login',
-  trackStarted: false,
 };
 
 // --- API helpers ---
@@ -268,16 +267,18 @@ function viewAuth(app) {
       <div class="form-group"><label>Логин <input type="text" name="login" required autocomplete="username"></label></div>
       <div class="form-group"><label>Пароль <input type="password" name="password" required autocomplete="current-password"></label></div>
       <button class="btn btn-primary" style="width:100%">Войти</button>
-    </form>`;
+    </form>
+    <p style="color:var(--c-text-muted);font-size:12px;margin-top:10px"><a href="/privacy.html">Приватность и условия</a></p>`;
   const regForm = `
     <form id="auth-register-form">
       <div class="form-group"><label>Логин <input type="text" name="login" required autocomplete="username"></label></div>
-      <div class="form-group"><label>Пароль (мин. 4 символа) <input type="password" name="password" required autocomplete="new-password"></label></div>
+      <div class="form-group"><label>Пароль (мин. 8 символов) <input type="password" name="password" required minlength="8" autocomplete="new-password"></label></div>
       <div class="form-group"><label>Ник на Lichess (обяз.) <input type="text" name="lichess" required placeholder="GarryKasparov" autocomplete="username"></label></div>
       <div class="form-group"><label>FIDE ID (необяз.) <input type="text" name="fide" placeholder="4130005"></label></div>
       <button class="btn btn-primary" style="width:100%">Зарегистрироваться</button>
     </form>
-    <p style="color:var(--c-text-muted);font-size:12px;margin-top:8px">Если твой ник уже есть в базе без пароля (старые данные и партии), регистрация закрепит его за тобой — партии сохранятся.</p>`;
+    <p style="color:var(--c-text-muted);font-size:12px;margin-top:8px">Если твой ник уже есть в базе без пароля (старые данные и партии), регистрация закрепит его за тобой — партии сохранятся.</p>
+    <p style="color:var(--c-text-muted);font-size:12px;margin-top:4px">Регистрируясь, ты соглашаешься с <a href="/privacy.html">Приватностью и условиями</a>: хранится логин, Lichess-ник и хеш пароля; партии используются для разбора; скрытой аналитики нет; аккаунт можно удалить в Профилях.</p>`;
   app.innerHTML = `
     <div class="card" style="max-width:420px;margin:40px auto">
       <div class="card-header"><span class="card-title">Вход / Регистрация</span></div>
@@ -6390,7 +6391,7 @@ function _fmtDur(sec) {
 
 function _trackLineHtml(track) {
   const lichess = (Number(track.lichess_sec) || 0) + (Number(track.manual_sec) || 0);
-  return `Сегодня: <strong style="color:var(--c-text)">${_fmtDur(track.total_sec)}</strong> · Lichess ${_fmtDur(lichess)} · тренер ${_fmtDur(track.site_sec)}`;
+  return `Сегодня: <strong style="color:var(--c-text)">${_fmtDur(track.total_sec)}</strong> · Lichess ${_fmtDur(lichess)}`;
 }
 
 async function refreshTrackLine() {
@@ -6559,12 +6560,19 @@ async function viewUsers(app) {
       <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--c-border)">
         <form id="pw-form" class="form-row" style="gap:8px;align-items:flex-end">
           <div class="form-group" style="flex:1;min-width:140px;margin-bottom:0"><label>Старый пароль <input type="password" name="old" required autocomplete="current-password"></label></div>
-          <div class="form-group" style="flex:1;min-width:140px;margin-bottom:0"><label>Новый пароль <input type="password" name="new" required autocomplete="new-password"></label></div>
+          <div class="form-group" style="flex:1;min-width:140px;margin-bottom:0"><label>Новый пароль (мин. 8) <input type="password" name="new" required minlength="8" autocomplete="new-password"></label></div>
           <button class="btn btn-secondary" style="height:38px">Сменить пароль</button>
         </form>
         <div class="alert alert-error" id="pw-err" style="display:none;margin-top:8px"></div>
         <div class="alert alert-success" id="pw-ok" style="display:none;margin-top:8px">Пароль сменён</div>
         <div style="margin-top:8px"><button class="btn btn-secondary" id="logout-btn">Выйти</button></div>
+        <div style="margin-top:8px;font-size:12px;color:var(--c-text-muted)"><a href="/privacy.html">Приватность и условия</a> · вопрос или удаление данных: <a href="mailto:tleukhanov0409@mail.ru">tleukhanov0409@mail.ru</a></div>
+      </div>
+      <div style="margin-top:16px;padding-top:12px;border-top:1px solid var(--c-border)" id="danger-zone">
+        <div style="font-weight:600;font-size:13px;color:var(--c-alert-error-fg, #c5221f);margin-bottom:4px">Удаление аккаунта</div>
+        <p style="font-size:13px;color:var(--c-text-muted);margin:0 0 8px">Необратимо: профиль, сессии, партии, кеш разбора, заметки, планы и артефакты на диске будут удалены. Общий кеш разбора партий, который есть у другого профиля, сохраняется.</p>
+        <button class="btn btn-danger" id="delete-account-btn">Удалить аккаунт и данные</button>
+        <div id="delete-account-slot"></div>
       </div>
     </div>`;
   const rerender = async () => {
@@ -6659,6 +6667,59 @@ async function viewUsers(app) {
     syncAdminNav();
     renderUserbox();
     render(state.currentView);
+  });
+
+  const deleteBtn = document.getElementById('delete-account-btn');
+  if (deleteBtn) deleteBtn.addEventListener('click', () => {
+    const slot = document.getElementById('delete-account-slot');
+    if (!slot || slot.innerHTML) return;
+    slot.innerHTML = `<form id="delete-account-form" class="form-row" style="gap:8px;align-items:flex-end;margin-top:10px;flex-wrap:wrap">
+        <div class="form-group" style="flex:1;min-width:160px;margin-bottom:0"><label>Пароль (если задан) <input type="password" name="password" autocomplete="current-password"></label></div>
+        <div class="form-group" style="flex:1;min-width:160px;margin-bottom:0"><label>Введи логин «${esc(me.nick || '')}» для подтверждения <input type="text" name="confirm_nick" required autocomplete="off"></label></div>
+        <button class="btn btn-danger" style="height:38px" type="submit">Удалить навсегда</button>
+        <button class="btn btn-link" type="button" id="delete-account-cancel">Отмена</button>
+      </form><div class="alert alert-error" id="delete-account-err" style="display:none;margin-top:8px"></div>`;
+    const closeDelete = () => { slot.innerHTML = ''; };
+    slot.querySelector('#delete-account-cancel').addEventListener('click', closeDelete);
+    slot.querySelector('#delete-account-form').addEventListener('submit', async ev => {
+      ev.preventDefault();
+      const errBox = document.getElementById('delete-account-err');
+      errBox.style.display = 'none';
+      const fd = new FormData(ev.target);
+      if ((fd.get('confirm_nick') || '').trim().toLowerCase() !== String(me.nick || '').toLowerCase()) {
+        errBox.textContent = 'Логин не совпадает — удаление отменено';
+        errBox.style.display = 'block';
+        return;
+      }
+      fd.set('nick', me.nick);
+      const submitBtn = ev.target.querySelector('button[type="submit"]');
+      if (submitBtn) submitBtn.disabled = true;
+      try {
+        await apiPost('/api/user/delete', fd);
+        state.user = null;
+        state.isAdmin = false;
+        state.authMode = 'login';
+        Object.assign(state, {
+          gameId: null, gameData: null, task: null, taskKey: null, taskResult: null,
+          taskRevealed: false, taskExplanation: null, planLlmJobId: null,
+          planLlmGenerating: false, tool: 'repertoire', gamesFilter: 'all',
+          openingSession: null, openingFens: null, openingLastReply: null, openingJobId: null,
+          middlegameSession: null, middlegameMeta: null, middlegameJobId: null,
+          middlegameThinking: false, middlegameAnalyzing: false, middlegameError: null,
+          middlegamePlanDraft: '', middlegameStrength: 'equal',
+        });
+        clearMiddlegameSessionId();
+        hideNav();
+        syncAdminNav();
+        renderUserbox();
+        showToast('Аккаунт и данные удалены');
+        render('users');
+      } catch (err) {
+        errBox.textContent = err.message;
+        errBox.style.display = 'block';
+        if (submitBtn) submitBtn.disabled = false;
+      }
+    });
   });
 
   const manualLink = app.querySelector('.track-manual-add');
@@ -7277,21 +7338,13 @@ async function loadUser() {
   renderUserbox();
 }
 
-function startTrackPing() {
-  if (state.trackStarted) return;
-  state.trackStarted = true;
-  const ping = () => {
-    if (state.user) fetch('/api/track/ping', { method: 'POST' }).catch(() => {});
-  };
-  ping();
-  setInterval(ping, 60000);
-}
+// Скрытого трекинга сессии нет: время считают часы Lichess из разобранных
+// партий и минуты, введённые пользователем вручную.
 
 async function init() {
   setupTheme();
   setupNav();
   await loadUser();
-  startTrackPing();
   navigate('dashboard');
   startGlobalJobPolling();
 }

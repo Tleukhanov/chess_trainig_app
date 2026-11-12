@@ -150,7 +150,7 @@ class MiddlegameApiTestBase(unittest.TestCase):
     def _register(self, client: TestClient, nick: str) -> None:
         resp = client.post(
             "/api/auth/register",
-            data={"login": nick, "password": "abcd", "lichess": nick},
+            data={"login": nick, "password": "abcd12345", "lichess": nick},
         )
         self.assertEqual(resp.status_code, 200, resp.text)
 

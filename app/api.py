@@ -1815,6 +1815,8 @@ def _run_middlegame_analyze_job(
 _SESSION_COOKIE = "ct_session"
 _SESSION_DAYS = 30
 _SESSION_MAX_AGE = _SESSION_DAYS * 24 * 3600
+# Минимальная длина НОВОГО пароля (регистрация и смена пароля).
+PASSWORD_MIN_LENGTH = 8
 
 
 def _is_active_record(rec: dict | None) -> bool:
@@ -1899,6 +1901,75 @@ def _set_session_cookie(
         secure=secure,
         path="/",
     )
+
+
+# --- Rate-limit логина ------------------------------------------------------
+# Счётчики неудачных попыток хранятся в meta-таблице приложения (та же БД,
+# что и всё состояние: SQLite data/trainer.db или PostgreSQL по
+# DATABASE_URL), а не в памяти процесса — лимит переживает рестарт и общий
+# для всех процессов, работающих с одной базой. Если несколько процессов
+# работают с РАЗНЫМИ SQLite-файлами, лимит действует в пределах каждого
+# файла — запускайте один процесс на базу или вынесите БД в PostgreSQL.
+# IP берём из соединения (request.client.host); за reverse proxy он будет
+# IP прокси, поэтому пороги (LOGIN_RATE_MAX_ATTEMPTS/LOGIN_RATE_WINDOW_SEC)
+# надо выбирать с учётом этого.
+
+
+def _login_rate_keys(request: Request, login: str) -> tuple[str, str]:
+    """Ключи meta: по IP соединения и по sha256(логина)."""
+    client = getattr(request, "client", None)
+    ip = (client.host if client and client.host else "unknown").strip() or "unknown"
+    ip_key = f"login_fail_ip:{ip}"
+    digest = hashlib.sha256((login or "").strip().lower().encode("utf-8")).hexdigest()
+    id_key = f"login_fail_id:{digest[:32]}"
+    return ip_key, id_key
+
+
+def _login_rate_state(db: Database, key: str, now: float) -> dict[str, float] | None:
+    """Состояние счётчика {count, window_start}; протухшее окно → None."""
+    raw = db.get_meta(key)
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        count = float(data["count"])
+        window_start = float(data["window_start"])
+    except (TypeError, ValueError, KeyError):
+        return None
+    if window_start <= 0 or now - window_start >= settings.login_rate_window_sec:
+        return None
+    return {"count": count, "window_start": window_start}
+
+
+def _login_rate_blocked(db: Database, keys: tuple[str, str], now: float) -> bool:
+    """True, если по любому из ключей исчерпан лимит за текущее окно."""
+    limit = max(1, int(settings.login_rate_max_attempts))
+    for key in keys:
+        state = _login_rate_state(db, key, now)
+        if state is not None and state["count"] >= limit:
+            return True
+    return False
+
+
+def _login_rate_record_failure(db: Database, keys: tuple[str, str], now: float) -> None:
+    """Регистрирует неудачную попытку: новое окно или инкремент текущего."""
+    for key in keys:
+        state = _login_rate_state(db, key, now)
+        if state is None:
+            payload = {"count": 1, "window_start": now}
+        else:
+            payload = {
+                "count": state["count"] + 1,
+                "window_start": state["window_start"],
+            }
+        db.set_meta(key, json.dumps(payload))
+
+
+def _login_rate_clear(db: Database, keys: tuple[str, str]) -> None:
+    """Успешный вход: счётчики по IP и логину удаляются."""
+    with db._connection() as conn:
+        for key in keys:
+            conn.execute("DELETE FROM meta WHERE key = ?", (key,))
 
 
 def _call_data(fn, db_path: Path):
@@ -2152,7 +2223,7 @@ def _maybe_snapshot_rating(db: Database, nick: str, day: str) -> None:
     """Запускает снапшот не чаще раза в день (успех и ошибка считаются).
 
     Маркер попытки в meta ставится до потока: если Lichess недоступен,
-    каждый ping не будет заново ждать таймаут.
+    каждый вход не будет заново ждать таймаут.
     """
     if not _RATING_SNAPSHOT_ENABLED:
         return
@@ -2291,6 +2362,37 @@ def _cohort_payload(db: Database, days: int) -> dict[str, Any]:
         )
 
         logs = db.list_daily_logs(nick, count, end_day)
+        # Аналитика активности считается напрямую из таблиц за окно, а не из
+        # кеша daily_log (его минуты/анализы раньше обновлял скрытый ping,
+        # который удалён). Окно: последние ``count`` дней до end_day включительно.
+        try:
+            start_day = (
+                datetime.date.fromisoformat(str(end_day))
+                - datetime.timedelta(days=count - 1)
+            ).isoformat()
+            start_ms = timeutil.day_bounds_ms(start_day)[0]
+            end_ms = timeutil.day_bounds_ms(str(end_day))[1]
+        except (TypeError, ValueError):
+            start_ms, end_ms = None, None
+        window_games = 0
+        window_analyses = 0
+        if start_ms is not None:
+            with db._connection() as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS n FROM games "
+                    "WHERE LOWER(player) = LOWER(?) "
+                    "AND created_at >= ? AND created_at < ?",
+                    (nick, start_ms, end_ms),
+                ).fetchone()
+                window_games = int(row["n"] or 0) if row else 0
+                row = conn.execute(
+                    "SELECT COUNT(*) AS n FROM analyses a "
+                    "JOIN games g ON g.id = a.game_id "
+                    "WHERE LOWER(g.player) = LOWER(?) "
+                    "AND a.analyzed_at >= ? AND a.analyzed_at < ?",
+                    (nick, start_ms, end_ms),
+                ).fetchone()
+                window_analyses = int(row["n"] or 0) if row else 0
         active = [
             item
             for item in logs
@@ -2319,10 +2421,8 @@ def _cohort_payload(db: Database, days: int) -> dict[str, Any]:
                 "tasks_done": tasks_done,
                 "tasks_total": tasks_total,
                 "completion_pct": completion_pct,
-                "games_analyzed": sum(
-                    int(item.get("games_analyzed") or 0) for item in logs
-                ),
-                "analyses": sum(int(item.get("analyses") or 0) for item in logs),
+                "games_analyzed": window_games,
+                "analyses": window_analyses,
                 "last_seen": _last_seen_iso(record.get("last_seen_at")),
                 "improved_rating": improved_rating,
                 "improved_activity": improved_activity,
@@ -2923,22 +3023,15 @@ def _plan_week_payload(db: Database, nick: str, data_dir: Any) -> dict[str, Any]
         task_done = None
 
     day = _today()
-    now = _now()
     try:
-        track_state = _track_state(db, _track_key(day, nick))
         manual_sec = _manual_seconds(db, _lichess_manual_key(day, nick))
         games = db.get_games(nick, limit=100_000)
-        site_sec = 0.0
-        if track_state is not None:
-            site_sec = track_state["total"] + max(
-                0.0, min(now - track_state["last"], 60.0)
-            )
         lichess_sec = 0.0
         for game in games:
             if timeutil.date_of_ms(game.created_at) != day:
                 continue
             lichess_sec += _clock_seconds(game.clocks)
-        time_sec = int(site_sec + lichess_sec + manual_sec)
+        time_sec = int(lichess_sec + manual_sec)
     except (ValueError, TypeError, OSError):
         time_sec = 0
 
@@ -3378,23 +3471,6 @@ def _now() -> float:
     return time.time()
 
 
-def _track_key(date: str, user: str) -> str:
-    """Ключ meta с сессией на сайте за дату (на пользователя)."""
-    return f"site_time_{date}_{user}"
-
-
-def _track_state(db: Database, key: str) -> dict[str, float] | None:
-    """Читает сессию трекера {"last", "total"}; нет записи/битый JSON → None."""
-    raw = db.get_meta(key)
-    if not raw:
-        return None
-    try:
-        data = json.loads(raw)
-        return {"last": float(data["last"]), "total": float(data["total"])}
-    except (TypeError, ValueError, KeyError):
-        return None
-
-
 def _lichess_manual_key(date: str, user: str) -> str:
     """Ключ meta с ручными минутами на Lichess за дату (на пользователя)."""
     return f"lichess_manual_{date}_{user}"
@@ -3513,8 +3589,19 @@ def create_api(
         return {"ok": True, "nick": clean}
 
     @app.post("/api/user/delete")
-    def api_user_delete(request: Request, nick: str = Form(...)):
-        """Удаляет профиль и его партии/анализ из БД (файлы data/<ник>/ остаются)."""
+    def api_user_delete(
+        request: Request,
+        nick: str = Form(...),
+        password: str = Form(""),
+    ):
+        """Удаляет профиль и его партии/анализ из БД и артефакты на диске.
+
+        Свой аккаунт (в т.ч. для админа): если у профиля есть пароль,
+        обязателен верный ``password`` — повторная авторизация перед
+        необратимым удалением. Паролем не защищённые legacy-профили и
+        удаление ЧУЖОГО профиля админом пароль не требуют (админ может
+        не знать чужой пароль).
+        """
         clean = nick.strip()
         if not clean:
             raise HTTPException(400, "Ник не может быть пустым")
@@ -3523,12 +3610,32 @@ def create_api(
         nick = _session_nick(request, db)
         if not nick:
             raise HTTPException(401, "Нужен вход")
-        if clean.lower() != nick.lower() and not is_admin(db, nick):
+        is_self = clean.lower() == nick.lower()
+        if not is_self and not is_admin(db, nick):
             raise HTTPException(403, "Можно удалить только свой профиль")
+        target = db.get_user_record(clean)
+        if is_self and target and target.get("password_hash"):
+            if not (password or ""):
+                raise HTTPException(
+                    400, "Пароль для подтверждения удаления"
+                )
+            if not verify_password(password, target["password_hash"]):
+                raise HTTPException(401, "Неверный пароль")
         deleted = db.delete_user(clean)
         if deleted:
             _purge_user_jobs(clean)
             _delete_user_artifacts(app.state.data_dir, clean)
+            # Чистим rate-limit счётчик логина удаляемого (хеш логина,
+            # без самого ника; ключ мог остаться после неудачных входов).
+            try:
+                digest = hashlib.sha256(clean.lower().encode("utf-8")).hexdigest()
+                with db._connection() as conn:
+                    conn.execute(
+                        "DELETE FROM meta WHERE key = ?",
+                        (f"login_fail_id:{digest[:32]}",),
+                    )
+            except Exception:  # noqa: BLE001 — удаление профиля важнее чистки
+                logger.debug("cannot purge login rate key for %s", clean)
         return {"ok": True, "nick": clean}
 
     @app.post("/api/user/fide")
@@ -4926,36 +5033,9 @@ def create_api(
 
         return _call_data(_legal, app.state.db_path)
 
-    # --- Мини-трекер времени ---
-    @app.post("/api/track/ping")
-    def api_track_ping(request: Request):
-        user = _current_user(app.state.db_path, request)
-        if not user:
-            raise HTTPException(404, "No current user")
-        now = _now()
-        day = _today()
-        nick = user["nick"]
-        key = _track_key(day, nick)
-        with Database(app.state.db_path) as db:
-            state = _track_state(db, key)
-            if state is None:
-                total = 0.0
-            else:
-                gap = now - state["last"]
-                total = state["total"] + gap if 0.0 <= gap <= 300.0 else state["total"]
-            db.set_meta(key, json.dumps({"last": now, "total": total}))
-            # Дневной лог: минуты сайта (total/60) и активность по партиям/анализам.
-            activity = db.daily_activity_counts(nick, day)
-            db.upsert_daily_log(
-                nick,
-                day,
-                minutes=int(round(total / 60.0)),
-                games_analyzed=activity["games_analyzed"],
-                analyses=activity["analyses"],
-            )
-        _maybe_snapshot_rating(db, nick, day)
-        return {"ok": True, "total": int(total)}
-
+    # --- Мини-трекер времени: только данные, введённые пользователем ---
+    # Скрытого трекинга сессии нет: время берётся из часов Lichess в
+    # проанализированных партиях и из ручного ввода (/api/track/lichess_manual).
     @app.post("/api/track/lichess_manual")
     def api_track_lichess_manual(request: Request, minutes: str = Form("")):
         user = _current_user(app.state.db_path, request)
@@ -4975,14 +5055,9 @@ def create_api(
         if not user:
             raise HTTPException(404, "No current user")
         day = _today()
-        now = _now()
         with Database(app.state.db_path) as db:
-            state = _track_state(db, _track_key(day, user["nick"]))
             manual_sec = _manual_seconds(db, _lichess_manual_key(day, user["nick"]))
             games = db.get_games(user["nick"], limit=100_000)
-        site_sec = 0.0
-        if state is not None:
-            site_sec = state["total"] + max(0.0, min(now - state["last"], 60.0))
         lichess_sec = 0.0
         games_today = 0
         for game in games:
@@ -4992,10 +5067,9 @@ def create_api(
             lichess_sec += _clock_seconds(game.clocks)
         return {
             "date": day,
-            "site_sec": int(site_sec),
             "lichess_sec": int(lichess_sec),
             "manual_sec": int(manual_sec),
-            "total_sec": int(site_sec + lichess_sec + manual_sec),
+            "total_sec": int(lichess_sec + manual_sec),
             "games_today": games_today,
         }
 
@@ -6048,8 +6122,10 @@ def create_api(
             for item in settings.admin_nicks
             if str(item).strip()
         }
-        if len(password or "") < 4:
-            raise HTTPException(400, "Пароль: минимум 4 символа")
+        if len(password or "") < PASSWORD_MIN_LENGTH:
+            raise HTTPException(
+                400, f"Пароль: минимум {PASSWORD_MIN_LENGTH} символов"
+            )
         lich = (lichess or "").strip()
         if not 1 <= len(lich) <= 64:
             raise HTTPException(400, "Укажи Lichess-ник")
@@ -6097,11 +6173,14 @@ def create_api(
                     ),
                 )
             nick = clean
+        # Успешная регистрация/claim сбрасывает счётчики неудачных входов.
+        _login_rate_clear(db, _login_rate_keys(request, nick))
         token = secrets.token_hex(32)
         db.create_session(nick, token, days=_SESSION_DAYS)
         _set_session_cookie(
             response, token, secure=_request_is_https(request)
         )
+        _maybe_snapshot_rating(db, nick, _today())
         return {"ok": True, "nick": nick}
 
     @app.post("/api/auth/login")
@@ -6114,18 +6193,29 @@ def create_api(
         clean = (login or "").strip()
         db = Database(app.state.db_path)
         db.init_db()
+        rate_keys = _login_rate_keys(request, clean)
+        now = _now()
+        if _login_rate_blocked(db, rate_keys, now):
+            # Ответ намеренно generic: не раскрываем, существует ли аккаунт.
+            raise HTTPException(
+                429, "Слишком много попыток входа. Попробуй позже."
+            )
         rec = db.get_user_record(clean)
         if not rec or not rec.get("password_hash"):
+            _login_rate_record_failure(db, rate_keys, now)
             raise HTTPException(401, "Неверный логин или пароль")
         if not verify_password(password or "", rec["password_hash"]):
+            _login_rate_record_failure(db, rate_keys, now)
             raise HTTPException(401, "Неверный логин или пароль")
         if not _is_active_record(rec):
             raise HTTPException(403, "Доступ ограничен")
+        _login_rate_clear(db, rate_keys)
         token = secrets.token_hex(32)
         db.create_session(rec["nick"], token, days=_SESSION_DAYS)
         _set_session_cookie(
             response, token, secure=_request_is_https(request)
         )
+        _maybe_snapshot_rating(db, rec["nick"], _today())
         return {"ok": True, "nick": rec["nick"]}
 
     @app.post("/api/auth/logout")
@@ -6166,8 +6256,10 @@ def create_api(
             or not verify_password(old or "", rec["password_hash"])
         ):
             raise HTTPException(401, "Неверный старый пароль")
-        if len(new or "") < 4:
-            raise HTTPException(400, "Новый пароль: минимум 4 символа")
+        if len(new or "") < PASSWORD_MIN_LENGTH:
+            raise HTTPException(
+                400, f"Новый пароль: минимум {PASSWORD_MIN_LENGTH} символов"
+            )
         db.set_password_hash(nick, hash_password(new))
         # Все живые сессии (включая текущую) больше не действуют:
         # с новым паролем нужно войти заново.

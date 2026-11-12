@@ -202,6 +202,14 @@ class Settings:
         "on",
     )
 
+    # --- вход и пароль ---
+    # Rate-limit логина: не больше ``login_rate_max_attempts`` неудачных
+    # попыток за окно ``login_rate_window_sec`` секунд на IP и на логин.
+    # Счётчики живут в meta-таблице БД (см. app/api.py), а не в памяти
+    # процесса.
+    login_rate_max_attempts: int = int(_cfg("LOGIN_RATE_MAX_ATTEMPTS", "5"))
+    login_rate_window_sec: int = int(_cfg("LOGIN_RATE_WINDOW_SEC", "900"))
+
     # --- LLM (M1) ---
     llm_api_key: str = _cfg("LLM_API_KEY", "")
     llm_base_url: str = _cfg("LLM_BASE_URL", "https://openrouter.ai/api/v1")

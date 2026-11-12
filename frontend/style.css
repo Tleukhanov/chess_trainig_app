@@ -328,6 +328,9 @@ h3 { font-size: 15px; font-weight: 600; margin-top: 16px; }
 .btn-link:hover { background: var(--c-bg-hover); text-decoration: none; }
 .btn-link.user-delete { color: var(--c-badge-bad); }
 .btn-link.user-delete:hover { background: var(--c-badge-bad-bg); }
+.btn-danger { background: var(--c-alert-error-fg, #c5221f); color: #fff; border: 1px solid transparent; }
+.btn-danger:hover:not(:disabled) { filter: brightness(0.9); text-decoration: none; }
+.btn-danger:disabled { opacity: 0.6; cursor: default; }
 
 /* Form */
 .form-group { margin-bottom: 12px; }

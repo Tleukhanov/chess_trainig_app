@@ -197,7 +197,7 @@ CREATE TABLE IF NOT EXISTS {table}(
 )
 """
 
-# Снапшот рейтинга Lichess на дату (не чаще раза в день, см. api.track/ping).
+# Снапшот рейтинга Lichess на дату (не чаще раза в день, см. /api/auth/login).
 _RATING_SNAPSHOTS_DDL = """
 CREATE TABLE IF NOT EXISTS {table}(
     "user" TEXT NOT NULL,
