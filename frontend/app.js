@@ -838,13 +838,13 @@ async function viewDashboard(app) {
   }
 
   let trendHtml = '';
-  if (progress && progress.trend && Number(progress.games) >= 6) {
+  if (progress && progress.trend && progress.trend.sufficient) {
     const t = progress.trend;
     const badgeClass = t.overall === 'improving' ? 'badge-good' : t.overall === 'worsening' ? 'badge-bad' : 'badge-neutral';
     let rows = '';
     for (const [m, v] of Object.entries(t)) {
-      if (['improving', 'worsening', 'overall'].includes(m)) continue;
-      const deltaClass = v.delta > 0 ? 'badge-bad' : 'badge-good';
+      if (['improving', 'worsening', 'overall', 'sufficient', 'n_games', 'min_games', 'windows_used'].includes(m)) continue;
+      const deltaClass = v.verdict === 'better' ? 'badge-good' : v.verdict === 'worse' ? 'badge-bad' : 'badge-neutral';
       rows += `<tr>
         <td>${esc(TREND_LABELS[m] || m)}</td>
         <td class="num">${fmt(v.from, 2)}</td>
@@ -860,7 +860,8 @@ async function viewDashboard(app) {
         <tbody>${rows}</tbody>
       </table></div>`;
   } else if (progress && progress.trend) {
-    trendHtml = '<p style="color:var(--c-text-muted)">Мало данных для тренда: нужно хотя бы 6 партий.</p>';
+    const minGames = (progress.trend && progress.trend.min_games) || progress.min_games || 10;
+    trendHtml = `<p style="color:var(--c-text-muted)">Недостаточно данных для тренда: нужно хотя бы ${esc(String(minGames))} проанализированных партий (сейчас ${esc(String(progress.games))}). Стрелки не показываем.</p>`;
   } else {
     trendHtml = '<p style="color:var(--c-text-muted)">Нет данных для тренда.</p>';
   }
@@ -1057,13 +1058,14 @@ async function viewPlan(app) {
     bindLinks(app);
     return;
   }
-  const [taskToday, track, report, goalData, weekData, llmData] = await Promise.all([
+  const [taskToday, track, report, goalData, weekData, llmData, snapData] = await Promise.all([
     api('/api/task/today').catch(() => null),
     api('/api/track/today').catch(() => null),
     api('/api/report').catch(() => null),
     api('/api/plan/goal').catch(() => null),
     api('/api/plan/week').catch(() => null),
     api('/api/plan/llm').catch(() => null),
+    api('/api/plan/week/snapshot').catch(() => null),
   ]);
 
   const focusRu = { auto: 'авто', opening: 'дебют', middlegame: 'миттельшпиль', endgame: 'эндшпиль' };
@@ -1150,6 +1152,42 @@ async function viewPlan(app) {
       <button class="btn btn-secondary" id="plan-llm-create" style="width:fit-content">Собрать комментарий</button></div>`;
   }
 
+  let snapshotHtml = '';
+  if (snapData) {
+    const snap = snapData.snapshot || null;
+    const caveat = esc(snapData.caveat || 'Описательная дельта — не доказательство роста рейтинга и не подтверждение причинности плана.');
+    if (!snap) {
+      snapshotHtml = `<div class="card"><div class="card-header"><span class="card-title">Снимок недели</span><span class="badge badge-neutral">описательно</span></div>
+        <p style="color:var(--c-text-muted);font-size:13px;margin:0">Снимок ещё не сохранён. Он зафиксируется при сохранении цели или генерации комментария тренера и останется базой для сверки — прошлую неделю не переписывает.</p>
+        <p style="color:var(--c-text-muted);font-size:12px;margin:8px 0 0">${caveat}</p></div>`;
+    } else {
+      const savedDate = snap.created_iso ? esc(String(snap.created_iso).slice(0, 10)) : '—';
+      const head = `<div style="color:var(--c-text-muted);font-size:13px;margin-bottom:8px">Окно на момент снимка: <strong>${esc(String(snap.window_n))} партий</strong> · неделя ${esc(snap.week_start || '—')} · сохранён ${savedDate} · фокус: ${esc(snap.focus_phase || '—')}</div>`;
+      let body = '';
+      if (snapData.status === 'pending') {
+        const left = snapData.days_remaining;
+        body = `<span class="badge badge-neutral">рано сверять</span> <span style="font-size:13px">Дельты появятся через ${left != null ? esc(String(left)) : 'несколько'} дн.: нужно ≥ ${esc(String(snapData.min_age_days || 7))} дней и ≥ ${esc(String(snapData.min_new_games || 10))} новых анализов.</span>`;
+      } else if (snapData.status === 'insufficient_data') {
+        body = `<span class="badge badge-neutral">недостаточно новых данных</span> <span style="font-size:13px">новых анализов: ${esc(String(snapData.new_games || 0))} из ${esc(String(snapData.min_new_games || 10))} — вывод не делаем, нулей не подставляем.</span>`;
+      } else if (snapData.status === 'ok' && snapData.deltas) {
+        const d = snapData.deltas;
+        const fmtD = (v) => (v == null ? '—' : (v > 0 ? '+' : '') + fmt(v, 2));
+        const cur = snapData.current || {};
+        body = `<div style="font-size:13px;margin-bottom:6px"> новых анализов: ${esc(String(snapData.new_games || 0))} · окно сейчас: ${esc(String(cur.window_n != null ? cur.window_n : '—'))} партий</div>
+        <div class="table-wrap"><table><thead><tr><th>Метрика</th><th>Снимок</th><th>Сейчас</th><th>Δ</th></tr></thead><tbody>
+          <tr><td>Счёт %</td><td class="num">${fmt(snap.score)}</td><td class="num">${fmt(cur.score_pct)}</td><td class="num">${fmtD(d.score_pct)}</td></tr>
+          <tr><td>Ср. потеря win%</td><td class="num">${fmt(snap.avg_drop, 2)}</td><td class="num">${fmt(cur.avg_drop, 2)}</td><td class="num">${fmtD(d.avg_drop)}</td></tr>
+        </tbody></table></div>`;
+      } else {
+        body = `<span style="font-size:13px;color:var(--c-text-muted)">Сверка недоступна.</span>`;
+      }
+      snapshotHtml = `<div class="card"><div class="card-header"><span class="card-title">Снимок недели</span><span class="badge badge-neutral">описательно</span></div>
+      ${head}
+      <div>${body}</div>
+      <p style="color:var(--c-text-muted);font-size:12px;margin:8px 0 0">${caveat}</p></div>`;
+    }
+  }
+
   let weekHtml = '';
   if (weekData && weekData.focus && Array.isArray(weekData.week_tasks)) {
     const wPhase = esc(focusRu[weekData.focus.phase] || weekData.focus.phase);
@@ -1205,6 +1243,7 @@ async function viewPlan(app) {
     <div class="card-header"><h1>План тренировки</h1><span class="badge badge-blue">${esc(state.user.nick)}</span></div>
     ${goalHtml}
     ${weekHtml}
+    ${snapshotHtml}
     ${llmHtml}
     ${todayHtml}
     <div class="grid grid-4">
@@ -1453,25 +1492,27 @@ async function viewProgress(app) {
     return;
   }
 
+  const trendSufficient = !!(pr.trend && pr.trend.sufficient);
+  const minGames = (pr.trend && pr.trend.min_games) || pr.min_games || 10;
   let trendRows = '';
-  if (pr.trend && Number(pr.games) >= 6) {
+  if (trendSufficient) {
     for (const [m, v] of Object.entries(pr.trend)) {
-      if (['improving', 'worsening', 'overall'].includes(m)) continue;
-      const deltaClass = v.delta > 0 ? 'badge-bad' : 'badge-good';
+      if (['improving', 'worsening', 'overall', 'sufficient', 'n_games', 'min_games', 'windows_used'].includes(m)) continue;
+      const deltaClass = v.verdict === 'better' ? 'badge-good' : v.verdict === 'worse' ? 'badge-bad' : 'badge-neutral';
       trendRows += `<tr><td>${esc(TREND_LABELS[m] || m)}</td><td class="num">${fmt(v.from, 2)}</td><td class="num">${fmt(v.to, 2)}</td><td class="num ${deltaClass}">${v.delta >= 0 ? '+' : ''}${fmt(v.delta, 2)}</td><td><span class="badge ${v.verdict === 'better' ? 'badge-good' : v.verdict === 'worse' ? 'badge-bad' : 'badge-neutral'}">${esc(TREND_VERDICT_RU[v.verdict] || v.verdict)}</span></td></tr>`;
     }
   } else if (pr.trend) {
-    trendRows = '<tr><td colspan="5" style="color:var(--c-text-muted)">Мало данных: нужно хотя бы 6 партий.</td></tr>';
+    trendRows = `<tr><td colspan="5" style="color:var(--c-text-muted)">Недостаточно данных: нужно хотя бы ${esc(String(minGames))} проанализированных партий (сейчас ${esc(String(pr.games))}). Стрелки не показываем.</td></tr>`;
   }
 
-  const overall = pr.trend && Number(pr.games) >= 6 ? pr.trend.overall : '—';
+  const overall = trendSufficient ? pr.trend.overall : 'insufficient_data';
   const badgeClass = overall === 'improving' ? 'badge-good' : overall === 'worsening' ? 'badge-bad' : 'badge-neutral';
 
   app.innerHTML = `
     <div class="card-header"><h1>Прогресс</h1><span class="badge badge-blue">${esc(state.user.nick)}</span></div>
     ${dailyHistoryCardHtml(daily)}
     <div class="card">
-      <div class="card-header"><span class="card-title">Таблица окон (${pr.windows} окон, ${pr.games} партий)</span></div>
+      <div class="card-header"><span class="card-title">Таблица окон (${pr.windows} окон, ${pr.games} партий · n=${pr.games})</span></div>
       <div class="table-wrap"><table>
         <thead><tr><th>№</th><th>Период</th><th>Партий</th><th>Счёт %</th><th title="Средняя потеря win% на ход игрока">Ср. потеря win%</th><th title="Средний win% перед ходом игрока">Win% до хода</th><th>Ошибок/партию</th><th>Неест. %</th><th>Ср. рейтинг</th></tr></thead>
         <tbody>
@@ -1488,10 +1529,11 @@ async function viewProgress(app) {
       </table></div>
     </div>
     <div class="card">
-      <div class="card-header"><span class="card-title">Тренд метрик</span></div>
-      ${pr.trend ? `<div style="margin-bottom:8px"><span class="badge ${badgeClass}">${esc(TREND_OVERALL_RU[overall] || overall)}</span></div>
+      <div class="card-header"><span class="card-title">Тренд метрик</span><span class="badge badge-neutral">мин. n=${esc(String(minGames))} для тренда</span></div>
+      ${pr.trend ? `<div style="margin-bottom:8px"><span class="badge ${badgeClass}">${esc(TREND_OVERALL_RU[overall] || overall)}</span> <span style="font-size:12px;color:var(--c-text-muted)">n=${esc(String(pr.games))} проанализированных партий</span></div>
       <div class="table-wrap"><table><thead><tr><th>Метрика</th><th>Было</th><th>Стало</th><th>Δ</th><th>Направление</th><th>Вердикт</th></tr></thead><tbody>${trendRows}</tbody></table></div>
-      <div style="margin-top:12px;font-size:13px"><strong>Улучшается: </strong>${pr.trend.improving.length ? pr.trend.improving.join(', ') : '—'}<br><strong>Ухудшается: </strong>${pr.trend.worsening.length ? pr.trend.worsening.join(', ') : '—'}</div>` : '<p style="color:var(--c-text-muted)">Недостаточно данных для тренда.</p>'}
+      <div style="margin-top:12px;font-size:13px"><strong>Улучшается: </strong>${pr.trend.improving.length ? pr.trend.improving.join(', ') : '—'}<br><strong>Ухудшается: </strong>${pr.trend.worsening.length ? pr.trend.worsening.join(', ') : '—'}</div>
+      <p style="color:var(--c-text-muted);font-size:12px;margin:8px 0 0">Сравнение окон описательное: разница не доказывает рост рейтинга и не подтверждает причинность плана — это сигнал, а не измерение обучения.</p>` : '<p style="color:var(--c-text-muted)">Недостаточно данных для тренда.</p>'}
     </div>`;
 }
 
@@ -3237,7 +3279,7 @@ const TREND_LABELS = {
   score_pct: 'Счёт',
 };
 const TREND_VERDICT_RU = { better: 'лучше', worse: 'хуже', same: 'без изменений', stable: 'без изменений' };
-const TREND_OVERALL_RU = { improving: "УЛУЧШЕНИЕ", worsening: "УХУДШЕНИЕ", stable: "БЕЗ ИЗМЕНЕНИЙ" };
+const TREND_OVERALL_RU = { improving: "УЛУЧШЕНИЕ", worsening: "УХУДШЕНИЕ", mixed: "СМЕШАННАЯ КАРТИНА", flat: "СТАБИЛЬНО", stable: "БЕЗ ИЗМЕНЕНИЙ", insufficient_data: "НЕДОСТАТОЧНО ДАННЫХ" };
 
 const ENDGAME_SOURCES = [
   { key: 'master', label: 'Мастер' },
@@ -6487,7 +6529,7 @@ async function viewAdmin(app) {
     <div class="grid grid-3">
       <div class="card stat"><div class="stat-value">${s.users != null ? s.users : users.length}</div><div class="stat-label">Участников</div></div>
       <div class="card stat"><div class="stat-value">${s.active_users != null ? s.active_users : '—'}</div><div class="stat-label">Активных</div></div>
-      <div class="card stat"><div class="stat-value">${s.improved != null ? s.improved : '—'}</div><div class="stat-label">Улучшились</div></div>
+      <div class="card stat"><div class="stat-value">${s.active != null ? s.active : '—'}</div><div class="stat-label">Активны*</div></div>
       <div class="card stat"><div class="stat-value">${s.avg_rating_delta != null ? (s.avg_rating_delta > 0 ? '+' : '') + fmt(s.avg_rating_delta, 1) : '—'}</div><div class="stat-label">Ср. Δ рейтинга</div></div>
       <div class="card stat"><div class="stat-value">${s.avg_completion_pct != null ? fmt(s.avg_completion_pct, 1) + '%' : '—'}</div><div class="stat-label">Ср. план</div></div>
       <div class="card stat"><div class="stat-value">${s.avg_minutes_per_day != null ? fmt(s.avg_minutes_per_day, 1) : '—'}</div><div class="stat-label">Мин/день</div></div>
@@ -6496,9 +6538,10 @@ async function viewAdmin(app) {
   const rows = users.map(row => {
     const start = row.rating_start != null ? row.rating_start : '—';
     const end = row.rating_end != null ? row.rating_end : '—';
-    const improved = row.improved ? ' <span class="badge badge-good">рост</span>' : '';
+    const activeFlag = row.active != null ? row.active : row.improved;
+    const active = activeFlag ? ' <span class="badge badge-neutral">активен</span>' : '';
     return `<tr>
-      <td>${esc(row.nick || '—')}${improved}</td>
+      <td>${esc(row.nick || '—')}${active}</td>
       <td class="num">${row.days_active != null ? row.days_active : '—'}</td>
       <td class="num">${row.avg_minutes_per_day != null ? fmt(row.avg_minutes_per_day, 1) : '—'}</td>
       <td class="num">${row.completion_pct != null ? fmt(row.completion_pct, 1) + '%' : '—'}</td>
@@ -6511,6 +6554,7 @@ async function viewAdmin(app) {
   app.innerHTML = `
     <div class="card-header"><h1>Админ</h1><span class="badge badge-neutral">когорта за ${days} дн.</span></div>
     ${summaryHtml}
+    <p style="color:var(--c-text-muted);font-size:12px;margin:-4px 0 12px">* Активны = Δ рейтинга ≥ 30 или ≥ 60% плана при ≥ 10 активных днях. Это сигнал вовлечённости, а не доказательство обучения: завершение плана и движение рейтинга не измеряют рост навыка и не доказывают причинность плана.</p>
     <div class="card">
       <div class="card-header">
         <span class="card-title">Игроки (${users.length})</span>
@@ -6520,6 +6564,7 @@ async function viewAdmin(app) {
         <thead><tr><th>Ник</th><th>Дней</th><th>Мин/день</th><th>План %</th><th>Рейтинг</th><th>Партий</th><th>Последняя активность</th></tr></thead>
         <tbody>${rows}</tbody>
       </table></div>` : '<p style="color:var(--c-text-muted);padding:16px">Игроков пока нет.</p>'}
+      <p style="color:var(--c-text-muted);font-size:12px;margin:12px 0 0">Рейтинг и «план %» — сырые дельты за окно, не измерение обучения. CSV сохраняет колонки improved_* как устаревшие алиасы к active_*.</p>
     </div>`;
 }
 

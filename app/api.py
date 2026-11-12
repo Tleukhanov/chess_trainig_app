@@ -85,7 +85,16 @@ from .patterns import analyze_user_moves, phase
 from .review_moves import badge_for, badge_label, detect_sacrifice
 from .pgn_import import MAX_PGN_BYTES, parse_pgn_games
 from .plan import build_plan
-from .progress import build_progress
+from .progress import (
+    build_progress,
+    monday_of_week,
+    snapshot_delta,
+    summarize_recent,
+    MIN_NEW_GAMES,
+    MIN_SNAPSHOT_AGE_DAYS,
+    SNAPSHOT_CAVEAT,
+    SNAPSHOT_VERSION,
+)
 from .opening_book import build_opening_book
 from .repertoire import Repertoire, opening_stats
 from .report import build_report
@@ -2405,8 +2414,12 @@ def _cohort_payload(db: Database, days: int) -> dict[str, Any]:
         completion_pct = (
             round(tasks_done / tasks_total * 100.0, 1) if tasks_total else 0.0
         )
-        improved_rating = rating_delta is not None and rating_delta >= 30
-        improved_activity = completion_pct >= 60.0 and days_active >= 10
+        # Активность ≠ обучение: это сырые сигналы вовлечённости. Старые
+        # ключи improved_* сохранены как deprecated-алиасы тех же значений —
+        # но больше не называются «улучшением» и не читаются как рост игрока.
+        active_rating = rating_delta is not None and rating_delta >= 30
+        active_completion = completion_pct >= 60.0 and days_active >= 10
+        active = active_rating or active_completion
         rows.append(
             {
                 "nick": nick,
@@ -2424,24 +2437,46 @@ def _cohort_payload(db: Database, days: int) -> dict[str, Any]:
                 "games_analyzed": window_games,
                 "analyses": window_analyses,
                 "last_seen": _last_seen_iso(record.get("last_seen_at")),
-                "improved_rating": improved_rating,
-                "improved_activity": improved_activity,
-                "improved": improved_rating or improved_activity,
+                # Новые имена: активность/вовлечённость, не «улучшение».
+                "active": active,
+                "active_rating": active_rating,
+                "active_completion": active_completion,
+                # Deprecated aliases (deprecated, kept for compatibility):
+                # те же значения, но это НЕ измерение обучения игрока.
+                "improved": active,
+                "improved_rating": active_rating,
+                "improved_activity": active_completion,
             }
         )
 
     return {
         "days": count,
         "users": rows,
+        # Оговорка: когорта показывает вовлечённость и сырой Δ рейтинга,
+        # а не эффективность плана и не «обученность» игроков.
+        "note": (
+            "active_* — сигналы активности (Δ рейтинга >= 30 или >= 60% "
+            "плана за >= 10 дней), не доказательство обучения/роста. "
+            "improved_* — устаревшие алиасы active_*, не измерение прогресса."
+        ),
+        "deprecated_keys": ["improved", "improved_rating", "improved_activity"],
         "summary": {
             "users": len(rows),
             "active_users": sum(1 for row in rows if row["days_active"] > 0),
-            "improved": sum(1 for row in rows if row["improved"]),
+            "active": sum(1 for row in rows if row["active"]),
+            "active_by_rating": sum(
+                1 for row in rows if row["active_rating"]
+            ),
+            "active_by_completion": sum(
+                1 for row in rows if row["active_completion"]
+            ),
+            # Deprecated aliases (см. note): не использовать в новых отчётах.
+            "improved": sum(1 for row in rows if row["active"]),
             "improved_by_rating": sum(
-                1 for row in rows if row["improved_rating"]
+                1 for row in rows if row["active_rating"]
             ),
             "improved_by_activity": sum(
-                1 for row in rows if row["improved_activity"]
+                1 for row in rows if row["active_completion"]
             ),
             "avg_rating_delta": _mean(
                 [
@@ -2474,6 +2509,10 @@ _COHORT_CSV_COLUMNS = (
     "completion_pct",
     "games_analyzed",
     "analyses",
+    "active",
+    "active_rating",
+    "active_completion",
+    # Deprecated aliases (см. note в /api/admin/cohort): не обучение.
     "improved",
     "improved_rating",
     "improved_activity",
@@ -3058,6 +3097,162 @@ def _plan_week_payload(db: Database, nick: str, data_dir: Any) -> dict[str, Any]
             focus_phase, phases, weak_opening, humanity, drills_today
         ),
     }
+
+# --- Снимок недельного плана (описательная петля, audit C3) --------------
+
+def _week_snapshot_payload(
+    db: Database, nick: str, data_dir: Any
+) -> dict[str, Any] | None:
+    """Агрегаты окна на момент сохранения плана (или None — снимать нечего).
+
+    Источники те же, что у /api/plan/week; наружу уходят только счётчики и
+    названия (слабые дебюты, мотивы), никаких ходов, соперников и PII.
+    """
+    try:
+        pairs = shared_data.repertoire_pairs(db, nick)
+    except RuntimeError:
+        return None
+    summary = summarize_recent(pairs)
+    plan: dict[str, Any] | None = None
+    try:
+        plan = shared_data.plan(db, nick, root=data_dir)
+    except RuntimeError:
+        plan = None
+    goal = _load_plan_goal(db, nick)
+    focus_phase, _ = _resolve_week_focus(goal, plan)
+
+    weak_openings: list[dict[str, Any]] = []
+    motifs: list[dict[str, Any]] = []
+    unnatural = 0
+    if isinstance(plan, dict):
+        for item in (
+            (plan.get("repertoire") or {}).get("weak_openings") or []
+        )[:3]:
+            if not isinstance(item, dict):
+                continue
+            try:
+                games_n = int(item.get("games") or 0)
+            except (TypeError, ValueError):
+                games_n = 0
+            weak_openings.append(
+                {
+                    "opening": str(item.get("opening") or "—"),
+                    "eco": item.get("eco"),
+                    "games": games_n,
+                    "errors_per_game": item.get("errors_per_game"),
+                    "points_pct": item.get("points_pct"),
+                }
+            )
+        for entry in (plan.get("patterns") or {}).get("motifs") or []:
+            if not (isinstance(entry, (list, tuple)) and len(entry) == 2):
+                continue
+            name, stats = entry
+            stats = stats if isinstance(stats, dict) else {}
+            try:
+                count_n = int(stats.get("count") or 0)
+            except (TypeError, ValueError):
+                count_n = 0
+            motifs.append(
+                {
+                    "motif": str(name),
+                    "count": count_n,
+                    "avg_drop": stats.get("avg_drop"),
+                }
+            )
+            if len(motifs) >= 3:
+                break
+        try:
+            unnatural = int((plan.get("drills") or {}).get("unnatural") or 0)
+        except (TypeError, ValueError):
+            unnatural = 0
+    return {
+        "window_n": summary["window_n"],
+        "focus_phase": focus_phase,
+        # drills_target — дневная норма из плана недели (как «Реши N дрелей
+        # в день»), не недельный итог.
+        "drills_target": _week_drills_portion(unnatural),
+        "weak_openings": weak_openings,
+        "motifs": motifs,
+        "avg_drop": summary["avg_drop"],
+        "score": summary["score_pct"],
+    }
+
+
+def _save_week_snapshot(db: Database, nick: str, data_dir: Any) -> dict[str, Any] | None:
+    """Best-effort снимок при сохранении/генерации плана недели.
+
+    Вызывать только из явных действий пользователя (сохранение цели,
+    генерация комментария), НЕ из аналитики. Ошибка сохранения снимка не
+    роняет запрос: логируем и продолжаем. Прошлая неделя не перезаписывается
+    (см. Database.save_plan_snapshot).
+    """
+    try:
+        payload = _week_snapshot_payload(db, nick, data_dir)
+        if payload is None:
+            return None
+        day = _today()
+        try:
+            week_start = monday_of_week(datetime.date.fromisoformat(day))
+        except ValueError:
+            week_start = day
+        return db.save_plan_snapshot(
+            nick, week_start, version=SNAPSHOT_VERSION, **payload
+        )
+    except Exception:
+        logger.warning("week plan snapshot failed", exc_info=True)
+        return None
+
+
+def _snapshot_public(snap: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Снимок для ответа API: + читаемая ISO-дата, без лишнего."""
+    if not snap:
+        return None
+    out = dict(snap)
+    created_ms = int(out.get("created_at") or 0)
+    created_iso: str | None = None
+    if created_ms > 0:
+        try:
+            created_iso = datetime.datetime.fromtimestamp(
+                created_ms / 1000, tz=timeutil.timezone_for()
+            ).isoformat(timespec="seconds")
+        except (OverflowError, OSError, ValueError):
+            created_iso = None
+    out["created_iso"] = created_iso
+    return out
+
+
+def _week_snapshot_status(db: Database, nick: str) -> dict[str, Any]:
+    """Снимок + описательные дельты «на сейчас» с жёсткими гейтами.
+
+    Честные состояния: ``no_snapshot`` | ``pending`` (<7 дней) |
+    ``insufficient_data`` (<10 новых анализов) | ``ok`` (сырые дельты).
+    Партии не пересчитываются при каждом чтении аналитики — только здесь.
+    """
+    snap = db.get_latest_plan_snapshot(nick)
+    if not snap:
+        return {
+            "status": "no_snapshot",
+            "snapshot": None,
+            "current": None,
+            "deltas": None,
+            "new_games": 0,
+            "age_days": None,
+            "days_remaining": None,
+            "min_new_games": MIN_NEW_GAMES,
+            "min_age_days": MIN_SNAPSHOT_AGE_DAYS,
+            "caveat": SNAPSHOT_CAVEAT,
+        }
+    created_ms = int(snap.get("created_at") or 0)
+    now_ms = int(time.time() * 1000)
+    age_days = (now_ms - created_ms) / 86_400_000 if created_ms > 0 else None
+    new_games = db.count_analyzed_games_since(nick, created_ms)
+    window_n = max(1, int(snap.get("window_n") or 1))
+    pairs = db.get_analyzed_games(nick, limit=window_n)
+    current = summarize_recent(pairs)
+    result = snapshot_delta(snap, current, new_games=new_games, age_days=age_days)
+    result["snapshot"] = _snapshot_public(result["snapshot"])
+    return result
+
 
 # --- Индивидуальный LLM-план недели ---------------------------------------
 
@@ -3937,6 +4132,7 @@ def create_api(
                 _plan_goal_key(user["nick"]),
                 json.dumps(saved, ensure_ascii=False),
             )
+            _save_week_snapshot(db, user["nick"], app.state.data_dir)
         return {"ok": True, **saved}
 
     @app.get("/api/plan/week")
@@ -3946,6 +4142,21 @@ def create_api(
             raise HTTPException(404, "No current user")
         with Database(app.state.db_path) as db:
             return _plan_week_payload(db, user["nick"], app.state.data_dir)
+
+    @app.get("/api/plan/week/snapshot")
+    def api_plan_week_snapshot(request: Request):
+        """Снимок текущей недели + описательные дельты к текущему окну.
+
+        Чистая аналитика чтения: снимок сюда не пишет. Гейты: <7 дней —
+        pending, <10 новых анализов — insufficient_data, иначе сырые
+        дельты со ссылкой на n и оговоркой про отсутствие причинности.
+        """
+        user = _current_user(app.state.db_path, request)
+        if not user:
+            raise HTTPException(404, "No current user")
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            return _week_snapshot_status(db, user["nick"])
 
     @app.get("/api/plan/llm")
     def api_plan_llm_get(request: Request):
@@ -3976,6 +4187,8 @@ def create_api(
             db.init_db()
             entry = _plan_llm_input(db, user["nick"], app.state.data_dir)
             raw = db.get_meta(_plan_llm_key(user["nick"]))
+            if dry_run != "on":
+                _save_week_snapshot(db, user["nick"], app.state.data_dir)
         digest = hashlib.sha256(
             json.dumps(entry, ensure_ascii=False, sort_keys=True).encode("utf-8")
         ).hexdigest()

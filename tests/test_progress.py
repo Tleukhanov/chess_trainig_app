@@ -100,22 +100,30 @@ def mkanalysis(
 
 
 def _pairs_improving() -> list[tuple[Game, dict]]:
-    """6 партий: первые 3 — слабые, последние 3 — сильные."""
+    """10 партий: первые 5 — слабые, последние 5 — сильные."""
     early = [
-        (mkgame("e1", 3000, ["e4", "e5", "Nf3", "Nc6", "Bc4", "Bc5"], "white", "loss", 2100),
+        (mkgame("e1", 1000, ["e4", "e5", "Nf3", "Nc6", "Bc4", "Bc5"], "white", "loss", 2100),
          mkanalysis(45.0, 80.0, blunders=2, mistakes=1)),
-        (mkgame("e2", 3300, ["e4", "e5", "Nf3", "Nc6", "Bc4", "Bc5"], "white", "draw", 2105),
-         mkanalysis(40.0, 82.0, blunders=1, mistakes=2)),
-        (mkgame("e3", 3600, ["e4", "e5", "Nf3", "Nc6", "Bc4", "Bc5"], "white", "win", 2110),
-         mkanalysis(35.0, 84.0, blunders=1, mistakes=1)),
+        (mkgame("e2", 1300, ["e4", "e5", "Nf3", "Nc6", "Bc4", "Bc5"], "white", "draw", 2105),
+         mkanalysis(41.0, 81.0, blunders=1, mistakes=2)),
+        (mkgame("e3", 1600, ["e4", "e5", "Nf3", "Nc6", "Bc4", "Bc5"], "white", "loss", 2108),
+         mkanalysis(37.0, 82.0, blunders=2, mistakes=1)),
+        (mkgame("e4", 1800, ["e4", "e5", "Nf3", "Nc6", "Bc4", "Bc5"], "white", "loss", 2110),
+         mkanalysis(33.0, 83.0, blunders=1, mistakes=1)),
+        (mkgame("e5", 2000, ["e4", "e5", "Nf3", "Nc6", "Bc4", "Bc5"], "white", "draw", 2112),
+         mkanalysis(30.0, 85.0, blunders=1, mistakes=2)),
     ]
     late = [
         (mkgame("l1", 9000, ["e4", "e5", "Nf3", "Nc6", "Bc4", "Bc5"], "white", "win", 2120),
          mkanalysis(15.0, 94.0, blunders=0, mistakes=0)),
-        (mkgame("l2", 9400, ["e4", "e5", "Nf3", "Nc6", "Bc4", "Bc5"], "white", "win", 2130),
-         mkanalysis(12.0, 96.0, blunders=0, mistakes=1)),
-        (mkgame("l3", 9800, ["e4", "e5", "Nf3", "Nc6", "Bc4", "Bc5"], "white", "draw", 2140),
-         mkanalysis(10.0, 97.0, blunders=0, mistakes=0)),
+        (mkgame("l2", 9200, ["e4", "e5", "Nf3", "Nc6", "Bc4", "Bc5"], "white", "win", 2125),
+         mkanalysis(13.0, 95.0, blunders=0, mistakes=1)),
+        (mkgame("l3", 9400, ["e4", "e5", "Nf3", "Nc6", "Bc4", "Bc5"], "white", "win", 2130),
+         mkanalysis(12.0, 96.0, blunders=0, mistakes=0)),
+        (mkgame("l4", 9600, ["e4", "e5", "Nf3", "Nc6", "Bc4", "Bc5"], "white", "win", 2135),
+         mkanalysis(11.0, 97.0, blunders=0, mistakes=1)),
+        (mkgame("l5", 9800, ["e4", "e5", "Nf3", "Nc6", "Bc4", "Bc5"], "white", "draw", 2140),
+         mkanalysis(10.0, 98.0, blunders=0, mistakes=0)),
     ]
     return early + late
 
@@ -125,9 +133,11 @@ def _humanity() -> dict:
     game_id = None
     for game, _ in _pairs_improving():
         if game.created_at < 5000:
-            verdicts = {"e1": ["unnatural", "unnatural"], "e2": ["unnatural"], "e3": ["unnatural", "natural"]}
+            verdicts = {"e1": ["unnatural", "unnatural"], "e2": ["unnatural"], "e3": ["unnatural", "natural"],
+                        "e4": ["unnatural"], "e5": ["borderline"]}
         else:
-            verdicts = {"l1": ["natural"], "l2": ["borderline"], "l3": ["natural"]}
+            verdicts = {"l1": ["natural"], "l2": ["borderline"], "l3": ["natural"],
+                        "l4": ["natural"], "l5": ["borderline"]}
         for verdict in verdicts.get(game.id, []):
             items.append({"game_id": game.id, "ply": 0, "verdict": verdict})
     return {"total_bad": len(items), "items": items}
@@ -137,10 +147,10 @@ class BuildProgressTests(unittest.TestCase):
     def test_two_windows_metrics(self) -> None:
         progress = build_progress(_pairs_improving(), user="u", windows=2, humanity=_humanity())
         self.assertEqual(progress["user"], "u")
-        self.assertEqual(progress["games"], 6)
+        self.assertEqual(progress["games"], 10)
         self.assertEqual(progress["windows"], 2)
         rows = progress["windows_rows"]
-        self.assertEqual([r["games"] for r in rows], [3, 3])
+        self.assertEqual([r["games"] for r in rows], [5, 5])
         # ранние партии слабее: потеря win% выше, win% перед ходом ниже
         self.assertGreater(rows[0]["avg_win_loss"], rows[1]["avg_win_loss"])
         self.assertLess(rows[0]["avg_win_before"], rows[1]["avg_win_before"])
@@ -153,7 +163,7 @@ class BuildProgressTests(unittest.TestCase):
         pairs = list(reversed(_pairs_improving()))
         progress = build_progress(pairs, windows=2)
         rows = [row for row in progress["windows_rows"]]
-        self.assertEqual([r["games"] for r in rows], [3, 3])
+        self.assertEqual([r["games"] for r in rows], [5, 5])
         # прогресс всегда сортирует по дате: первые окна — старые (слабые) партии
         self.assertGreater(rows[0]["avg_win_loss"], rows[1]["avg_win_loss"])
 
@@ -171,18 +181,49 @@ class BuildProgressTests(unittest.TestCase):
     def test_trend_improving(self) -> None:
         progress = build_progress(_pairs_improving(), user="u", windows=2)
         trend = progress["trend"]
+        self.assertTrue(trend["sufficient"])
+        self.assertEqual(trend["n_games"], 10)
+        self.assertEqual(trend["min_games"], 10)
         self.assertEqual(trend["overall"], "improving")
         self.assertIn("avg_win_loss", trend["improving"])
         self.assertIn("avg_win_before", trend["improving"])
         self.assertIn("avg_rating", trend["improving"])
         self.assertEqual(trend["worsening"], [])
 
+    def test_trend_insufficient_when_below_min_games(self) -> None:
+        progress = build_progress(_pairs_improving()[:6], user="u", windows=2)
+        trend = progress["trend"]
+        self.assertFalse(trend["sufficient"])
+        self.assertEqual(progress["sufficient_data"], False)
+        self.assertEqual(progress["min_games"], 10)
+        self.assertEqual(trend["overall"], "insufficient_data")
+        self.assertEqual(trend["improving"], [])
+        self.assertEqual(trend["worsening"], [])
+        self.assertEqual(progress["windows"], 2)
+        # Сами окна считаются, но тренда нет и не голосуют стрелки.
+        self.assertIn("windows_rows", progress)
+        self.assertNotIn("avg_win_loss", trend)
+
+    def test_trend_min_games_overridable(self) -> None:
+        progress = build_progress(_pairs_improving()[:6], user="u", windows=2, min_games=6)
+        self.assertEqual(progress["trend"]["overall"], "improving")
+
+    def test_avg_drop_does_not_vote_in_overall(self) -> None:
+        progress = build_progress(_pairs_improving(), user="u", windows=2)
+        trend = progress["trend"]
+        self.assertIn("avg_drop", trend)
+        self.assertFalse(trend["avg_drop"]["counts_in_overall"])
+        self.assertNotIn("avg_drop", trend["improving"])
+        self.assertNotIn("avg_drop", trend["worsening"])
+        self.assertTrue(trend["avg_win_loss"]["counts_in_overall"])
+
     def test_empty_pairs(self) -> None:
         progress = build_progress([], user="u", windows=5)
         self.assertEqual(progress["games"], 0)
         self.assertEqual(progress["windows"], 0)
         self.assertEqual(progress["windows_rows"], [])
-        self.assertEqual(progress["trend"]["overall"], "flat")
+        self.assertEqual(progress["trend"]["overall"], "insufficient_data")
+        self.assertFalse(progress["trend"]["sufficient"])
 
     def test_windows_clamp_to_games(self) -> None:
         pairs = _pairs_improving()[:1]
@@ -199,10 +240,16 @@ class FormatProgressTests(unittest.TestCase):
     def test_contains_header_and_trend(self) -> None:
         text = format_progress(build_progress(_pairs_improving(), user="u", windows=2))
         self.assertIn("Динамика прогресса", text)
-        self.assertIn("партий: 6", text)
+        self.assertIn("партий: 10", text)
         self.assertIn("Динамика (первое → последнее окно)", text)
         self.assertIn("Итог", text)
         self.assertIn("Ср. потеря win%", text)
+        self.assertIn("не доказывают", text)
+
+    def test_insufficient_text(self) -> None:
+        text = format_progress(build_progress(_pairs_improving()[:6], user="u", windows=2))
+        self.assertIn("недостаточно данных", text)
+        self.assertNotIn("Динамика (первое → последнее окно):", text)
 
     def test_empty_text(self) -> None:
         text = format_progress(build_progress([]))
