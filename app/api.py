@@ -40,6 +40,7 @@ from . import reading
 from . import theory
 from . import timeutil
 from .analyzer import Engine, analysis_needs_refresh, win_percent
+from .client_analysis import validate_and_enrich
 from .coach import _extract_json, build_request, run_coach
 from .config import settings
 from .dayplan import build_tasks
@@ -5512,6 +5513,44 @@ def create_api(
         with Database(app.state.db_path) as db:
             db.init_db()
             db.save_analysis(game_id, summary, depth=10)
+        return {"analysis": summary, "cached": False}
+
+    @app.post("/api/games/{game_id}/analyze/client")
+    async def api_game_analyze_client(game_id: str, request: Request):
+        """Приём анализа, посчитанного на клиенте (Stockfish WASM)."""
+        user = _current_user(app.state.db_path, request)
+        if not user:
+            raise HTTPException(404, "No current user")
+        try:
+            payload = await request.json()
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(400, "Неверный JSON") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(400, "Ожидается объект JSON")
+
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            game = db.get_game(game_id, user["nick"])
+            if game is None:
+                raise HTTPException(404, "Партия не найдена")
+            if not game.moves:
+                raise HTTPException(400, "В партии нет ходов")
+            if _analysis_has_foreign_copy(db, game_id, user["nick"]):
+                raise HTTPException(409, "Партия уже есть в кеше у другого игрока")
+
+        try:
+            summary = validate_and_enrich(game, payload)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+        with Database(app.state.db_path) as db:
+            db.init_db()
+            db.save_analysis(
+                game_id,
+                summary,
+                depth=int(summary.get("depth", 10)),
+                engine="stockfish-wasm",
+            )
         return {"analysis": summary, "cached": False}
 
     @app.get("/api/games/{game_id}/repeats")

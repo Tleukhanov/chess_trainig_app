@@ -1,6 +1,7 @@
 // Chess Trainer Frontend — SPA на vanilla JS, потребляет /api/* эндпоинты.
 
 import { boardHtml, bindBoard, lastMoveSquares } from './board.js?v=0.9.22';
+import { analyzeGameLocally } from './engine/local-analysis.js';
 
 const state = {
   user: null,
@@ -119,6 +120,91 @@ async function apiPost(path, formData) {
     throw error;
   }
   return resp.json();
+}
+
+function clientAnalysisAvailable() {
+  try {
+    return typeof WebAssembly === 'object' &&
+      typeof WebAssembly.instantiate === 'function' &&
+      typeof Worker !== 'undefined';
+  } catch (e) {
+    return false;
+  }
+}
+
+async function analyzeGameClientById(gameId, onProgress) {
+  const detail = await api('/api/games/' + encodeURIComponent(gameId));
+  const game = (detail && detail.game) ? detail.game : detail;
+  const summary = await analyzeGameLocally(game, {
+    depth: 12,
+    multipv: 3,
+    onProgress: (p) => {
+      if (typeof onProgress === 'function') {
+        try { onProgress(p); } catch (e) { /* ignore */ }
+      }
+    },
+  });
+  const normalized = normalizeClientAnalysisForUpload(summary);
+  const payload = {
+    analysis: normalized,
+    engine_meta: {
+      depth: (summary && typeof summary.depth === 'number') ? summary.depth : 12,
+      multipv: (summary && typeof summary.multipv === 'number') ? summary.multipv : 3,
+    },
+  };
+  return api('/api/games/' + encodeURIComponent(gameId) + '/analyze/client', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+}
+
+function normalizeClientAnalysisForUpload(summary) {
+  let copy;
+  try {
+    copy = JSON.parse(JSON.stringify(summary || {}));
+  } catch (e) {
+    copy = Object.assign({}, summary || {});
+  }
+  const moves = Array.isArray(copy.moves) ? copy.moves : [];
+  for (const m of moves) {
+    if (!m || typeof m !== 'object') continue;
+    const rawLines = Array.isArray(m.client_lines) ? m.client_lines : null;
+    if (!rawLines) {
+      m.client_lines = null;
+      continue;
+    }
+    const normalized = [];
+    for (const line of rawLines) {
+      if (!line || typeof line !== 'object') continue;
+      let cp = null;
+      let mate = null;
+      const scoreType = line.scoreType || line.score_type;
+      if (scoreType === 'mate') {
+        const sc = (typeof line.score === 'number') ? line.score : null;
+        mate = sc;
+      } else if (typeof line.score === 'number') {
+        cp = line.score;
+      } else if (typeof line.eval === 'number') {
+        cp = Math.round(line.eval * 100);
+      } else if (line.eval && typeof line.eval === 'object') {
+        if (typeof line.eval.cp === 'number') cp = line.eval.cp;
+        if (typeof line.eval.mate === 'number') mate = line.eval.mate;
+      }
+      const pv = Array.isArray(line.san) ? line.san.slice()
+        : (Array.isArray(line.pvSan) ? line.pvSan.slice()
+          : (Array.isArray(line.pv_san) ? line.pv_san.slice() : []));
+      const win = (typeof line.winPercent === 'number') ? line.winPercent
+        : (typeof line.win_percent === 'number') ? line.win_percent
+        : (typeof line.win === 'number') ? line.win : null;
+      const multipv = (typeof line.multipv === 'number' && line.multipv >= 1) ? line.multipv
+        : (typeof line.multiPv === 'number' && line.multiPv >= 1) ? line.multiPv
+        : (typeof line.multiPV === 'number' && line.multiPV >= 1) ? line.multiPV : 1;
+      normalized.push({ pv: pv, eval: { cp: cp, mate: mate }, win: win, multipv: multipv });
+    }
+    m.client_lines = normalized.length ? normalized : null;
+  }
+  return copy;
 }
 
 function showToast(msg, kind) {
@@ -1589,7 +1675,7 @@ async function viewGameList(app) {
       <td class="center"><span class="badge ${resBadge}">${resLabel}</span></td>
       <td>${opening}</td>
       <td class="num">${g.moves}</td>
-      <td class="center">${g.analyzed ? '<span class="badge badge-good">анализ</span>' : `<button type="button" class="btn btn-secondary analyze-game" data-id="${esc(g.id)}" style="font-size:12px;padding:3px 8px">Анализ</button>`}</td>
+      <td class="center">${g.analyzed ? '<span class="badge badge-good">анализ</span>' : `<button type="button" class="btn btn-secondary analyze-game" data-id="${esc(g.id)}" style="font-size:12px;padding:3px 8px">Анализ</button> <button type="button" class="btn btn-secondary analyze-game-client" data-id="${esc(g.id)}" style="font-size:12px;padding:3px 8px" ${clientAnalysisAvailable() ? '' : 'disabled'} title="${clientAnalysisAvailable() ? 'Анализ в браузере (Stockfish WASM)' : 'Браузер не поддерживает WebAssembly/Worker'}">Устройство</button>`}</td>
     </tr>`;
   }).join('');
 
@@ -1610,10 +1696,13 @@ async function viewGameList(app) {
           <div class="form-group" style="display:flex;align-items:center;gap:6px;min-height:38px">
             <input type="checkbox" id="pgn-analyze"><label for="pgn-analyze" style="margin:0;white-space:nowrap">сразу проанализировать</label>
           </div>
+          <div class="form-group" style="display:flex;align-items:center;gap:6px;min-height:38px">
+            <input type="checkbox" id="pgn-analyze-client" ${clientAnalysisAvailable() ? '' : 'disabled'}><label for="pgn-analyze-client" style="margin:0;white-space:nowrap">Анализ на устройстве</label>
+          </div>
           <button type="submit" class="btn btn-primary" style="height:38px">Импортировать</button>
         </div>
         <div id="pgn-import-status" class="alert alert-error" style="display:none;margin-top:8px"></div>
-        <p style="color:var(--c-text-muted);font-size:12px;margin:8px 0 0">Вставь одну или несколько партий. Если ника нет в заголовках — выбери свой цвет. Анализ сразу — для небольших импортов (до 3 партий).</p>
+        <p style="color:var(--c-text-muted);font-size:12px;margin:8px 0 0">Вставь одну или несколько партий. Если ника нет в заголовках — выбери свой цвет. Анализ сразу — для небольших импортов (до 3 партий). Локальный анализ использует Stockfish WASM в браузере и может быть медленнее на мобильных; результат помечается analysis_source='client' и не считается глобально верифицированным.</p>
       </form>
     </div>
     <div class="card">
@@ -1655,16 +1744,39 @@ async function viewGameList(app) {
       else fd.append('pgn', text);
       const color = document.getElementById('pgn-color').value;
       if (color) fd.append('user_color', color);
-      if (document.getElementById('pgn-analyze').checked) fd.append('analyze', 'on');
+      const localChecked = clientAnalysisAvailable() && document.getElementById('pgn-analyze-client').checked;
+      if (!localChecked && document.getElementById('pgn-analyze').checked) fd.append('analyze', 'on');
       btn.disabled = true;
       btn.textContent = 'Импортирую…';
       if (status) { status.style.display = 'none'; status.textContent = ''; }
       try {
         const res = await apiPost('/api/games/import', fd);
-        showToast(
-          'Импортировано: ' + res.imported + (res.analyzed ? ', проанализировано: ' + res.analyzed : ''),
-          'info',
-        );
+        const importedMsg = 'Импортировано: ' + res.imported + (res.analyzed ? ', проанализировано: ' + res.analyzed : '');
+        showToast(importedMsg, 'info');
+        if (localChecked && Array.isArray(res.ids) && res.ids.length) {
+          if (status) { status.style.display = 'block'; status.textContent = ''; }
+          let ok = 0;
+          const errs = [];
+          for (let i = 0; i < res.ids.length; i++) {
+            const id = res.ids[i];
+            if (status) status.textContent = 'Локальный анализ: ' + (i + 1) + '/' + res.ids.length + ' — ' + id + '…';
+            try {
+              await analyzeGameClientById(id, (p) => {
+                if (status) status.textContent = 'Локальный анализ: ' + (i + 1) + '/' + res.ids.length + ' — ' + id + ' (ход ' + ((p && p.current) ? p.current : (p ? p.ply + 1 : '?')) + '/' + (p ? p.total : '?') + ')…';
+              });
+              ok += 1;
+            } catch (e) {
+              errs.push(id + ': ' + (e && e.message ? e.message : e));
+            }
+          }
+          if (errs.length) {
+            if (status) status.textContent = 'Проанализировано локально: ' + ok + '/' + res.ids.length + '.\n' + errs.join('\n');
+            showToast('Импортировано: ' + res.imported + '; локально: ' + ok + ', ошибок: ' + errs.length, 'error');
+          } else {
+            if (status) status.textContent = 'Проанализировано локально: ' + ok + '/' + res.ids.length + '.';
+            showToast('Импортировано: ' + res.imported + '; локально проанализировано: ' + ok, 'info');
+          }
+        }
         viewGameList(app);
       } catch (err) {
         if (isSessionError(err)) { handleSessionExpired(); return; }
@@ -1687,6 +1799,26 @@ async function viewGameList(app) {
         showToast(err.message, 'error');
         btn.disabled = false;
         btn.textContent = 'Анализ';
+      }
+    });
+  });
+  app.querySelectorAll('.analyze-game-client').forEach(btn => {
+    btn.addEventListener('click', async e => {
+      e.stopPropagation();
+      if (!clientAnalysisAvailable()) {
+        showToast('Браузер не поддерживает WebAssembly/Worker — анализ на устройстве недоступен', 'error');
+        return;
+      }
+      btn.disabled = true;
+      const oldText = btn.textContent;
+      btn.textContent = '…';
+      try {
+        await analyzeGameClientById(btn.dataset.id, null);
+        viewGameList(app);
+      } catch (err) {
+        showToast(err.message, 'error');
+        btn.disabled = false;
+        btn.textContent = oldText || 'Устройство';
       }
     });
   });
@@ -1838,10 +1970,12 @@ function drawGameDetail(app) {
         </div>
         <div class="card">
           <div class="card-header"><span class="card-title">Анализ</span></div>
-          ${analysis ? gameMetricsHtml(analysis) : '<p style="color:var(--c-text-muted)">Не проанализирована.</p>'}
-          <div style="margin-top:10px">
+          ${analysis ? gameMetricsHtml(analysis) + (analysis.analysis_source ? `<div style="margin-top:8px;font-size:12px;color:var(--c-text-muted)">Источник анализа: <strong>${esc(analysis.analysis_source)}</strong>${analysis.analysis_source === 'client' ? ' (браузерный Stockfish WASM; не глобально верифицирован)' : ''}</div>` : '') : '<p style="color:var(--c-text-muted)">Не проанализирована.</p>'}
+          <div style="margin-top:10px; display:flex; gap:8px; flex-wrap:wrap">
             <button type="button" class="btn btn-primary" id="analyze-game-btn">${analysis ? 'Переанализировать' : 'Проанализировать'}</button>
+            ${!analysis ? `<button type="button" class="btn btn-secondary" id="analyze-game-client-btn" ${clientAnalysisAvailable() ? '' : 'disabled'} title="${clientAnalysisAvailable() ? 'Анализ в браузере (Stockfish WASM)' : 'Браузер не поддерживает WebAssembly/Worker'}">Анализировать на устройстве</button>` : ''}
           </div>
+          <p style="color:var(--c-text-muted);font-size:12px;margin:8px 0 0">Локальный анализ использует Stockfish WASM в браузере и может быть медленнее на мобильных; метрики помечаются analysis_source='client' и не считаются глобально верифицированными.</p>
           ${analysis ? '<div id="game-errors"></div>' : ''}
           <div id="game-repeats"></div>
           ${analysis ? `<div style="margin-top:10px"><button class="btn btn-primary" id="train-from-game" data-color="${esc(game.user_color || 'white')}">Тренировать этот дебют</button></div>` : ''}
@@ -1899,6 +2033,33 @@ function drawGameDetail(app) {
         showToast(err.message, 'error');
         analyzeGameBtn.disabled = false;
         analyzeGameBtn.textContent = oldText;
+      }
+    });
+  }
+  const analyzeGameClientBtn = document.getElementById('analyze-game-client-btn');
+  if (analyzeGameClientBtn) {
+    analyzeGameClientBtn.addEventListener('click', async () => {
+      if (!clientAnalysisAvailable()) {
+        showToast('Браузер не поддерживает WebAssembly/Worker — анализ на устройстве недоступен', 'error');
+        return;
+      }
+      const oldText = analyzeGameClientBtn.textContent;
+      analyzeGameClientBtn.disabled = true;
+      analyzeGameClientBtn.textContent = 'Анализирую…';
+      try {
+        await analyzeGameClientById(game.id, (p) => {
+          analyzeGameClientBtn.textContent = 'Анализирую ' + ((p && p.current) ? p.current : (p ? p.ply + 1 : '')) + '/' + (p ? p.total : '') + '…';
+        });
+        const fresh = await api('/api/games/' + encodeURIComponent(game.id));
+        state.gameData = fresh;
+        state.gameReview = null;
+        state.gameExtras = null;
+        state.gameRepeats = null;
+        drawGameDetail(document.getElementById('app'));
+      } catch (err) {
+        showToast(err.message, 'error');
+        analyzeGameClientBtn.disabled = false;
+        analyzeGameClientBtn.textContent = oldText;
       }
     });
   }
