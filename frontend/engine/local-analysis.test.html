@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Local analysis harness</title>
+  <style>
+    body { font-family: monospace; margin: 16px; }
+    pre { white-space: pre-wrap; word-break: break-word; }
+  </style>
+</head>
+<body>
+  <h1>Local analysis harness</h1>
+  <button id="run">Run analysis</button>
+  <pre id="out"></pre>
+  <script type="module">
+    import { analyzeGameLocally, winPercent, classifyMove } from './local-analysis.js';
+
+    const out = document.getElementById('out');
+    document.getElementById('run').addEventListener('click', async () => {
+      out.textContent = 'Running...';
+      const pgn = `[Event "Test"]
+[White "A"]
+[Black "B"]
+[Result "1-0"]
+
+1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 4. Ba4 Nf6 5. O-O Be7`;
+      try {
+        const summary = await analyzeGameLocally(pgn, {
+          depth: 8,
+          multipv: 2,
+          onProgress: (p) => { out.textContent = 'progress ' + JSON.stringify(p); },
+        });
+        out.textContent = JSON.stringify(summary, null, 2);
+      } catch (err) {
+        out.textContent = 'ERROR: ' + (err && err.message ? err.message : err);
+      }
+    });
+  </script>
+</body>
+</html>
+```
+
+Need test in browser. We can use browser tools to open file? The browser tool likely can open URL. But local file path? browser.tabs.open accepts url. Could use file:// path. Let's try after copying vendor. Actually our worktree has vendor and stockfish-client copied. Good.
+
+Let's open test harness in browser.<|end|><|start|>assist to=execute<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name="code">
+import { tools } from 'tools';
+const tab = await tools.browser.tabs.open({ url: 'file:///home/yeraly/Projects/chess_trainig_app/.worktrees/agent-b-local-analysis/frontend/engine/local-analysis.test.html', focus: true });
+return tab;
